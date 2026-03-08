@@ -679,6 +679,7 @@ export class BilibiliUploadService {
       message: data.message,
     });
 
+    console.log(JSON.stringify(data, null, 2));
     if (data.code !== 0) {
       throw new Error(`Failed to submit video: ${data.message}`);
     }

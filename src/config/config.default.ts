@@ -101,6 +101,12 @@ export default {
     },
   },
 
+  // 投稿配置
+  submission: {
+    defaultTid: 171, // 默认分区（电子竞技）
+    defaultTitleTemplate: '{streamerName}的直播录像 {date}',
+  },
+
   // 日志配置
   midwayLogger: {
     clients: {

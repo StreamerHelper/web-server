@@ -51,20 +51,6 @@ export class BilibiliSubmissionRepository {
   }
 
   /**
-   * 获取可重试的失败投稿
-   */
-  async findRetryableSubmissions(): Promise<BilibiliSubmissionEntity[]> {
-    return this.repo
-      .createQueryBuilder('submission')
-      .where('submission.status = :status', {
-        status: SubmissionStatus.UPLOADING,
-      })
-      .andWhere('submission.retryCount < submission.maxRetries')
-      .orderBy('submission.createdAt', 'ASC')
-      .getMany();
-  }
-
-  /**
    * 更新投稿状态
    */
   async updateStatus(
@@ -122,21 +108,6 @@ export class BilibiliSubmissionRepository {
         status: SubmissionStatus.COMPLETED,
         bvid,
         avid,
-      }
-    );
-  }
-
-  /**
-   * 增加重试次数
-   */
-  async incrementRetryCount(id: string): Promise<void> {
-    const submission = await this.findById(id);
-    if (!submission) return;
-
-    await this.repo.update(
-      { id },
-      {
-        retryCount: submission.retryCount + 1,
       }
     );
   }

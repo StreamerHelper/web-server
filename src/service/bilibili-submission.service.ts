@@ -18,6 +18,7 @@ import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.
 import { BilibiliUploadService, VideoPart } from './bilibili-upload.service';
 import { StorageService } from './storage.service';
 import { JobService } from './job.service';
+import { StreamerService } from './streamer.service';
 
 /**
  * 每个分P的目标时长（10分钟 = 600秒）
@@ -65,6 +66,9 @@ export class BilibiliSubmissionService {
 
   @Inject()
   private jobService: JobService;
+
+  @Inject()
+  private streamerService: StreamerService;
 
   /**
    * 创建投稿任务
@@ -119,8 +123,6 @@ export class BilibiliSubmissionService {
       parts,
       totalParts: parts.length,
       completedParts: 0,
-      retryCount: 0,
-      maxRetries: 3,
     });
 
     return submission;
@@ -150,7 +152,6 @@ export class BilibiliSubmissionService {
           index: parts.length + 1,
           s3Keys: [...currentPart],
           status: PartStatus.PENDING,
-          uploadProgress: 0,
         });
         currentPart = [];
       }
@@ -162,7 +163,6 @@ export class BilibiliSubmissionService {
         index: parts.length + 1,
         s3Keys: currentPart,
         status: PartStatus.PENDING,
-        uploadProgress: 0,
       });
     }
 
@@ -179,16 +179,8 @@ export class BilibiliSubmissionService {
       throw new Error(`Submission not found: ${submissionId}`);
     }
 
-    // 检查是否超过最大重试次数
-    if (submission.retryCount >= submission.maxRetries) {
-      await this.submissionRepository.updateStatus(
-        submission.id,
-        SubmissionStatus.FAILED,
-        'Exceeded maximum retry count'
-      );
-      this.logger.warn('Submission exceeded max retries', { submissionId });
-      return;
-    }
+    // 获取最新的 streamer 信息并更新投稿配置
+    await this.updateSubmissionFromStreamer(submission);
 
     this.logger.info('Processing submission', {
       submissionId,
@@ -247,8 +239,7 @@ export class BilibiliSubmissionService {
         await this.submissionRepository.updatePartStatus(
           submissionId,
           part.index,
-          PartStatus.UPLOADING,
-          { mergedFilePath }
+          PartStatus.UPLOADING
         );
 
         // 2. 上传到B站
@@ -270,7 +261,7 @@ export class BilibiliSubmissionService {
           submissionId,
           part.index,
           PartStatus.COMPLETED,
-          { filename, uploadProgress: 100 }
+          { filename }
         );
 
         uploadedParts.push({
@@ -332,30 +323,12 @@ export class BilibiliSubmissionService {
         error: errorMessage,
       });
 
-      // 增加重试次数
-      await this.submissionRepository.incrementRetryCount(submissionId);
-
-      // 检查是否超过最大重试次数
-      const updatedSubmission = await this.submissionRepository.findById(
-        submissionId
+      // 直接标记为失败
+      await this.submissionRepository.updateStatus(
+        submissionId,
+        SubmissionStatus.FAILED,
+        errorMessage
       );
-      if (
-        updatedSubmission &&
-        updatedSubmission.retryCount >= updatedSubmission.maxRetries
-      ) {
-        await this.submissionRepository.updateStatus(
-          submissionId,
-          SubmissionStatus.FAILED,
-          errorMessage
-        );
-      } else {
-        // 保持 UPLOADING 状态以便重试
-        await this.submissionRepository.updateStatus(
-          submissionId,
-          SubmissionStatus.UPLOADING,
-          errorMessage
-        );
-      }
 
       throw error;
     }
@@ -511,13 +484,6 @@ export class BilibiliSubmissionService {
   }
 
   /**
-   * 获取待重试的投稿列表
-   */
-  async getRetryableSubmissions(): Promise<BilibiliSubmissionEntity[]> {
-    return this.submissionRepository.findRetryableSubmissions();
-  }
-
-  /**
    * 获取投稿列表（分页）
    */
   async listSubmissions(options: {
@@ -527,5 +493,71 @@ export class BilibiliSubmissionService {
     status?: SubmissionStatus;
   }): Promise<{ items: BilibiliSubmissionEntity[]; total: number }> {
     return this.submissionRepository.list(options);
+  }
+
+  /**
+   * 从 streamer 获取最新投稿配置并更新 submission
+   */
+  private async updateSubmissionFromStreamer(
+    submission: BilibiliSubmissionEntity
+  ): Promise<void> {
+    try {
+      // 通过 jobId 获取 Job 信息
+      const job = await this.jobService.findByJobId(submission.jobId);
+      if (!job) {
+        this.logger.warn('Job not found for submission', {
+          submissionId: submission.id,
+          jobId: submission.jobId,
+        });
+        return;
+      }
+
+      // 获取 streamer 信息
+      const streamer = await this.streamerService.findByStreamerId(
+        job.streamerId
+      );
+      if (!streamer?.uploadSettings) {
+        this.logger.debug('No streamer upload settings found', {
+          submissionId: submission.id,
+          streamerId: job.streamerId,
+        });
+        return;
+      }
+
+      const { uploadSettings } = streamer;
+      let updated = false;
+
+      // 更新投稿信息（仅更新有值的字段）
+      if (uploadSettings.title) {
+        submission.title = uploadSettings.title;
+        updated = true;
+      }
+      if (uploadSettings.description !== undefined) {
+        submission.description = uploadSettings.description;
+        updated = true;
+      }
+      if (uploadSettings.tags && uploadSettings.tags.length > 0) {
+        submission.tags = uploadSettings.tags;
+        updated = true;
+      }
+      if (uploadSettings.tid) {
+        submission.tid = uploadSettings.tid;
+        updated = true;
+      }
+
+      if (updated) {
+        await this.submissionRepository.save(submission);
+        this.logger.info('Updated submission from streamer settings', {
+          submissionId: submission.id,
+          streamerId: job.streamerId,
+        });
+      }
+    } catch (error) {
+      this.logger.error('Failed to update submission from streamer', {
+        submissionId: submission.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // 不抛出错误，继续使用原有配置
+    }
   }
 }

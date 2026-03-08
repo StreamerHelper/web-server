@@ -8,9 +8,14 @@ export class InitSchema1700000000000 implements MigrationInterface {
     await queryRunner.query(
       'DROP TABLE IF EXISTS "bilibili_credentials" CASCADE;'
     );
+    await queryRunner.query(
+      'DROP TABLE IF EXISTS "bilibili_submissions" CASCADE;'
+    );
     await queryRunner.query('DROP TABLE IF EXISTS "migrations" CASCADE;');
     await queryRunner.query('DROP TYPE IF EXISTS "job_status_enum";');
     await queryRunner.query('DROP TYPE IF EXISTS "platform_enum";');
+    await queryRunner.query('DROP TYPE IF EXISTS "submission_status";');
+    await queryRunner.query('DROP TYPE IF EXISTS "part_status";');
 
     // 创建枚举类型
     await queryRunner.query(`
@@ -19,6 +24,14 @@ export class InitSchema1700000000000 implements MigrationInterface {
 
     await queryRunner.query(`
       CREATE TYPE "job_status_enum" AS ENUM ('pending', 'recording', 'processing', 'completed', 'failed', 'cancelled', 'stopping');
+    `);
+
+    await queryRunner.query(`
+      CREATE TYPE "submission_status" AS ENUM ('pending', 'uploading', 'submitting', 'completed', 'failed');
+    `);
+
+    await queryRunner.query(`
+      CREATE TYPE "part_status" AS ENUM ('pending', 'merging', 'uploading', 'completed', 'failed');
     `);
 
     // 创建 streamers 表
@@ -90,6 +103,36 @@ export class InitSchema1700000000000 implements MigrationInterface {
       );
     `);
 
+    // 创建 bilibili_submissions 表
+    await queryRunner.query(`
+      CREATE TABLE "bilibili_submissions" (
+        "id" uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        "job_id" VARCHAR(255) NOT NULL,
+        "title" VARCHAR(80) NOT NULL,
+        "description" VARCHAR(2000),
+        "tags" TEXT[],
+        "tid" INTEGER DEFAULT 171,
+        "cover" VARCHAR(500),
+        "copyright" INTEGER DEFAULT 1,
+        "source" VARCHAR(500),
+        "dynamic" VARCHAR(500),
+        "status" submission_status DEFAULT 'pending',
+        "parts" JSONB NOT NULL DEFAULT '[]',
+        "total_parts" INTEGER DEFAULT 0,
+        "completed_parts" INTEGER DEFAULT 0,
+        "bvid" VARCHAR(20),
+        "avid" BIGINT,
+        "last_error" VARCHAR(2000),
+        "created_at" TIMESTAMPTZ DEFAULT NOW(),
+        "updated_at" TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await queryRunner.query(`
+      CREATE INDEX "IDX_bilibili_submissions_job_id" ON "bilibili_submissions" ("job_id");
+      CREATE INDEX "IDX_bilibili_submissions_status" ON "bilibili_submissions" ("status");
+    `);
+
     // 创建 migrations 记录表
     await queryRunner.query(`
       CREATE TABLE "migrations" (
@@ -111,8 +154,13 @@ export class InitSchema1700000000000 implements MigrationInterface {
     await queryRunner.query(
       'DROP TABLE IF EXISTS "bilibili_credentials" CASCADE;'
     );
+    await queryRunner.query(
+      'DROP TABLE IF EXISTS "bilibili_submissions" CASCADE;'
+    );
     await queryRunner.query('DROP TABLE IF EXISTS "migrations" CASCADE;');
     await queryRunner.query('DROP TYPE IF EXISTS "job_status_enum";');
     await queryRunner.query('DROP TYPE IF EXISTS "platform_enum";');
+    await queryRunner.query('DROP TYPE IF EXISTS "submission_status";');
+    await queryRunner.query('DROP TYPE IF EXISTS "part_status";');
   }
 }

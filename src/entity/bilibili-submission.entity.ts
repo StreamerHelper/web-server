@@ -39,12 +39,8 @@ export interface SubmissionPart {
   s3Keys: string[];
   /** 分P状态 */
   status: PartStatus;
-  /** 上传进度 0-100 */
-  uploadProgress: number;
   /** B站上传后的文件名 */
   filename?: string;
-  /** 合并后的临时文件路径 */
-  mergedFilePath?: string;
   /** 视频时长（毫秒） */
   duration?: number;
   /** 文件大小 */
@@ -101,12 +97,6 @@ export class BilibiliSubmissionEntity {
   })
   @Index()
   status: SubmissionStatus;
-
-  @Column({ name: 'retry_count', default: 0 })
-  retryCount: number;
-
-  @Column({ name: 'max_retries', default: 3 })
-  maxRetries: number;
 
   // === 分P信息 ===
 

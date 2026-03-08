@@ -42,12 +42,12 @@ export class Streamer {
   @Column({ name: 'recordSettings', type: 'jsonb', nullable: true })
   recordSettings: {
     quality?: string;
-    autoUpload?: boolean;
     detectHighlights?: boolean;
   };
 
   @Column({ name: 'uploadSettings', type: 'jsonb', nullable: true })
   uploadSettings: {
+    autoUpload?: boolean;
     title?: string;
     description?: string;
     tags?: string[];

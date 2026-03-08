@@ -13,6 +13,8 @@ import { Framework } from '@midwayjs/bullmq';
 import { JOB_STATUS, Platform } from '../interface';
 import { DanmakuManager } from './danmaku.service';
 import { JobService } from './job.service';
+import { StreamerService } from './streamer.service';
+import { BilibiliSubmissionService } from './bilibili-submission.service';
 import {
   Recording,
   RecordingEndEvent,
@@ -46,6 +48,12 @@ export class RecorderManager {
 
   @Inject()
   danmakuManager: DanmakuManager;
+
+  @Inject()
+  streamerService: StreamerService;
+
+  @Inject()
+  submissionService: BilibiliSubmissionService;
 
   @Inject()
   bullFramework: Framework;
@@ -116,7 +124,7 @@ export class RecorderManager {
     this.recordings.set(key, recording);
 
     // 监听结束事件，自动清理（once: true 确保监听器只触发一次并自动移除）
-    recording.onceEnd((data: RecordingEndEvent) => {
+    recording.onceEnd(async (data: RecordingEndEvent) => {
       this.logger.info('Recording ended', {
         id: recording.id,
         platform,
@@ -129,6 +137,9 @@ export class RecorderManager {
 
       // 从管理器中移除
       this.recordings.delete(key);
+
+      // 触发自动投稿
+      await this.triggerAutoSubmission(options, data);
     });
 
     // 启动录制（异步）
@@ -246,5 +257,105 @@ export class RecorderManager {
     );
 
     await Promise.all(promises);
+  }
+
+  /**
+   * 触发自动投稿
+   * 录制结束后检查是否需要自动投稿
+   */
+  private async triggerAutoSubmission(
+    options: RecordingInputOptions,
+    endData: RecordingEndEvent
+  ): Promise<void> {
+    try {
+      // 1. 用户取消的任务不触发投稿
+      if (endData.reason === 'cancelled') {
+        this.logger.info('Recording cancelled, skipping submission', {
+          jobId: options.jobId,
+        });
+        return;
+      }
+
+      // 2. 获取 Job 信息，检查是否有已上传的分片
+      const job = await this.jobService.findById(options.id);
+      if (!job) {
+        this.logger.warn('Job not found for auto submission', {
+          jobId: options.jobId,
+        });
+        return;
+      }
+
+      const uploadedSegments = job.metadata?.uploadedSegments || [];
+      const videoSegments = uploadedSegments.filter((key: string) =>
+        key.includes('/video/')
+      );
+
+      if (videoSegments.length === 0) {
+        this.logger.info('No video segments uploaded, skipping submission', {
+          jobId: options.jobId,
+          reason: endData.reason,
+        });
+        return;
+      }
+
+      // 3. 获取 streamer 信息，检查是否开启自动投稿
+      const streamer = await this.streamerService.findByStreamerId(
+        options.streamerId
+      );
+
+      if (streamer?.uploadSettings?.autoUpload === false) {
+        this.logger.info('Auto upload disabled', {
+          streamerId: options.streamerId,
+        });
+        return;
+      }
+
+      // 4. 获取投稿配置
+      const uploadSettings = streamer.uploadSettings || {};
+
+      // 5. 创建投稿记录
+      const submission = await this.submissionService.createSubmission({
+        jobId: options.jobId,
+        title:
+          uploadSettings.title || this.generateDefaultTitle(streamer.name),
+        description: uploadSettings.description,
+        tags: uploadSettings.tags || [],
+        tid: uploadSettings.tid || 171,
+      });
+
+      // 6. 派发投稿任务
+      const submissionQueue =
+        this.bullFramework.getQueue('bilibili-submission');
+      if (submissionQueue) {
+        await submissionQueue.addJobToQueue({
+          submissionId: submission.id,
+        });
+      }
+
+      this.logger.info('Auto submission triggered', {
+        jobId: options.jobId,
+        submissionId: submission.id,
+        reason: endData.reason,
+        segmentCount: videoSegments.length,
+      });
+    } catch (error) {
+      this.logger.error('Failed to trigger auto submission', {
+        jobId: options.jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * 生成默认投稿标题
+   */
+  private generateDefaultTitle(streamerName: string): string {
+    const now = new Date();
+    const date = now.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    return `${streamerName}的直播录像 ${date}`;
   }
 }
