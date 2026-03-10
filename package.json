@@ -13,6 +13,7 @@
     "build": "mwtsc --cleanOutDir",
     "migration:show": "ts-node ./node_modules/typeorm/cli.js migration:show -d src/config/typeorm.config.ts",
     "migration:run": "ts-node ./node_modules/typeorm/cli.js migration:run -d src/config/typeorm.config.ts",
+    "migration:run:prod": "node dist/scripts/run-migrations.js",
     "migration:revert": "ts-node ./node_modules/typeorm/cli.js migration:revert -d src/config/typeorm.config.ts"
   },
   "dependencies": {

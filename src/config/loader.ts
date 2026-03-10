@@ -2,7 +2,7 @@
  * Configuration Loader
  *
  * 配置优先级：环境变量 > 配置文件 > 默认值
- * 配置文件路径：~/.streamer_helper/config.yaml
+ * 配置文件路径：~/.streamerhelper/config.yaml
  */
 
 import * as fs from 'fs';
@@ -12,9 +12,9 @@ import * as os from 'os';
 import * as path from 'path';
 
 // 配置目录和文件路径
-// 优先级：环境变量 CONFIG_PATH > /app/config (Docker) > ~/.streamer-helper (本地开发)
+// 优先级：环境变量 CONFIG_PATH > /app/config (Docker) > ~/.streamerhelper (本地开发)
 const CONFIG_DIR = process.env.CONFIG_DIR ||
-  (fs.existsSync('/app/config') ? '/app/config' : path.join(os.homedir(), '.streamer-helper'));
+  (fs.existsSync('/app/config') ? '/app/config' : path.join(os.homedir(), '.streamerhelper'));
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.yaml');
 
 // 配置接口定义

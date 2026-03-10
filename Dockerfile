@@ -1,19 +1,23 @@
-# 构建阶段
+## ===== 构建阶段 =====
 FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-# 安装依赖
+# 只拷贝依赖文件，利用缓存
 COPY package*.json ./
-RUN npm ci --only=production
 
-# 复制源代码
+# 安装全部依赖（包含 devDependencies），用于构建
+RUN npm ci
+
+# 复制源代码并构建 TypeScript
 COPY . .
-
-# 构建 TypeScript
 RUN npm run build
 
-# 生产阶段
+# 构建完成后裁剪掉 devDependencies，只保留生产依赖
+RUN npm prune --omit=dev
+
+
+## ===== 生产阶段 =====
 FROM node:18-alpine
 
 # 安装 FFmpeg
@@ -21,7 +25,10 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
-# 复制构建产物和依赖
+# 运行环境设为生产
+ENV NODE_ENV=production
+
+# 复制构建产物和仅保留生产依赖
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist

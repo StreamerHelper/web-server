@@ -3,17 +3,23 @@ version: '3.8'
 services:
   app:
     build: .
+    command: sh -c "node dist/scripts/run-migrations.js && node bootstrap.js"
     ports:
       - "7001:7001"
     volumes:
-      # 方式一：挂载配置文件目录
-      - ~/.streamer_helper:/app/config:ro
+      
+      - ~/.streamerhelper:/app/config:ro
       # 临时文件目录
       - ./temp:/app/temp
     environment:
-      # 方式二：通过环境变量覆盖配置（推荐用于生产环境）
       - NODE_ENV=production
-      # - TYPEORM_HOST=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=streamerhelper
+      # 可选：覆盖为生产配置
+      # - DB_PASSWORD=${DB_PASSWORD}
       # - TYPEORM_PORT=5432
       # - TYPEORM_USERNAME=postgres
       # - TYPEORM_PASSWORD=${DB_PASSWORD}
