@@ -1,25 +1,25 @@
+import { Framework } from '@midwayjs/bullmq';
 import {
   App,
   Config,
-  Inject,
   ILogger,
+  Inject,
   Logger,
   Provide,
   Scope,
   ScopeEnum,
 } from '@midwayjs/core';
 import { Application } from '@midwayjs/koa';
-import { Framework } from '@midwayjs/bullmq';
 import { JOB_STATUS, Platform } from '../interface';
+import { BilibiliSubmissionService } from './bilibili-submission.service';
 import { DanmakuManager } from './danmaku.service';
 import { JobService } from './job.service';
-import { StreamerService } from './streamer.service';
-import { BilibiliSubmissionService } from './bilibili-submission.service';
 import {
   Recording,
   RecordingEndEvent,
   RecordingInputOptions,
 } from './recording';
+import { StreamerService } from './streamer.service';
 
 /**
  * 录制管理器（单例）
@@ -36,7 +36,7 @@ export class RecorderManager {
   @App()
   app: Application;
 
-  @Config('livestream.recorder')
+  @Config('streamerhelper.recorder')
   private recorderConfig: {
     heartbeatInterval: number;
     heartbeatTimeout: number;

@@ -2,11 +2,11 @@ import { Framework } from '@midwayjs/bullmq';
 import { App, Controller, Get, Inject, Post, Query } from '@midwayjs/core';
 import { Application, Context } from '@midwayjs/koa';
 import {
-  FailedStreamerInfo,
-  LiveStreamerInfo,
-  OfflineStreamerInfo,
-  Platform,
-  StreamerLiveStatus,
+    FailedStreamerInfo,
+    LiveStreamInfo,
+    OfflineStreamerInfo,
+    Platform,
+    StreamerLiveStatus,
 } from '../interface';
 import { JobService } from '../service/job.service';
 import { PlatformService } from '../service/platform.service';
@@ -135,7 +135,7 @@ export class SystemController {
           live: {
             count: live.length,
             streamers: live.map(
-              (s): LiveStreamerInfo => ({
+              (s): LiveStreamInfo => ({
                 id: s.streamer.id,
                 streamerId: s.streamer.streamerId,
                 name: s.streamer.name,

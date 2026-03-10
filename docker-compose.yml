@@ -17,7 +17,7 @@ services:
       # - TYPEORM_PORT=5432
       # - TYPEORM_USERNAME=postgres
       # - TYPEORM_PASSWORD=${DB_PASSWORD}
-      # - TYPEORM_DATABASE=livestream
+      # - TYPEORM_DATABASE=streamerhelper
       # - REDIS_HOST=redis
       # - S3_ENDPOINT=http://minio:9000
     depends_on:
@@ -32,7 +32,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: livestream
+      POSTGRES_DB: streamerhelper
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:

@@ -17,7 +17,7 @@ import { StreamerService } from '../service/streamer.service';
   },
 })
 export class PollerProcessor implements IProcessor {
-  @Config('livestream.poller')
+  @Config('streamerhelper.poller')
   private pollerConfig: {
     concurrency: number;
   };

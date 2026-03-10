@@ -88,7 +88,7 @@ Bull Board 已集成到应用中，无需额外服务。
 
 - Access Key: `minioadmin`
 - Secret Key: `minioadmin`
-- 默认桶: `livestream-archive`
+- 默认桶: `streamerhelper-archive`
 
 ## pgAdmin 使用
 
@@ -102,7 +102,7 @@ Bull Board 已集成到应用中，无需额外服务。
 - Port: `5432`
 - Username: `postgres`
 - Password: `postgres`
-- Database: `livestream`
+- Database: `streamerhelper`
 
 ## 数据持久化
 

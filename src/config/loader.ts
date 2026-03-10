@@ -6,15 +6,15 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import * as yaml from 'js-yaml';
 import { merge } from 'lodash';
+import * as os from 'os';
+import * as path from 'path';
 
 // 配置目录和文件路径
-// 优先级：环境变量 CONFIG_PATH > /app/config (Docker) > ~/.streamer_helper (本地开发)
+// 优先级：环境变量 CONFIG_PATH > /app/config (Docker) > ~/.streamer-helper (本地开发)
 const CONFIG_DIR = process.env.CONFIG_DIR ||
-  (fs.existsSync('/app/config') ? '/app/config' : path.join(os.homedir(), '.streamer_helper'));
+  (fs.existsSync('/app/config') ? '/app/config' : path.join(os.homedir(), '.streamer-helper'));
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.yaml');
 
 // 配置接口定义
@@ -75,7 +75,7 @@ const DEFAULT_CONFIG: AppConfig = {
     port: 5432,
     username: 'postgres',
     password: 'postgres',
-    database: 'livestream',
+    database: 'streamerhelper',
     ssl: false,
   },
   redis: {
@@ -89,7 +89,7 @@ const DEFAULT_CONFIG: AppConfig = {
     region: 'us-east-1',
     accessKey: 'minioadmin',
     secretKey: 'minioadmin',
-    bucket: 'livestream-archive',
+    bucket: 'streamerhelper-archive',
   },
   recorder: {
     segmentDuration: 10,
@@ -218,7 +218,7 @@ database:
   port: 5432
   username: postgres
   password: postgres
-  database: livestream
+  database: streamerhelper
   ssl: false              # 生产环境建议开启
 
 # ===========================================
@@ -238,7 +238,7 @@ s3:
   region: us-east-1
   accessKey: minioadmin
   secretKey: minioadmin
-  bucket: livestream-archive
+  bucket: streamerhelper-archive
 
 # ===========================================
 # 录制器配置

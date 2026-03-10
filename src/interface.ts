@@ -387,7 +387,7 @@ export interface StreamerLiveStatus {
 }
 
 /** 开播中的主播简略信息 */
-export interface LiveStreamerInfo {
+export interface LiveStreamInfo {
   id: string;
   streamerId: string;
   name: string;

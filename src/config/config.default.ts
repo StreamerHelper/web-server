@@ -44,7 +44,7 @@ export default {
       password: config.redis.password || undefined,
       db: config.redis.db,
     },
-    defaultPrefix: '{livestream}',
+    defaultPrefix: '{streamerhelper}',
     defaultQueueOptions: {
       defaultJobOptions: {
         removeOnComplete: 10,
@@ -62,7 +62,7 @@ export default {
     },
   },
 
-  livestream: {
+  streamerhelper: {
     // S3/MinIO 配置
     s3: {
       endpoint: config.s3.endpoint,
@@ -118,7 +118,7 @@ export default {
     clients: {
       appLogger: {
         level: isProduction ? 'info' : 'debug',
-        fileLogName: 'livestream-app.log',
+        fileLogName: 'streamerhelper-app.log',
       },
       coreLogger: {
         level: 'warn',
