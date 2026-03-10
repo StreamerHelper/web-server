@@ -26,8 +26,11 @@ COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 
-# 创建日志和临时目录
-RUN mkdir -p logs temp
+# 创建日志、临时和配置目录
+RUN mkdir -p logs temp config
+
+# 配置目录（可通过 volume 挂载）
+VOLUME ["/app/config"]
 
 # 暴露端口
 EXPOSE 7001

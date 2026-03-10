@@ -1,11 +1,16 @@
 import { MidwayConfig } from '@midwayjs/core';
+import { getConfig } from './loader';
+
+// 加载配置
+const config = getConfig();
+const isProduction = config.app.nodeEnv === 'production';
 
 export default {
-  // use for cookie sign key, should change to your own and keep security
-  keys: '1769452436380_8289',
+  // Cookie 签名密钥
+  keys: config.app.keys,
 
   koa: {
-    port: 7001,
+    port: config.app.port,
   },
 
   // TypeORM 配置
@@ -13,16 +18,17 @@ export default {
     dataSource: {
       default: {
         type: 'postgres',
-        host: 'localhost',
-        port: 5432,
-        username: 'postgres',
-        password: 'postgres',
-        database: 'livestream',
-        ssl: false,
+        host: config.database.host,
+        port: config.database.port,
+        username: config.database.username,
+        password: config.database.password,
+        database: config.database.database,
+        ssl: config.database.ssl,
         entities: ['**/entity/*.entity{.ts,.js}'],
         synchronize: false,
         migrations: ['dist/migration/**/*.js'],
-        logging: false,
+        migrationsRun: isProduction,
+        logging: !isProduction,
         extra: {
           timezone: 'UTC',
         },
@@ -33,10 +39,10 @@ export default {
   // BullMQ 配置
   bullmq: {
     defaultConnection: {
-      host: 'localhost',
-      port: 6379,
-      password: undefined,
-      db: 0,
+      host: config.redis.host,
+      port: config.redis.port,
+      password: config.redis.password || undefined,
+      db: config.redis.db,
     },
     defaultPrefix: '{livestream}',
     defaultQueueOptions: {
@@ -59,59 +65,59 @@ export default {
   livestream: {
     // S3/MinIO 配置
     s3: {
-      endpoint: 'http://localhost:9000',
-      region: 'us-east-1',
+      endpoint: config.s3.endpoint,
+      region: config.s3.region,
       credentials: {
-        accessKeyId: 'minioadmin',
-        secretAccessKey: 'minioadmin',
+        accessKeyId: config.s3.accessKey,
+        secretAccessKey: config.s3.secretKey,
       },
-      bucket: 'livestream-archive',
+      bucket: config.s3.bucket,
       forcePathStyle: true,
     },
 
     // Redis 配置
     redis: {
-      host: 'localhost',
-      port: 6379,
-      password: undefined,
-      db: 0,
+      host: config.redis.host,
+      port: config.redis.port,
+      password: config.redis.password || undefined,
+      db: config.redis.db,
       lockTTL: 300,
     },
 
     // 录制器配置
     recorder: {
-      segmentDuration: 10, // 秒
-      cacheMaxSegments: 3,
-      heartbeatInterval: 5, // 秒 - 心跳发送间隔
-      heartbeatTimeout: 10, // 秒 - 心跳超时时间
-      maxRecordingTime: 24 * 60 * 60, // 秒 - 最长录制时间（24小时）
+      segmentDuration: config.recorder.segmentDuration,
+      cacheMaxSegments: config.recorder.cacheMaxSegments,
+      heartbeatInterval: config.recorder.heartbeatInterval,
+      heartbeatTimeout: config.recorder.heartbeatTimeout,
+      maxRecordingTime: config.recorder.maxRecordingTime,
     },
 
     // 轮询器配置
     poller: {
-      checkInterval: 60, // 秒
-      totalInstances: 1,
-      concurrency: 5,
+      checkInterval: config.poller.checkInterval,
+      totalInstances: config.poller.totalInstances,
+      concurrency: config.poller.concurrency,
     },
 
     // 日志配置
     logging: {
-      level: 'debug',
-      pretty: true,
+      level: isProduction ? 'info' : 'debug',
+      pretty: !isProduction,
     },
   },
 
   // 投稿配置
   submission: {
-    defaultTid: 171, // 默认分区（电子竞技）
-    defaultTitleTemplate: '{streamerName}的直播录像 {date}',
+    defaultTid: config.upload.defaultTid,
+    defaultTitleTemplate: config.upload.defaultTitleTemplate,
   },
 
   // 日志配置
   midwayLogger: {
     clients: {
       appLogger: {
-        level: 'debug',
+        level: isProduction ? 'info' : 'debug',
         fileLogName: 'livestream-app.log',
       },
       coreLogger: {
