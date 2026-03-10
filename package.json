@@ -1,8 +1,7 @@
 {
-  "name": "livestream-helper",
-  "version": "1.0.0",
-  "description": "Livestream Recording Helper - Powered by MidwayJS",
-  "private": true,
+  "name": "@streamerhelper/web-server",
+  "version": "2.0.0",
+  "description": "StreamerHelper Web Server",
   "scripts": {
     "start": "NODE_ENV=production node ./bootstrap.js",
     "dev": "cross-env NODE_ENV=local mwtsc --watch --run @midwayjs/mock/app.js",
