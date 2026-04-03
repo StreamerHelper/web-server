@@ -1,0 +1,16 @@
+node_modules
+dist
+logs
+temp
+.env
+.env.local
+*.log
+.DS_Store
+.vscode
+.idea
+*.md
+!README.md
+.git
+.github
+coverage
+.nyc_output
