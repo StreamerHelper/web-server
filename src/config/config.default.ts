@@ -123,6 +123,10 @@ export default {
         level: isProduction ? 'info' : 'debug',
         fileLogName: 'streamerhelper-app.log',
       },
+      ffmpegExitLogger: {
+        level: 'info',
+        fileLogName: 'streamerhelper-ffmpeg-exit.log',
+      },
       coreLogger: {
         level: 'warn',
         fileLogName: 'midway-core.log',

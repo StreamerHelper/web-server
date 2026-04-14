@@ -7,7 +7,13 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import { throttle } from 'lodash';
 import * as path from 'path';
-import { JOB_STATUS, Platform, SegmentInfo } from '../interface';
+import {
+  JOB_STATUS,
+  Platform,
+  RecordingQuality,
+  ResolvedStream,
+  SegmentInfo,
+} from '../interface';
 import { DanmakuManager } from './danmaku.service';
 import { FFmpegExitEvent, FFmpegService } from './ffmpeg.service';
 import { HighlightService } from './highlight.service';
@@ -26,6 +32,11 @@ export interface RecordingInputOptions {
   roomId: string;
   outputDir: string;
   segmentTime?: number;
+  requestedQuality?: RecordingQuality;
+  effectiveQuality?: RecordingQuality;
+  qualityApplied?: boolean;
+  qualityNote?: string;
+  refreshStream?: () => Promise<ResolvedStream>;
 }
 
 /**
@@ -51,6 +62,7 @@ export interface RecordingOptions extends RecordingInputOptions {
 
   // 日志
   logger: ILogger;
+  ffmpegFailureLogger?: ILogger;
 
   // 录制器配置（可选，默认使用内置值）
   recordingConfig?: Partial<RecordingConfig>;
@@ -89,6 +101,17 @@ interface SegmentRecord {
   duration: number;
 }
 
+interface UploadSettlementSummary {
+  expectedVideoSegments: number;
+  uploadedVideoSegments: number;
+  failedVideoSegments: number;
+  expectedDanmakuSegments: number;
+  uploadedDanmakuSegments: number;
+  failedDanmakuSegments: number;
+  settled: boolean;
+  timedOut: boolean;
+}
+
 /**
  * Recording 类 - 管理单个录制任务的完整生命周期
  *
@@ -110,6 +133,9 @@ interface SegmentRecord {
 export class Recording extends EventEmitter {
   // 事件类型定义
   static readonly EVENT_END = 'end' as const;
+  private static readonly MAX_FFMPEG_RESTART_ATTEMPTS = 5;
+  private static readonly FFMPEG_RESTART_BASE_DELAY_MS = 2000;
+  private static readonly FFMPEG_RESTART_MAX_DELAY_MS = 15000;
 
   /**
    * 类型化的事件发射
@@ -134,11 +160,15 @@ export class Recording extends EventEmitter {
   readonly jobId: string;
   readonly platform: Platform;
   readonly streamerId: string;
-  readonly streamUrl: string;
+  streamUrl: string;
   readonly danmakuUrl: string;
   readonly roomId: string;
   readonly outputDir: string;
   readonly segmentTime: number;
+  readonly requestedQuality?: RecordingQuality;
+  effectiveQuality?: RecordingQuality;
+  qualityApplied?: boolean;
+  qualityNote?: string;
   readonly videoDir: string;
   readonly danmakuDir: string;
   readonly startTime: number;
@@ -152,6 +182,7 @@ export class Recording extends EventEmitter {
 
   // 日志
   private logger: ILogger;
+  private ffmpegFailureLogger?: ILogger;
 
   /**
    * 目录配置（从 RecordingOptions 解构）
@@ -194,13 +225,16 @@ export class Recording extends EventEmitter {
   // ========== 心跳相关 ==========
   private heartbeatTimer: NodeJS.Timeout | null = null; // 心跳超时定时器
   private maxDurationTimer: NodeJS.Timeout | null = null;
+  private ffmpegRestartTimer: NodeJS.Timeout | null = null;
   private lastFFmpegOutputTime = 0; // FFmpeg 最后输出时间
+  private ffmpegRestartAttempts = 0;
   private failureReason: string | null = null;
   private recordingFailed = false;
   private throttledUpdateHeartbeat: (() => void) & { cancel(): void }; // 节流的心跳更新函数
 
   // ========== 录制器配置 ==========
   private readonly recordingConfig: RecordingConfig;
+  private readonly refreshStream?: () => Promise<ResolvedStream>;
 
   constructor(options: RecordingOptions) {
     super();
@@ -215,6 +249,11 @@ export class Recording extends EventEmitter {
     this.roomId = options.roomId;
     this.outputDir = options.outputDir;
     this.segmentTime = options.segmentTime ?? 10;
+    this.requestedQuality = options.requestedQuality;
+    this.effectiveQuality = options.effectiveQuality;
+    this.qualityApplied = options.qualityApplied;
+    this.qualityNote = options.qualityNote;
+    this.refreshStream = options.refreshStream;
     this.videoDir = path.join(this.outputDir, 'video');
     this.danmakuDir = path.join(this.outputDir, 'danmaku');
     this.startTime = Date.now();
@@ -243,6 +282,7 @@ export class Recording extends EventEmitter {
 
     // 保存 logger 引用
     this.logger = options.logger;
+    this.ffmpegFailureLogger = options.ffmpegFailureLogger;
 
     // 创建 FFmpeg 服务实例
     this.ffmpeg = new FFmpegService();
@@ -264,6 +304,8 @@ export class Recording extends EventEmitter {
       jobId: this.jobId,
       platform: this.platform,
       streamerId: this.streamerId,
+      requestedQuality: this.requestedQuality,
+      effectiveQuality: this.effectiveQuality,
     });
 
     try {
@@ -274,8 +316,18 @@ export class Recording extends EventEmitter {
       // 2. 更新 Job 状态
       await this.jobService.updateStatus(this.id, JOB_STATUS.RECORDING);
       await this.jobService.updateMetadata(this.id, {
+        stream_url: this.streamUrl,
+        danmaku_url: this.danmakuUrl,
+        requestedQuality: this.requestedQuality,
+        effectiveQuality: this.effectiveQuality,
+        qualityApplied: this.qualityApplied,
+        qualityNote: this.qualityNote,
+        ffmpegRequestedQuality: this.effectiveQuality ?? this.requestedQuality,
         totalSegments: 0,
         uploadedSegments: [],
+        failedVideoSegments: [],
+        uploadedDanmakuSegments: [],
+        failedDanmakuSegments: [],
       });
 
       // 3. 创建并启动 Highlight 检测（每个 Recording 独立实例）
@@ -294,17 +346,7 @@ export class Recording extends EventEmitter {
       this.startHeartbeatCheck();
 
       // 7. 启动 FFmpeg（传入 onOutput 回调用于心跳维护）
-      this.ffmpeg.start({
-        streamUrl: this.streamUrl,
-        outputDir: this.videoDir,
-        segmentTime: this.segmentTime,
-        listFilePath: this.pathsConfig.listFilePath,
-        logger: this.logger,
-        id: this.id,
-        onOutput: () => {
-          this.handleFFmpegOutput();
-        }, // FFmpeg 有输出时调用
-      });
+      this.startFFmpegProcess();
 
       // 8. 启动分片监听
       this.startSegmentWatcher();
@@ -368,6 +410,10 @@ export class Recording extends EventEmitter {
       clearTimeout(this.maxDurationTimer);
       this.maxDurationTimer = null;
     }
+    if (this.ffmpegRestartTimer) {
+      clearTimeout(this.ffmpegRestartTimer);
+      this.ffmpegRestartTimer = null;
+    }
 
     // 停止 FFmpeg
     await this.ffmpeg.stop();
@@ -381,16 +427,35 @@ export class Recording extends EventEmitter {
     // 清理监听器
     this.cleanup();
 
+    await this.jobService.updateMetadata(this.id, {
+      totalSegments: this.videoSegments.length,
+    });
+    await this.jobService.updateStatus(this.id, JOB_STATUS.PROCESSING);
+
+    const uploadSummary = await this.waitForUploadsToSettle();
+    if (
+      (uploadSummary.failedVideoSegments > 0 ||
+        uploadSummary.failedDanmakuSegments > 0) &&
+      !this.failureReason
+    ) {
+      this.failureReason =
+        'One or more upload jobs failed after recording stopped';
+      this.recordingFailed = true;
+    }
+    if (uploadSummary.timedOut) {
+      this.failureReason =
+        this.failureReason ||
+        'Timed out waiting for upload jobs to settle after recording stopped';
+      this.recordingFailed = true;
+    }
+
     // 更新最终状态
-    const finalStatus = this.getFinalStatus(reason);
+    const finalStatus = this.getFinalStatus(reason, uploadSummary);
     await this.jobService.updateStatus(
       this.id,
       finalStatus,
       this.failureReason || undefined
     );
-    await this.jobService.updateMetadata(this.id, {
-      totalSegments: this.videoSegments.length,
-    });
 
     this.status = finalStatus as RecordingStatus;
     this.logger.info('Recording stopped', {
@@ -399,10 +464,29 @@ export class Recording extends EventEmitter {
       finalStatus,
       videoSegments: this.videoSegments.length,
       danmakuSegments: this.danmakuSegments.length,
+      uploadSummary,
     });
 
-    // 调度清理任务（10分钟后）
-    await this.scheduleCleanup();
+    if (this.shouldLogAbnormalRecorderExit(reason, finalStatus, uploadSummary)) {
+      this.logAbnormalRecorderExit(reason, finalStatus, uploadSummary);
+    }
+
+    const hasFailedUploads =
+      uploadSummary.failedVideoSegments > 0 ||
+      uploadSummary.failedDanmakuSegments > 0;
+
+    // 只有在上传全部成功时才删除本地源文件
+    if (uploadSummary.settled && !hasFailedUploads) {
+      await this.scheduleCleanup();
+    } else {
+      this.logger.warn(
+        'Skipping cleanup because uploads are not fully successful',
+        {
+          id: this.id,
+          uploadSummary,
+        }
+      );
+    }
   }
 
   /**
@@ -445,6 +529,14 @@ export class Recording extends EventEmitter {
    * 处理 FFmpeg 进程退出
    */
   private handleFFmpegExit(event: FFmpegExitEvent): void {
+    // 处理剩余分片
+    this.processListChanges().catch(err => {
+      this.logger.error('Failed to process remaining segments', {
+        id: this.id,
+        error: err.message,
+      });
+    });
+
     if (event.isNatural) {
       this.logger.info('FFmpeg process exited - stream ended', {
         id: this.id,
@@ -458,21 +550,121 @@ export class Recording extends EventEmitter {
         signal: event.signal,
       });
     } else {
-      this.logger.warn('FFmpeg process exited abnormally', {
+      this.scheduleFFmpegRestart(event);
+    }
+  }
+
+  private startFFmpegProcess(): void {
+    this.lastFFmpegOutputTime = Date.now();
+    this.resetHeartbeatTimer();
+    this.ffmpeg.start({
+      streamUrl: this.streamUrl,
+      outputDir: this.videoDir,
+      segmentTime: this.segmentTime,
+      listFilePath: this.pathsConfig.listFilePath,
+      platform: this.platform,
+      roomId: this.roomId,
+      requestedQuality: this.requestedQuality,
+      effectiveQuality: this.effectiveQuality,
+      logger: this.logger,
+      failureLogger: this.ffmpegFailureLogger,
+      id: this.id,
+      onOutput: message => {
+        this.handleFFmpegOutput(message);
+      },
+    });
+  }
+
+  private scheduleFFmpegRestart(event: FFmpegExitEvent): void {
+    if (this.ffmpegRestartTimer || this.isStopping) {
+      return;
+    }
+
+    this.ffmpegRestartAttempts += 1;
+
+    if (this.ffmpegRestartAttempts > Recording.MAX_FFMPEG_RESTART_ATTEMPTS) {
+      this.logger.error('FFmpeg restart limit reached', {
         id: this.id,
+        attempts: this.ffmpegRestartAttempts - 1,
         code: event.code,
         signal: event.signal,
       });
       this.recordingFailed = true;
-      this.failureReason = `FFmpeg exited with code ${event.code}`;
+      this.failureReason = `FFmpeg restart limit reached after ${
+        this.ffmpegRestartAttempts - 1
+      } attempts`;
+      this.resolveEndReason?.('ffmpeg_error');
+      return;
     }
 
-    // 处理剩余分片
-    this.processListChanges().catch(err => {
-      this.logger.error('Failed to process remaining segments', {
+    const delayMs = Math.min(
+      Recording.FFMPEG_RESTART_BASE_DELAY_MS * this.ffmpegRestartAttempts,
+      Recording.FFMPEG_RESTART_MAX_DELAY_MS
+    );
+
+    this.lastFFmpegOutputTime = Date.now();
+    this.resetHeartbeatTimer();
+
+    this.logger.warn('FFmpeg exited unexpectedly, scheduling restart', {
+      id: this.id,
+      code: event.code,
+      signal: event.signal,
+      attempt: this.ffmpegRestartAttempts,
+      delayMs,
+    });
+
+    this.ffmpegRestartTimer = setTimeout(() => {
+      this.ffmpegRestartTimer = null;
+      void this.restartFFmpegProcess();
+    }, delayMs);
+  }
+
+  private async restartFFmpegProcess(): Promise<void> {
+    if (this.isStopping) {
+      return;
+    }
+
+    try {
+      await this.refreshStreamUrl();
+      this.startFFmpegProcess();
+      this.logger.info('FFmpeg restarted', {
         id: this.id,
-        error: err.message,
+        attempt: this.ffmpegRestartAttempts,
+        streamUrl: this.streamUrl,
       });
+    } catch (error) {
+      this.logger.error('Failed to restart FFmpeg', {
+        id: this.id,
+        attempt: this.ffmpegRestartAttempts,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      this.scheduleFFmpegRestart({
+        code: null,
+        signal: null,
+        isNatural: false,
+      });
+    }
+  }
+
+  private async refreshStreamUrl(): Promise<void> {
+    if (!this.refreshStream) {
+      return;
+    }
+
+    const resolved = await this.refreshStream();
+    this.streamUrl = resolved.url;
+    this.effectiveQuality = resolved.effectiveQuality;
+    this.qualityApplied = resolved.qualityApplied;
+    this.qualityNote = resolved.note;
+
+    await this.jobService.updateMetadata(this.id, {
+      stream_url: resolved.url,
+      effectiveQuality: resolved.effectiveQuality,
+      qualityApplied: resolved.qualityApplied,
+      qualityNote: resolved.note,
+      ffmpegRequestedQuality:
+        resolved.effectiveQuality ?? this.requestedQuality,
     });
   }
 
@@ -569,6 +761,7 @@ export class Recording extends EventEmitter {
 
       this.segmentCount++;
       this.lastSegmentTime = timestamp;
+      this.ffmpegRestartAttempts = 0;
 
       // 触发上传
       const uploadQueue = this.bullFramework.getQueue('upload');
@@ -620,7 +813,7 @@ export class Recording extends EventEmitter {
       return Date.now();
     }
 
-    const [_, date, time] = match;
+    const [, date, time] = match;
     const isoStr = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(
       6,
       8
@@ -673,8 +866,12 @@ export class Recording extends EventEmitter {
    * 处理 FFmpeg 输出（由 FFmpegService 回调）
    * 每次 FFmpeg 有 stderr 输出时调用
    */
-  private async handleFFmpegOutput(): Promise<void> {
+  private async handleFFmpegOutput(message?: string): Promise<void> {
     this.lastFFmpegOutputTime = Date.now();
+
+    if (message) {
+      this.captureMediaMetadata(message);
+    }
 
     // 节流更新 Job metadata
     this.throttledUpdateHeartbeat();
@@ -770,6 +967,30 @@ export class Recording extends EventEmitter {
       });
   }
 
+  private captureMediaMetadata(message: string): void {
+    const videoStreamMatch = message.match(
+      /Video:\s*([^,\s]+).*?(\d{2,5}x\d{2,5})(?:[^,\n]*,\s*(\d+)\s*kb\/s)?/i
+    );
+
+    if (!videoStreamMatch) {
+      return;
+    }
+
+    const [, codec, resolution, bitrate] = videoStreamMatch;
+    this.jobService
+      .updateMetadata(this.id, {
+        codec,
+        resolution,
+        bitrate: bitrate ? Number(bitrate) : undefined,
+      })
+      .catch(err => {
+        this.logger.error('Failed to update media metadata', {
+          id: this.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
   /**
    * 等待录制完成
    * 返回一个 Promise，当 resolveEndReason 被调用时 resolve
@@ -806,11 +1027,7 @@ export class Recording extends EventEmitter {
             highlightId: event.highlightId,
           });
 
-          const currentJob = await this.jobService.findById(this.id);
-          const existingHighlights = currentJob?.metadata?.highlights || [];
-          await this.jobService.updateMetadata(this.id, {
-            highlights: [...existingHighlights, event.highlight],
-          });
+          await this.jobService.addHighlight(this.id, event.highlight);
         } catch (error) {
           this.logger.error('Failed to save highlight', {
             id: this.id,
@@ -947,12 +1164,156 @@ export class Recording extends EventEmitter {
     }
   }
 
+  private async waitForUploadsToSettle(): Promise<UploadSettlementSummary> {
+    const timeoutMs = 10 * 60 * 1000;
+    const pollIntervalMs = 2000;
+    const startedAt = Date.now();
+    let lastProgressLogAt = 0;
+
+    while (true) {
+      const currentJob = await this.jobService.findById(this.id);
+      if (!currentJob) {
+        return {
+          expectedVideoSegments: this.videoSegments.length,
+          uploadedVideoSegments: 0,
+          failedVideoSegments: this.videoSegments.length,
+          expectedDanmakuSegments: this.danmakuSegments.length,
+          uploadedDanmakuSegments: 0,
+          failedDanmakuSegments: this.danmakuSegments.length,
+          settled: false,
+          timedOut: true,
+        };
+      }
+
+      const uploadedVideoSegments = currentJob.metadata?.uploadedSegments || [];
+      const failedVideoSegments =
+        currentJob.metadata?.failedVideoSegments || [];
+      const uploadedDanmakuSegments =
+        currentJob.metadata?.uploadedDanmakuSegments || [];
+      const failedDanmakuSegments =
+        currentJob.metadata?.failedDanmakuSegments || [];
+
+      const summary: UploadSettlementSummary = {
+        expectedVideoSegments: this.videoSegments.length,
+        uploadedVideoSegments: uploadedVideoSegments.length,
+        failedVideoSegments: failedVideoSegments.length,
+        expectedDanmakuSegments: this.danmakuSegments.length,
+        uploadedDanmakuSegments: uploadedDanmakuSegments.length,
+        failedDanmakuSegments: failedDanmakuSegments.length,
+        settled:
+          uploadedVideoSegments.length + failedVideoSegments.length >=
+            this.videoSegments.length &&
+          uploadedDanmakuSegments.length + failedDanmakuSegments.length >=
+            this.danmakuSegments.length,
+        timedOut: false,
+      };
+
+      if (summary.settled) {
+        return summary;
+      }
+
+      if (Date.now() - startedAt >= timeoutMs) {
+        return {
+          ...summary,
+          timedOut: true,
+        };
+      }
+
+      if (Date.now() - lastProgressLogAt >= 30000) {
+        this.logger.info('Waiting for upload jobs to settle', {
+          id: this.id,
+          summary,
+        });
+        lastProgressLogAt = Date.now();
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+
   /**
    * 根据结束原因获取最终状态
    */
-  private getFinalStatus(reason: RecordingEndReason): JOB_STATUS {
+  private getFinalStatus(
+    reason: RecordingEndReason,
+    uploadSummary?: UploadSettlementSummary
+  ): JOB_STATUS {
     if (reason === 'cancelled') return JOB_STATUS.CANCELLED;
-    if (reason === 'failed' || this.recordingFailed) return JOB_STATUS.FAILED;
+    if (
+      !this.failureReason &&
+      (reason === 'heartbeat_timeout' || reason === 'ffmpeg_error')
+    ) {
+      this.failureReason =
+        reason === 'heartbeat_timeout'
+          ? 'FFmpeg heartbeat timed out while recording'
+          : 'FFmpeg exited unexpectedly and retry limit was reached';
+    }
+    if (
+      reason === 'failed' ||
+      reason === 'heartbeat_timeout' ||
+      reason === 'ffmpeg_error' ||
+      this.recordingFailed ||
+      uploadSummary?.timedOut ||
+      (uploadSummary?.failedVideoSegments || 0) > 0 ||
+      (uploadSummary?.failedDanmakuSegments || 0) > 0
+    ) {
+      return JOB_STATUS.FAILED;
+    }
     return JOB_STATUS.COMPLETED;
+  }
+
+  private shouldLogAbnormalRecorderExit(
+    reason: RecordingEndReason,
+    finalStatus: JOB_STATUS,
+    uploadSummary: UploadSettlementSummary
+  ): boolean {
+    return (
+      finalStatus === JOB_STATUS.FAILED ||
+      reason === 'failed' ||
+      reason === 'heartbeat_timeout' ||
+      reason === 'ffmpeg_error' ||
+      reason === 'max_duration' ||
+      uploadSummary.timedOut
+    );
+  }
+
+  private logAbnormalRecorderExit(
+    reason: RecordingEndReason,
+    finalStatus: JOB_STATUS,
+    uploadSummary: UploadSettlementSummary
+  ): void {
+    const endTime = Date.now();
+
+    this.ffmpegFailureLogger?.error('Recorder abnormal exit', {
+      id: this.id,
+      jobId: this.jobId,
+      platform: this.platform,
+      streamerId: this.streamerId,
+      roomId: this.roomId,
+      reason,
+      finalStatus,
+      failureReason: this.failureReason,
+      recordingFailed: this.recordingFailed,
+      status: this.status,
+      startTime: this.startTime,
+      endTime,
+      durationMs: endTime - this.startTime,
+      streamUrl: this.streamUrl,
+      danmakuUrl: this.danmakuUrl,
+      requestedQuality: this.requestedQuality,
+      effectiveQuality: this.effectiveQuality,
+      qualityApplied: this.qualityApplied,
+      qualityNote: this.qualityNote,
+      outputDir: this.outputDir,
+      videoDir: this.videoDir,
+      danmakuDir: this.danmakuDir,
+      listFilePath: this.pathsConfig.listFilePath,
+      ffmpegRestartAttempts: this.ffmpegRestartAttempts,
+      lastFFmpegOutputTime: this.lastFFmpegOutputTime,
+      segmentCount: this.segmentCount,
+      videoSegments: this.videoSegments.length,
+      danmakuSegments: this.danmakuSegments.length,
+      uploadSummary,
+    });
   }
 }

@@ -3,12 +3,20 @@ import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { In, LessThan, Repository } from 'typeorm';
 import { Job, Streamer } from '../entity';
-import { JOB_STATUS, JobStatus } from '../interface';
+import { Highlight, JOB_STATUS, JobStatus } from '../interface';
 import dayjs = require('dayjs');
 
 @Provide()
 @Scope(ScopeEnum.Singleton)
 export class JobService {
+  private static readonly ARRAY_METADATA_FIELDS = new Set([
+    'uploadedSegments',
+    'failedVideoSegments',
+    'uploadedDanmakuSegments',
+    'failedDanmakuSegments',
+    'highlights',
+  ]);
+
   @InjectEntityModel(Job)
   jobModel: Repository<Job>;
 
@@ -225,11 +233,19 @@ export class JobService {
     id: string,
     metadata: Record<string, any>
   ): Promise<void> {
-    const job = await this.findById(id);
-    if (job) {
-      job.metadata = { ...job.metadata, ...metadata };
-      await this.jobModel.save(job);
+    if (Object.keys(metadata).length === 0) {
+      return;
     }
+
+    await this.jobModel.query(
+      `
+        UPDATE jobs
+        SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+      [id, JSON.stringify(metadata)]
+    );
   }
 
   /**
@@ -250,14 +266,16 @@ export class JobService {
    * 增加片段计数和时长
    */
   async addSegment(id: string, duration?: number): Promise<void> {
-    const job = await this.findById(id);
-    if (job) {
-      job.segmentCount += 1;
-      if (duration) {
-        job.duration = (job.duration || 0) + duration;
-      }
-      await this.jobModel.save(job);
-    }
+    await this.jobModel.query(
+      `
+        UPDATE jobs
+        SET segment_count = segment_count + 1,
+            duration = COALESCE(duration, 0) + $2,
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+      [id, duration || 0]
+    );
   }
 
   /**
@@ -271,14 +289,45 @@ export class JobService {
    * 添加已上传分片到 metadata
    */
   async addUploadedSegment(id: string, s3Key: string): Promise<void> {
-    const job = await this.findById(id);
-    if (job) {
-      const uploadedSegments = job.metadata?.uploadedSegments || [];
-      if (!uploadedSegments.includes(s3Key)) {
-        uploadedSegments.push(s3Key);
-        await this.updateMetadata(id, { uploadedSegments });
-      }
-    }
+    await this.appendMetadataArrayValue(id, 'uploadedSegments', s3Key, true);
+  }
+
+  /**
+   * 添加最终失败的视频分片到 metadata
+   */
+  async addFailedVideoSegment(id: string, s3Key: string): Promise<void> {
+    await this.appendMetadataArrayValue(id, 'failedVideoSegments', s3Key, true);
+  }
+
+  /**
+   * 添加已上传弹幕分片到 metadata
+   */
+  async addUploadedDanmakuSegment(id: string, s3Key: string): Promise<void> {
+    await this.appendMetadataArrayValue(
+      id,
+      'uploadedDanmakuSegments',
+      s3Key,
+      true
+    );
+  }
+
+  /**
+   * 添加最终失败的弹幕分片到 metadata
+   */
+  async addFailedDanmakuSegment(id: string, s3Key: string): Promise<void> {
+    await this.appendMetadataArrayValue(
+      id,
+      'failedDanmakuSegments',
+      s3Key,
+      true
+    );
+  }
+
+  /**
+   * 追加高光到 metadata
+   */
+  async addHighlight(id: string, highlight: Highlight): Promise<void> {
+    await this.appendMetadataArrayValue(id, 'highlights', highlight, false);
   }
 
   /**
@@ -288,6 +337,37 @@ export class JobService {
     await this.jobModel.update(
       { id },
       { status: JOB_STATUS.CANCELLED, endTime: new Date() }
+    );
+  }
+
+  private async appendMetadataArrayValue(
+    id: string,
+    field: string,
+    value: unknown,
+    unique: boolean
+  ): Promise<void> {
+    if (!JobService.ARRAY_METADATA_FIELDS.has(field)) {
+      throw new Error(`Unsupported metadata array field: ${field}`);
+    }
+
+    await this.jobModel.query(
+      `
+        UPDATE jobs
+        SET metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb),
+              '{${field}}',
+              CASE
+                WHEN $3::boolean
+                  AND COALESCE(metadata->'${field}', '[]'::jsonb) @> jsonb_build_array($2::jsonb)
+                THEN COALESCE(metadata->'${field}', '[]'::jsonb)
+                ELSE COALESCE(metadata->'${field}', '[]'::jsonb) || jsonb_build_array($2::jsonb)
+              END,
+              true
+            ),
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+      [id, JSON.stringify(value), unique]
     );
   }
 
@@ -376,7 +456,10 @@ export class JobService {
 
     for (const job of jobs) {
       // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于该值的任务
-      if (minSegmentCount !== undefined && job.segmentCount <= minSegmentCount) {
+      if (
+        minSegmentCount !== undefined &&
+        job.segmentCount <= minSegmentCount
+      ) {
         continue;
       }
 

@@ -9,6 +9,7 @@ import {
 } from '@midwayjs/core';
 import { Application } from '@midwayjs/koa';
 import { EventEmitter } from 'events';
+import * as fsPromises from 'fs/promises';
 import * as WebSocket from 'ws';
 import { DanmakuMessage } from '../interface/data';
 import { DanmakuXmlMetadata, DanmakuXmlService } from './danmaku-xml.service';
@@ -217,6 +218,9 @@ export class DanmakuService extends EventEmitter {
           this.messageBuffer.map(msg => JSON.stringify(msg)).join('\n') + '\n';
         s3Key = `danmaku/${this.options.id}/${filename}`;
       }
+
+      await fsPromises.mkdir(this.options.outputDir, { recursive: true });
+      await fsPromises.writeFile(filePath, data, 'utf-8');
 
       // 创建分片信息
       const segmentInfo = {

@@ -110,10 +110,15 @@ export class PollerProcessor implements IProcessor {
         viewerCount: status.viewerCount,
       });
 
-      // 获取流地址
-      const streamUrl = await this.platformService.getStreamUrl(
+      const requestedQuality = streamer.recordSettings?.quality as
+        | 'low'
+        | 'medium'
+        | 'high'
+        | undefined;
+      const resolvedStream = await this.platformService.resolveStream(
         platform,
-        streamerId
+        streamerId,
+        requestedQuality
       );
       const danmakuUrl = await this.platformService.getDanmakuUrl(
         platform,
@@ -127,9 +132,17 @@ export class PollerProcessor implements IProcessor {
         roomName: status.title,
         roomId: streamer.roomId,
         platform,
-        streamUrl,
+        streamUrl: resolvedStream.url,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
+        metadata: {
+          stream_url: resolvedStream.url,
+          danmaku_url: danmakuUrl,
+          requestedQuality,
+          effectiveQuality: resolvedStream.effectiveQuality,
+          qualityApplied: resolvedStream.qualityApplied,
+          qualityNote: resolvedStream.note,
+        },
       });
 
       this.logger.info('Job created', {
@@ -145,11 +158,15 @@ export class PollerProcessor implements IProcessor {
           jobId: job.jobId,
           platform,
           streamerId,
-          streamUrl,
+          streamUrl: resolvedStream.url,
           danmakuUrl,
           roomId: streamer.roomId,
           outputDir: path.join(process.cwd(), 'temp', job.id),
           segmentTime: 10,
+          requestedQuality,
+          effectiveQuality: resolvedStream.effectiveQuality,
+          qualityApplied: resolvedStream.qualityApplied,
+          qualityNote: resolvedStream.note,
         });
 
         // 启动成功，更新状态为 RECORDING

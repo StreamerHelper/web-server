@@ -1,4 +1,5 @@
 export type Platform = 'bilibili' | 'huya' | 'douyu';
+export type RecordingQuality = 'low' | 'medium' | 'high';
 
 export interface StreamerInfo {
   id: string;
@@ -8,7 +9,7 @@ export interface StreamerInfo {
   roomId: string;
   isActive?: boolean;
   recordSettings?: {
-    quality?: string;
+    quality?: RecordingQuality;
     detectHighlights?: boolean;
   };
   uploadSettings?: {
@@ -44,6 +45,11 @@ export enum JOB_STATUS {
 export interface JobMetadata {
   stream_url: string;
   danmaku_url: string;
+  requestedQuality?: RecordingQuality;
+  effectiveQuality?: RecordingQuality;
+  qualityApplied?: boolean;
+  qualityNote?: string;
+  ffmpegRequestedQuality?: RecordingQuality;
   resolution?: string;
   bitrate?: number;
   codec?: string;
@@ -55,6 +61,9 @@ export interface JobMetadata {
   };
   totalSegments?: number; // 总分片数
   uploadedSegments?: string[]; // 已上传的 S3 key 列表
+  failedVideoSegments?: string[]; // 最终上传失败的视频分片
+  uploadedDanmakuSegments?: string[]; // 已上传的弹幕分片
+  failedDanmakuSegments?: string[]; // 最终上传失败的弹幕分片
   lastFFmpegOutputTime?: number; // FFmpeg 最后输出时间（毫秒）
   recordedSegments?: number; // 已录制的分片数
   lastSegmentTime?: number; // 最后分片时间戳
@@ -170,9 +179,21 @@ export interface PlatformAdapter {
   name: Platform;
 
   getStreamerStatus(streamerId: string): Promise<StreamStatus>;
-  getStreamUrl(streamerId: string, quality?: string): Promise<string>;
+  getStream(
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<ResolvedStream>;
+  getStreamUrl(streamerId: string, quality?: RecordingQuality): Promise<string>;
   getDanmakuUrl(streamerId: string): Promise<string>;
   validateStreamerId(streamerId: string): Promise<boolean>;
+}
+
+export interface ResolvedStream {
+  url: string;
+  requestedQuality?: RecordingQuality;
+  effectiveQuality?: RecordingQuality;
+  qualityApplied: boolean;
+  note?: string;
 }
 
 export interface DanmakuCollector {

@@ -3,6 +3,8 @@ import {
   Platform,
   PlatformAdapter,
   PlatformError,
+  RecordingQuality,
+  ResolvedStream,
   StreamStatus,
 } from '../interface';
 
@@ -106,23 +108,37 @@ export class BilibiliAdapter implements PlatformAdapter {
    * 优先级: V1 API (HTTP-FLV) -> V2 API (HLS)
    * 对每个流进行 HEAD 校验，返回第一个有效的流
    */
-  async getStreamUrl(streamerId: string, quality = '0'): Promise<string> {
+  async getStream(
+    streamerId: string,
+    quality: RecordingQuality = 'high'
+  ): Promise<ResolvedStream> {
     // 首先尝试 V1 API 获取 HTTP-FLV 流
-    const v1Streams = await this.getApiV1PlayUrl(streamerId);
+    const v1Streams = await this.getApiV1PlayUrl(streamerId, quality);
     for (const streamUrl of v1Streams) {
-      if (await this.validateStreamUrl(streamUrl)) {
+      if (await this.validateStreamUrl(streamUrl, streamerId)) {
         this.logger?.debug('Using V1 API HTTP-FLV stream', { url: streamUrl });
-        return streamUrl;
+        return {
+          url: streamUrl,
+          requestedQuality: quality,
+          effectiveQuality: quality,
+          qualityApplied: true,
+        };
       }
     }
 
     // 回退到 V2 API 获取 HLS 流
     this.logger?.debug('Falling back to V2 API HLS streams');
-    const v2Streams = await this.getApiV2PlayInfo(streamerId);
-    for (const streamUrl of v2Streams) {
-      if (await this.validateStreamUrl(streamUrl)) {
+    const v2Streams = await this.getApiV2PlayInfo(streamerId, quality);
+    for (const stream of v2Streams) {
+      const streamUrl = stream.url;
+      if (await this.validateStreamUrl(streamUrl, streamerId)) {
         this.logger?.debug('Using V2 API HLS stream', { url: streamUrl });
-        return streamUrl;
+        return {
+          url: streamUrl,
+          requestedQuality: quality,
+          effectiveQuality: stream.effectiveQuality,
+          qualityApplied: true,
+        };
       }
     }
 
@@ -133,13 +149,24 @@ export class BilibiliAdapter implements PlatformAdapter {
     );
   }
 
+  async getStreamUrl(
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<string> {
+    const resolved = await this.getStream(streamerId, quality);
+    return resolved.url;
+  }
+
   /**
    * 校验流 URL 是否有效
-   * 通过 HEAD 请求检查状态码，< 400 认为有效
+   * B 站直播源带防盗链，校验时必须携带与 FFmpeg 一致的 Referer/Origin。
    */
-  private async validateStreamUrl(url: string): Promise<boolean> {
+  private async validateStreamUrl(url: string, roomId: string): Promise<boolean> {
     try {
-      const response = await fetch(url, { method: 'HEAD' });
+      const response = await fetch(url, {
+        method: 'HEAD',
+        headers: this.buildStreamRequestHeaders(roomId),
+      });
       const isValid = response.status < 400;
       if (!isValid) {
         this.logger?.debug('Stream URL validation failed', {
@@ -157,16 +184,27 @@ export class BilibiliAdapter implements PlatformAdapter {
     }
   }
 
+  private buildStreamRequestHeaders(roomId: string): Record<string, string> {
+    return {
+      'User-Agent': 'Mozilla/5.0',
+      Referer: `https://live.bilibili.com/${roomId}`,
+      Origin: 'https://live.bilibili.com',
+    };
+  }
+
   /**
    * V1 API: 获取 HTTP-FLV 流地址
    * 返回直接的 FLV 流 URL 列表
    */
-  private async getApiV1PlayUrl(roomId: string): Promise<string[]> {
+  private async getApiV1PlayUrl(
+    roomId: string,
+    quality: RecordingQuality
+  ): Promise<string[]> {
     try {
       const params = new URLSearchParams({
         cid: roomId,
         platform: 'web',
-        quality: '4', // 原画
+        quality: this.mapV1Quality(quality),
       });
 
       const url = `${this.URL_API_V1_PLAYURL}?${params.toString()}`;
@@ -193,33 +231,42 @@ export class BilibiliAdapter implements PlatformAdapter {
    * V2 API: 获取 HLS 流地址
    * 返回符合条件 (http_hls + fmp4/ts + avc) 的流 URL 列表
    */
-  private async getApiV2PlayInfo(roomId: string): Promise<string[]> {
+  private async getApiV2PlayInfo(
+    roomId: string,
+    quality: RecordingQuality
+  ): Promise<Array<{ url: string; effectiveQuality: RecordingQuality }>> {
     try {
-      const params = new URLSearchParams({
-        room_id: roomId,
-        no_playurl: '0',
-        mask: '1',
-        qn: '0', // 原画
-        platform: 'web',
-        protocol: '0,1', // HTTP-FLV 和 HLS
-        format: '0,1,2', // fmp4, ts, flv
-        codec: '0,1,2', // avc, hevc, av1
-        dolby: '5',
-        panorama: '1',
-      });
+      for (const qn of this.getPreferredQnList(quality)) {
+        const params = new URLSearchParams({
+          room_id: roomId,
+          no_playurl: '0',
+          mask: '1',
+          qn: qn.toString(),
+          platform: 'web',
+          protocol: '0,1',
+          format: '0,1,2',
+          codec: '0,1,2',
+          dolby: '5',
+          panorama: '1',
+        });
 
-      const url = `${this.URL_API_V2_PLAYINFO}?${params.toString()}`;
-      const data = await this.fetchJson<PlayInfoResponse>(url, {
-        headers: {
-          Referer: `https://live.bilibili.com/${roomId}`,
-        },
-      });
+        const url = `${this.URL_API_V2_PLAYINFO}?${params.toString()}`;
+        const data = await this.fetchJson<PlayInfoResponse>(url, {
+          headers: {
+            Referer: `https://live.bilibili.com/${roomId}`,
+          },
+        });
 
-      if (data.code !== 0 || !data.data?.playurl_info?.playurl?.stream) {
-        return [];
+        if (data.code !== 0 || !data.data?.playurl_info?.playurl?.stream) {
+          continue;
+        }
+
+        const streams = this.extractHlsStreams(data.data.playurl_info.playurl.stream);
+        if (streams.length > 0) {
+          return streams;
+        }
       }
-
-      return this.extractHlsStreams(data.data.playurl_info.playurl.stream);
+      return [];
     } catch (error) {
       this.logger?.warn('V2 API request failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -232,8 +279,10 @@ export class BilibiliAdapter implements PlatformAdapter {
    * 从 V2 API 响应中提取 HLS 流
    * 过滤条件: protocol_name == "http_hls", format_name in ("fmp4", "ts"), codec_name == "avc"
    */
-  private extractHlsStreams(streams: BilibiliStreamInfo[]): string[] {
-    const urls: string[] = [];
+  private extractHlsStreams(
+    streams: BilibiliStreamInfo[]
+  ): Array<{ url: string; effectiveQuality: RecordingQuality }> {
+    const urls: Array<{ url: string; effectiveQuality: RecordingQuality }> = [];
 
     for (const stream of streams) {
       // 只取 http_hls 协议
@@ -255,7 +304,12 @@ export class BilibiliAdapter implements PlatformAdapter {
 
           for (const urlInfo of codec.url_info) {
             const url = `${urlInfo.host}${codec.base_url}${urlInfo.extra}`;
-            urls.push(url);
+            urls.push({
+              url,
+              effectiveQuality: this.mapQnToQuality(
+                codec.current_qn ?? this.extractQnFromExtra(urlInfo.extra)
+              ),
+            });
           }
         }
       }
@@ -303,5 +357,39 @@ export class BilibiliAdapter implements PlatformAdapter {
       });
       throw error;
     }
+  }
+
+  private mapV1Quality(quality: RecordingQuality): string {
+    switch (quality) {
+      case 'low':
+        return '2';
+      case 'medium':
+        return '3';
+      default:
+        return '4';
+    }
+  }
+
+  private getPreferredQnList(quality: RecordingQuality): number[] {
+    switch (quality) {
+      case 'low':
+        return [150, 80, 250, 400, 10000];
+      case 'medium':
+        return [400, 250, 150, 80, 10000];
+      default:
+        return [10000, 400, 250, 150, 80];
+    }
+  }
+
+  private extractQnFromExtra(extra: string): number | undefined {
+    const qn = new URLSearchParams(extra.replace(/^\?/, '')).get('qn');
+    return qn ? Number(qn) : undefined;
+  }
+
+  private mapQnToQuality(qn?: number): RecordingQuality {
+    if (!qn) return 'high';
+    if (qn >= 10000 || qn >= 400) return 'high';
+    if (qn >= 250) return 'medium';
+    return 'low';
   }
 }

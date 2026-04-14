@@ -22,7 +22,7 @@ export class DanmakuUploadProcessor implements IProcessor {
   @Logger()
   private logger: ILogger;
 
-  async execute(data: DanmakuUploadJobData) {
+  async execute(data: DanmakuUploadJobData, job: any) {
     const { id, segmentId, s3Key, localPath, index } = data;
 
     this.logger.info('Processing danmaku upload job', { id, segmentId, s3Key });
@@ -45,6 +45,8 @@ export class DanmakuUploadProcessor implements IProcessor {
         Buffer.from(fileContent, 'utf-8'),
         'application/jsonl'
       );
+
+      await this.jobService.addUploadedDanmakuSegment(id, s3Key);
 
       // 解析弹幕消息
       const messages = fileContent
@@ -95,6 +97,12 @@ export class DanmakuUploadProcessor implements IProcessor {
         localPath,
         error: error instanceof Error ? error.message : String(error),
       });
+
+      const maxAttempts = job.opts.attempts || 1;
+      const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+      if (isFinalAttempt) {
+        await this.jobService.addFailedDanmakuSegment(id, s3Key);
+      }
 
       throw error;
     }

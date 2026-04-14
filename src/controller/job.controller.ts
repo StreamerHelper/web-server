@@ -315,22 +315,27 @@ export class JobController {
         };
       }
 
-      // 获取流地址
-      const streamUrl = await this.platformService.getStreamUrl(
-        platform,
-        streamerId
-      );
-      const danmakuUrl = await this.platformService.getDanmakuUrl(
-        platform,
-        streamerId
-      );
-
       // 获取主播信息以获取 roomId
       const streamer = await this.streamerService.findByStreamerId(streamerId);
       if (!streamer) {
         this.ctx.status = 404;
         return { error: 'Streamer not found' };
       }
+
+      const requestedQuality = streamer.recordSettings?.quality as
+        | 'low'
+        | 'medium'
+        | 'high'
+        | undefined;
+      const resolvedStream = await this.platformService.resolveStream(
+        platform,
+        streamerId,
+        requestedQuality
+      );
+      const danmakuUrl = await this.platformService.getDanmakuUrl(
+        platform,
+        streamerId
+      );
 
       // 创建任务记录（先设为 PENDING）
       const job = await this.jobService.create({
@@ -339,9 +344,17 @@ export class JobController {
         roomName: status.title,
         roomId: streamer.roomId,
         platform,
-        streamUrl,
+        streamUrl: resolvedStream.url,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
+        metadata: {
+          stream_url: resolvedStream.url,
+          danmaku_url: danmakuUrl,
+          requestedQuality,
+          effectiveQuality: resolvedStream.effectiveQuality,
+          qualityApplied: resolvedStream.qualityApplied,
+          qualityNote: resolvedStream.note,
+        },
       });
 
       this.ctx.logger.info(`Job created manually: ${job.jobId}`);
@@ -353,11 +366,15 @@ export class JobController {
           jobId: job.jobId,
           platform,
           streamerId,
-          streamUrl,
+          streamUrl: resolvedStream.url,
           danmakuUrl,
           roomId: streamer.roomId,
           outputDir: path.join(process.cwd(), 'temp', job.id),
           segmentTime: 10,
+          requestedQuality,
+          effectiveQuality: resolvedStream.effectiveQuality,
+          qualityApplied: resolvedStream.qualityApplied,
+          qualityNote: resolvedStream.note,
         });
 
         // 启动成功，更新状态为 RECORDING
@@ -501,9 +518,18 @@ export class JobController {
       }
 
       // 获取流地址
-      const streamUrl = await this.platformService.getStreamUrl(
-        oldJob.platform as Platform,
+      const streamer = await this.streamerService.findByStreamerId(
         oldJob.streamerId
+      );
+      const requestedQuality = streamer?.recordSettings?.quality as
+        | 'low'
+        | 'medium'
+        | 'high'
+        | undefined;
+      const resolvedStream = await this.platformService.resolveStream(
+        oldJob.platform as Platform,
+        oldJob.streamerId,
+        requestedQuality
       );
       const danmakuUrl = await this.platformService.getDanmakuUrl(
         oldJob.platform as Platform,
@@ -517,9 +543,17 @@ export class JobController {
         roomName: status.title,
         roomId: oldJob.roomId,
         platform: oldJob.platform,
-        streamUrl,
+        streamUrl: resolvedStream.url,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
+        metadata: {
+          stream_url: resolvedStream.url,
+          danmaku_url: danmakuUrl,
+          requestedQuality,
+          effectiveQuality: resolvedStream.effectiveQuality,
+          qualityApplied: resolvedStream.qualityApplied,
+          qualityNote: resolvedStream.note,
+        },
       });
 
       this.ctx.logger.info(`Retry job created: ${id} -> ${newJob.jobId}`);
@@ -534,11 +568,15 @@ export class JobController {
             jobId: newJob.jobId,
             platform: oldJob.platform as Platform,
             streamerId: oldJob.streamerId,
-            streamUrl,
+            streamUrl: resolvedStream.url,
             danmakuUrl,
             roomId: oldJob.roomId,
             outputDir: path.join(process.cwd(), 'temp', newJob.id),
             segmentTime: 10,
+            requestedQuality,
+            effectiveQuality: resolvedStream.effectiveQuality,
+            qualityApplied: resolvedStream.qualityApplied,
+            qualityNote: resolvedStream.note,
           }
         );
 

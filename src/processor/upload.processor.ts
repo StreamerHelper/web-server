@@ -19,7 +19,7 @@ export class UploadProcessor implements IProcessor {
   @Logger()
   private logger: ILogger;
 
-  async execute(data: UploadJobData) {
+  async execute(data: UploadJobData, job: any) {
     const { id, s3Key, localPath, contentType } = data;
 
     this.logger.info('Processing upload job', { id, s3Key, localPath });
@@ -64,11 +64,18 @@ export class UploadProcessor implements IProcessor {
         error: error instanceof Error ? error.message : String(error),
       });
 
+      const maxAttempts = job.opts.attempts || 1;
+      const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
+
+      if (isFinalAttempt) {
+        await this.jobService.addFailedVideoSegment(id, s3Key);
+      }
+
       // BullMQ 会根据 attempts 配置自动重试
       // 这里只处理不可重试的错误，或已达最大重试次数后的清理
       const isRetryable = this.isRetryableError(error);
 
-      if (!isRetryable) {
+      if (!isRetryable && isFinalAttempt) {
         // 不可重试的错误，调度清理
         const cleanupQueue = this.bullFramework.getQueue('cleanup');
         if (cleanupQueue) {

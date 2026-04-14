@@ -14,11 +14,11 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: streamerhelper
     ports:
-      - "5432:5432"
+      - '5432:5432'
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d streamerhelper"]
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d streamerhelper']
       interval: 5s
       timeout: 5s
       retries: 5
@@ -30,11 +30,11 @@ services:
     restart: unless-stopped
     command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - '6379:6379'
     volumes:
       - redis_dev_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 5s
       retries: 5
@@ -47,14 +47,14 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: "minioadmin"
+      MINIO_ROOT_PASSWORD: 'minioadmin'
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - '9000:9000'
+      - '9001:9001'
     volumes:
       - minio_dev_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
       interval: 5s
       timeout: 5s
       retries: 10
@@ -68,7 +68,7 @@ services:
       until /usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin; do
         echo 'Waiting for MinIO...' && sleep 1
       done
-      for bucket in streamerhelper-uploads streamerhelper-avatars streamerhelper-temp; do
+      for bucket in streamerhelper-archive; do
         /usr/bin/mc mb minio/\$$bucket --ignore-existing
         /usr/bin/mc anonymous set download minio/\$$bucket
       done
@@ -86,9 +86,9 @@ services:
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@streamerhelper.dev
       PGADMIN_DEFAULT_PASSWORD: admin
-      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
     ports:
-      - "5050:80"
+      - '5050:80'
     volumes:
       - pgadmin_dev_data:/var/lib/pgadmin
     depends_on:

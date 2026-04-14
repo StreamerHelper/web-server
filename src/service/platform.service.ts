@@ -1,9 +1,18 @@
-import { App, ILogger, Logger, Provide } from '@midwayjs/core';
+import {
+  App,
+  ILogger,
+  Logger,
+  Provide,
+  Scope,
+  ScopeEnum,
+} from '@midwayjs/core';
 import { Application } from '@midwayjs/koa';
 import {
   Platform,
   PlatformAdapter,
   PlatformError,
+  RecordingQuality,
+  ResolvedStream,
   StreamStatus,
 } from '../interface';
 import { BilibiliAdapter } from '../platform/bilibili';
@@ -14,6 +23,7 @@ import { HuyaAdapter } from '../platform/huya';
  * 平台服务
  */
 @Provide()
+@Scope(ScopeEnum.Singleton)
 export class PlatformService {
   @App()
   app: Application;
@@ -59,10 +69,22 @@ export class PlatformService {
   async getStreamUrl(
     platform: Platform,
     streamerId: string,
-    quality?: string
+    quality?: RecordingQuality
   ): Promise<string> {
+    const resolved = await this.resolveStream(platform, streamerId, quality);
+    return resolved.url;
+  }
+
+  /**
+   * 获取直播流及画质解析结果
+   */
+  async resolveStream(
+    platform: Platform,
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<ResolvedStream> {
     const adapter = this.getAdapter(platform);
-    return await adapter.getStreamUrl(streamerId, quality);
+    return await adapter.getStream(streamerId, quality);
   }
 
   /**

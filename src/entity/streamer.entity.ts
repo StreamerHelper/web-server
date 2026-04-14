@@ -6,7 +6,7 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { StreamerInfo } from '../interface';
+import { RecordingQuality, StreamerInfo } from '../interface';
 
 @Entity('streamers')
 export class Streamer {
@@ -41,7 +41,7 @@ export class Streamer {
 
   @Column({ name: 'recordSettings', type: 'jsonb', nullable: true })
   recordSettings: {
-    quality?: string;
+    quality?: RecordingQuality;
     detectHighlights?: boolean;
   };
 

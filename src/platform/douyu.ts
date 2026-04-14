@@ -1,4 +1,10 @@
-import { Platform, PlatformAdapter, StreamStatus } from '../interface';
+import {
+  Platform,
+  PlatformAdapter,
+  RecordingQuality,
+  ResolvedStream,
+  StreamStatus,
+} from '../interface';
 
 /**
  * 斗鱼直播适配器
@@ -39,11 +45,29 @@ export class DouyuAdapter implements PlatformAdapter {
     }
   }
 
-  async getStreamUrl(streamerId: string): Promise<string> {
+  async getStream(
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<ResolvedStream> {
     this.logger?.warn('Douyu stream URL parsing not fully implemented', {
       streamerId,
+      quality,
     });
-    return `https://douyu.com/${streamerId}`;
+    return {
+      url: `https://douyu.com/${streamerId}`,
+      requestedQuality: quality,
+      effectiveQuality: undefined,
+      qualityApplied: false,
+      note: 'Douyu quality selection is not implemented yet',
+    };
+  }
+
+  async getStreamUrl(
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<string> {
+    const resolved = await this.getStream(streamerId, quality);
+    return resolved.url;
   }
 
   async getDanmakuUrl(streamerId: string): Promise<string> {

@@ -4,6 +4,8 @@ import {
   Platform,
   PlatformAdapter,
   PlatformError,
+  RecordingQuality,
+  ResolvedStream,
   StreamStatus,
 } from '../interface';
 
@@ -94,10 +96,10 @@ export class HuyaAdapter implements PlatformAdapter {
     };
   }
 
-  async getStreamUrl(
+  async getStream(
     streamerId: string,
-    _quality?: string
-  ): Promise<string> {
+    quality: RecordingQuality = 'high'
+  ): Promise<ResolvedStream> {
     const url = `${this.URL_ROOM_PAGE}/${streamerId}`;
     const html = await this.fetchPage(url);
     const streamData = this.extractStreamData(html);
@@ -138,13 +140,19 @@ export class HuyaAdapter implements PlatformAdapter {
     const candidates = this.buildStreamCandidates(
       streamInfoList,
       streamData.vMultiStreamInfo,
-      reSecret
+      reSecret,
+      quality
     );
 
     for (const candidate of candidates) {
-      if (await this.validateStreamUrl(candidate)) {
-        this.logger?.debug('Using Huya stream URL', { url: candidate });
-        return candidate;
+      if (await this.validateStreamUrl(candidate.url)) {
+        this.logger?.debug('Using Huya stream URL', { url: candidate.url });
+        return {
+          url: candidate.url,
+          requestedQuality: quality,
+          effectiveQuality: candidate.effectiveQuality,
+          qualityApplied: true,
+        };
       }
     }
 
@@ -153,6 +161,14 @@ export class HuyaAdapter implements PlatformAdapter {
       'huya',
       'NO_STREAM_URL'
     );
+  }
+
+  async getStreamUrl(
+    streamerId: string,
+    quality?: RecordingQuality
+  ): Promise<string> {
+    const resolved = await this.getStream(streamerId, quality);
+    return resolved.url;
   }
 
   async getDanmakuUrl(streamerId: string): Promise<string> {
@@ -244,12 +260,18 @@ export class HuyaAdapter implements PlatformAdapter {
   private buildStreamCandidates(
     streamInfoList: HuyaGameStreamInfo[],
     multiStreamInfo: HuyaMultiStreamInfo[],
-    reSecret: boolean
-  ): string[] {
-    const urls: string[] = [];
+    reSecret: boolean,
+    requestedQuality: RecordingQuality
+  ): Array<{ url: string; effectiveQuality: RecordingQuality }> {
+    const urls: Array<{ url: string; effectiveQuality: RecordingQuality }> =
+      [];
     const qualities = multiStreamInfo?.length
       ? multiStreamInfo
       : [{ iBitRate: 0, sDisplayName: '' }];
+    const prioritizedQualities = this.prioritizeQualities(
+      qualities,
+      requestedQuality
+    );
 
     for (const streamInfo of streamInfoList) {
       const { sFlvUrl, sStreamName, sFlvUrlSuffix, sFlvAntiCode } = streamInfo;
@@ -267,7 +289,7 @@ export class HuyaAdapter implements PlatformAdapter {
         }
       }
 
-      for (const vStream of qualities) {
+      for (const vStream of prioritizedQualities) {
         const baseUrl = `${sFlvUrl}/${sStreamName}.${sFlvUrlSuffix}`;
 
         let params: Record<string, string>;
@@ -286,11 +308,51 @@ export class HuyaAdapter implements PlatformAdapter {
         }
 
         const queryString = new URLSearchParams(params).toString();
-        urls.push(`${baseUrl}?${queryString}`);
+        urls.push({
+          url: `${baseUrl}?${queryString}`,
+          effectiveQuality: this.classifyHuyaQuality(
+            qualities,
+            vStream.iBitRate
+          ),
+        });
       }
     }
 
     return urls;
+  }
+
+  private prioritizeQualities(
+    qualities: HuyaMultiStreamInfo[],
+    requestedQuality: RecordingQuality
+  ): HuyaMultiStreamInfo[] {
+    const sorted = [...qualities].sort((a, b) => a.iBitRate - b.iBitRate);
+    if (sorted.length <= 1) {
+      return sorted;
+    }
+
+    const preferredIndex =
+      requestedQuality === 'low'
+        ? 0
+        : requestedQuality === 'medium'
+          ? Math.floor((sorted.length - 1) / 2)
+          : sorted.length - 1;
+
+    const [preferred] = sorted.splice(preferredIndex, 1);
+    return [preferred, ...sorted.reverse()];
+  }
+
+  private classifyHuyaQuality(
+    qualities: HuyaMultiStreamInfo[],
+    bitrate: number
+  ): RecordingQuality {
+    const sorted = [...qualities].sort((a, b) => a.iBitRate - b.iBitRate);
+    if (sorted.length <= 1) {
+      return 'high';
+    }
+    const index = sorted.findIndex(item => item.iBitRate === bitrate);
+    if (index <= 0) return 'low';
+    if (index >= sorted.length - 1) return 'high';
+    return 'medium';
   }
 
   private computeStreamParams(

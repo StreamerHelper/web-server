@@ -14,6 +14,7 @@ import { JOB_STATUS, Platform } from '../interface';
 import { BilibiliSubmissionService } from './bilibili-submission.service';
 import { DanmakuManager } from './danmaku.service';
 import { JobService } from './job.service';
+import { PlatformService } from './platform.service';
 import {
   Recording,
   RecordingEndEvent,
@@ -56,10 +57,16 @@ export class RecorderManager {
   submissionService: BilibiliSubmissionService;
 
   @Inject()
+  platformService: PlatformService;
+
+  @Inject()
   bullFramework: Framework;
 
   @Logger()
   private logger: ILogger;
+
+  @Logger('ffmpegExitLogger')
+  private ffmpegExitLogger: ILogger;
 
   /**
    * 活跃录制映射
@@ -113,11 +120,18 @@ export class RecorderManager {
         app: this.app,
       },
       logger: this.logger,
+      ffmpegFailureLogger: this.ffmpegExitLogger,
       recordingConfig: {
         heartbeatInterval: this.recorderConfig.heartbeatInterval * 1000, // 秒转毫秒
         heartbeatTimeout: this.recorderConfig.heartbeatTimeout * 1000, // 秒转毫秒
         maxRecordingTime: this.recorderConfig.maxRecordingTime * 1000, // 秒转毫秒
       },
+      refreshStream: async () =>
+        await this.platformService.resolveStream(
+          platform,
+          streamerId,
+          options.requestedQuality
+        ),
     });
 
     // 注册到管理器
@@ -286,9 +300,11 @@ export class RecorderManager {
       }
 
       const uploadedSegments = job.metadata?.uploadedSegments || [];
+      const failedVideoSegments = job.metadata?.failedVideoSegments || [];
       const videoSegments = uploadedSegments.filter((key: string) =>
         key.includes('/video/')
       );
+      const expectedVideoSegments = job.metadata?.totalSegments || 0;
 
       if (videoSegments.length === 0) {
         this.logger.info('No video segments uploaded, skipping submission', {
@@ -298,10 +314,32 @@ export class RecorderManager {
         return;
       }
 
+      if (
+        failedVideoSegments.length > 0 ||
+        (expectedVideoSegments > 0 &&
+          videoSegments.length !== expectedVideoSegments)
+      ) {
+        this.logger.warn('Video uploads are incomplete, skipping submission', {
+          jobId: options.jobId,
+          expectedVideoSegments,
+          uploadedVideoSegments: videoSegments.length,
+          failedVideoSegments: failedVideoSegments.length,
+        });
+        return;
+      }
+
       // 3. 获取 streamer 信息，检查是否开启自动投稿
       const streamer = await this.streamerService.findByStreamerId(
         options.streamerId
       );
+
+      if (!streamer) {
+        this.logger.warn('Streamer not found for auto submission', {
+          streamerId: options.streamerId,
+          jobId: options.jobId,
+        });
+        return;
+      }
 
       if (streamer?.uploadSettings?.autoUpload === false) {
         this.logger.info('Auto upload disabled', {
@@ -316,16 +354,16 @@ export class RecorderManager {
       // 5. 创建投稿记录
       const submission = await this.submissionService.createSubmission({
         jobId: options.jobId,
-        title:
-          uploadSettings.title || this.generateDefaultTitle(streamer.name),
+        title: uploadSettings.title || this.generateDefaultTitle(streamer.name),
         description: uploadSettings.description,
         tags: uploadSettings.tags || [],
         tid: uploadSettings.tid || 171,
       });
 
       // 6. 派发投稿任务
-      const submissionQueue =
-        this.bullFramework.getQueue('bilibili-submission');
+      const submissionQueue = this.bullFramework.getQueue(
+        'bilibili-submission'
+      );
       if (submissionQueue) {
         await submissionQueue.addJobToQueue({
           submissionId: submission.id,

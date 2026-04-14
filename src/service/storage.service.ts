@@ -1,13 +1,23 @@
 import {
-    DeleteObjectCommand,
-    GetObjectCommand,
-    ListObjectsV2Command,
-    PutObjectCommand,
-    S3Client,
-    S3ServiceException,
+  CreateBucketCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+  S3ServiceException,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { Config, Init, Provide, Scope, ScopeEnum } from '@midwayjs/core';
+import {
+  Config,
+  Init,
+  Logger,
+  Provide,
+  Scope,
+  ScopeEnum,
+  ILogger,
+} from '@midwayjs/core';
 import { Readable } from 'stream';
 import { StorageError } from '../interface';
 
@@ -22,7 +32,9 @@ function getS3ErrorMessage(error: unknown): string {
     // AWS SDK 错误可能有额外属性
     const awsError = error as any;
     if (awsError.Code || awsError.$metadata) {
-      return `[${awsError.Code || awsError.name}] ${awsError.message || 'Unknown error'} (StatusCode: ${awsError.$metadata?.httpStatusCode})`;
+      return `[${awsError.Code || awsError.name}] ${
+        awsError.message || 'Unknown error'
+      } (StatusCode: ${awsError.$metadata?.httpStatusCode})`;
     }
     return error.message || error.toString();
   }
@@ -35,20 +47,26 @@ export class StorageService {
   @Config('streamerhelper.s3')
   s3Config: any;
 
+  @Logger()
+  private logger: ILogger;
+
   /** 内部客户端：用于上传、下载、删除等操作 (endpoint: minio:9000) */
   private client: S3Client;
-  
+
   /** 公开客户端：用于生成浏览器可访问的签名 URL (publicEndpoint: localhost:9000) */
   private publicClient: S3Client;
 
   @Init()
   async init() {
-    const { endpoint, publicEndpoint, region, credentials, forcePathStyle } = this.s3Config;
-    
-    console.log(`[Storage] Initializing S3 clients:`);
-    console.log(`[Storage]   - Internal endpoint: ${endpoint}`);
-    console.log(`[Storage]   - Public endpoint: ${publicEndpoint}`);
-    
+    const { endpoint, publicEndpoint, region, credentials, forcePathStyle } =
+      this.s3Config;
+
+    this.logger.info('Initializing S3 clients', {
+      endpoint,
+      publicEndpoint,
+      bucket: this.s3Config.bucket,
+    });
+
     // 内部客户端：用于服务端操作（容器内网络）
     this.client = new S3Client({
       endpoint,
@@ -56,7 +74,7 @@ export class StorageService {
       credentials,
       forcePathStyle: forcePathStyle ?? true,
     });
-    
+
     // 公开客户端：用于生成浏览器可访问的 URL
     this.publicClient = new S3Client({
       endpoint: publicEndpoint,
@@ -64,6 +82,8 @@ export class StorageService {
       credentials,
       forcePathStyle: forcePathStyle ?? true,
     });
+
+    await this.ensureBucketExists();
   }
 
   /**
@@ -210,12 +230,25 @@ export class StorageService {
    */
   async list(prefix: string): Promise<string[]> {
     try {
-      const command = new ListObjectsV2Command({
-        Bucket: this.s3Config.bucket,
-        Prefix: prefix,
-      });
-      const response = await this.client.send(command);
-      return response.Contents?.map(obj => obj.Key!) || [];
+      const keys: string[] = [];
+      let continuationToken: string | undefined;
+
+      do {
+        const command = new ListObjectsV2Command({
+          Bucket: this.s3Config.bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        });
+        const response = await this.client.send(command);
+        keys.push(
+          ...(response.Contents?.map(obj => obj.Key!).filter(Boolean) || [])
+        );
+        continuationToken = response.IsTruncated
+          ? response.NextContinuationToken
+          : undefined;
+      } while (continuationToken);
+
+      return keys;
     } catch (error) {
       const errorMsg = getS3ErrorMessage(error);
       throw new StorageError(
@@ -232,5 +265,45 @@ export class StorageService {
   getS3Path(key: string): string {
     const publicEndpoint = this.s3Config.publicEndpoint.replace(/\/$/, '');
     return `${publicEndpoint}/${this.s3Config.bucket}/${key}`;
+  }
+
+  private async ensureBucketExists(): Promise<void> {
+    try {
+      await this.client.send(
+        new HeadBucketCommand({
+          Bucket: this.s3Config.bucket,
+        })
+      );
+    } catch (error) {
+      const awsError = error as any;
+      const code = awsError?.Code || awsError?.name;
+      const statusCode = awsError?.$metadata?.httpStatusCode;
+
+      if (
+        statusCode === 404 ||
+        code === 'NotFound' ||
+        code === 'NoSuchBucket'
+      ) {
+        this.logger.warn('S3 bucket not found, creating automatically', {
+          bucket: this.s3Config.bucket,
+        });
+        await this.client.send(
+          new CreateBucketCommand({
+            Bucket: this.s3Config.bucket,
+          })
+        );
+        this.logger.info('S3 bucket created', {
+          bucket: this.s3Config.bucket,
+        });
+        return;
+      }
+
+      const errorMsg = getS3ErrorMessage(error);
+      throw new StorageError(
+        `Failed to verify bucket ${this.s3Config.bucket}: ${errorMsg}`,
+        'init',
+        true
+      );
+    }
   }
 }

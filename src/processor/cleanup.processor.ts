@@ -5,7 +5,7 @@ import { CleanupJobData } from '../interface';
 
 /**
  * 清理任务处理器
- * FlowProducer 确保 cleanup 只在所有 upload 完成后执行
+ * 只有在录制停止后确认上传已收敛，才会调度 cleanup
  */
 @Processor('cleanup')
 export class CleanupProcessor implements IProcessor {
