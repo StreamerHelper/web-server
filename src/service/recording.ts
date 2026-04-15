@@ -235,6 +235,10 @@ export class Recording extends EventEmitter {
   // ========== 录制器配置 ==========
   private readonly recordingConfig: RecordingConfig;
   private readonly refreshStream?: () => Promise<ResolvedStream>;
+  private readonly startedPromise: Promise<void>;
+  private resolveStarted!: () => void;
+  private rejectStarted!: (error: Error) => void;
+  private startupSettled = false;
 
   constructor(options: RecordingOptions) {
     super();
@@ -286,6 +290,23 @@ export class Recording extends EventEmitter {
 
     // 创建 FFmpeg 服务实例
     this.ffmpeg = new FFmpegService();
+
+    this.startedPromise = new Promise((resolve, reject) => {
+      this.resolveStarted = () => {
+        if (this.startupSettled) {
+          return;
+        }
+        this.startupSettled = true;
+        resolve();
+      };
+      this.rejectStarted = (error: Error) => {
+        if (this.startupSettled) {
+          return;
+        }
+        this.startupSettled = true;
+        reject(error);
+      };
+    });
 
     // 初始化节流函数（3 秒内最多执行一次）
     this.throttledUpdateHeartbeat = throttle(
@@ -346,7 +367,7 @@ export class Recording extends EventEmitter {
       this.startHeartbeatCheck();
 
       // 7. 启动 FFmpeg（传入 onOutput 回调用于心跳维护）
-      this.startFFmpegProcess();
+      await this.startFFmpegProcess();
 
       // 8. 启动分片监听
       this.startSegmentWatcher();
@@ -359,6 +380,7 @@ export class Recording extends EventEmitter {
 
       // 11. 等待录制结束
       this.status = 'recording';
+      this.resolveStarted();
       const endReason = await this.waitForCompletion();
 
       // 12. 停止录制
@@ -371,6 +393,9 @@ export class Recording extends EventEmitter {
         danmakuSegments: this.danmakuSegments.length,
       });
     } catch (error) {
+      this.rejectStarted(
+        error instanceof Error ? error : new Error(String(error))
+      );
       this.logger.error('Recording failed', {
         id: this.id,
         error: error instanceof Error ? error.message : String(error),
@@ -496,6 +521,10 @@ export class Recording extends EventEmitter {
     return this.status;
   }
 
+  waitUntilStarted(): Promise<void> {
+    return this.startedPromise;
+  }
+
   /**
    * 获取录制信息
    */
@@ -529,20 +558,8 @@ export class Recording extends EventEmitter {
    * 处理 FFmpeg 进程退出
    */
   private handleFFmpegExit(event: FFmpegExitEvent): void {
-    // 处理剩余分片
-    this.processListChanges().catch(err => {
-      this.logger.error('Failed to process remaining segments', {
-        id: this.id,
-        error: err.message,
-      });
-    });
-
     if (event.isNatural) {
-      this.logger.info('FFmpeg process exited - stream ended', {
-        id: this.id,
-        code: event.code,
-        signal: event.signal,
-      });
+      void this.finalizeNaturalFFmpegExit(event);
     } else if (this.isStopping) {
       this.logger.info('FFmpeg process exited - stopped by user', {
         id: this.id,
@@ -550,14 +567,45 @@ export class Recording extends EventEmitter {
         signal: event.signal,
       });
     } else {
+      this.processListChanges().catch(err => {
+        this.logger.error('Failed to process remaining segments', {
+          id: this.id,
+          error: err.message,
+        });
+      });
       this.scheduleFFmpegRestart(event);
     }
   }
 
-  private startFFmpegProcess(): void {
+  private async finalizeNaturalFFmpegExit(
+    event: FFmpegExitEvent
+  ): Promise<void> {
+    try {
+      await this.processListChanges();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error('Failed to process remaining segments', {
+        id: this.id,
+        error: message,
+      });
+      this.recordingFailed = true;
+      this.failureReason = `Failed to flush final segments after stream ended: ${message}`;
+      this.resolveEndReason?.('failed');
+      return;
+    }
+
+    this.logger.info('FFmpeg process exited - stream ended', {
+      id: this.id,
+      code: event.code,
+      signal: event.signal,
+    });
+    this.resolveEndReason?.('completed');
+  }
+
+  private async startFFmpegProcess(): Promise<void> {
     this.lastFFmpegOutputTime = Date.now();
     this.resetHeartbeatTimer();
-    this.ffmpeg.start({
+    await this.ffmpeg.start({
       streamUrl: this.streamUrl,
       outputDir: this.videoDir,
       segmentTime: this.segmentTime,
@@ -626,7 +674,7 @@ export class Recording extends EventEmitter {
 
     try {
       await this.refreshStreamUrl();
-      this.startFFmpegProcess();
+      await this.startFFmpegProcess();
       this.logger.info('FFmpeg restarted', {
         id: this.id,
         attempt: this.ffmpegRestartAttempts,
@@ -1058,7 +1106,6 @@ export class Recording extends EventEmitter {
                 segmentId: segment.id,
                 s3Key,
                 localPath: segment.localPath,
-                index: undefined,
               },
               {
                 attempts: 2,

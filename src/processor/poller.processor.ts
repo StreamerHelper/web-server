@@ -22,6 +22,13 @@ export class PollerProcessor implements IProcessor {
     concurrency: number;
   };
 
+  @Config('streamerhelper.recorder')
+  private recorderConfig: {
+    heartbeatInterval: number;
+    heartbeatTimeout: number;
+    maxRecordingTime: number;
+  };
+
   @Inject()
   streamerService: StreamerService;
 
@@ -80,7 +87,8 @@ export class PollerProcessor implements IProcessor {
       // 检查是否有活跃的 Job（通过 Job 实体 + 心跳检测）
       const activeJob = await this.jobService.findActiveJobForStreamer(
         streamerId,
-        platform
+        platform,
+        this.recorderConfig.heartbeatTimeout * 1000
       );
       if (activeJob) {
         this.logger.debug('Active job found, skipping', {
@@ -169,8 +177,6 @@ export class PollerProcessor implements IProcessor {
           qualityNote: resolvedStream.note,
         });
 
-        // 启动成功，更新状态为 RECORDING
-        await this.jobService.updateStatus(job.id, JOB_STATUS.RECORDING);
         this.logger.info('Recording started successfully', {
           jobId: job.jobId,
         });

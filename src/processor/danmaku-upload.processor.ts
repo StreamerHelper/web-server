@@ -23,7 +23,7 @@ export class DanmakuUploadProcessor implements IProcessor {
   private logger: ILogger;
 
   async execute(data: DanmakuUploadJobData, job: any) {
-    const { id, segmentId, s3Key, localPath, index } = data;
+    const { id, segmentId, s3Key, localPath } = data;
 
     this.logger.info('Processing danmaku upload job', { id, segmentId, s3Key });
 
@@ -74,7 +74,7 @@ export class DanmakuUploadProcessor implements IProcessor {
       };
 
       // 更新 Job metadata
-      await this.updateDanmakuIndex(id, segmentInfo, index, messages);
+      await this.updateDanmakuIndex(id, segmentInfo, messages);
 
       this.logger.info('Danmaku upload completed', {
         id,
@@ -121,66 +121,62 @@ export class DanmakuUploadProcessor implements IProcessor {
   }
 
   /**
-   * 统计唯一用户数
-   */
-  private countUniqueUsers(messages: any[]): number {
-    const uniqueUserIds = new Set<string>();
-    for (const msg of messages) {
-      if (msg.userId) {
-        uniqueUserIds.add(msg.userId);
-      }
-    }
-    return uniqueUserIds.size;
-  }
-
-  /**
    * 更新弹幕索引
    */
   private async updateDanmakuIndex(
     id: string,
     segmentInfo: DanmakuSegmentInfo,
-    currentIndex?: DanmakuIndex,
     messages?: any[]
   ): Promise<void> {
-    let index: DanmakuIndex;
-
-    if (currentIndex) {
-      // 更新现有索引
-      index = {
-        ...currentIndex,
-        segments: [...currentIndex.segments, segmentInfo],
-        totalMessages: currentIndex.totalMessages + segmentInfo.messageCount,
-      };
-      // 合并类型统计
-      for (const [type, count] of Object.entries(segmentInfo.types)) {
-        index.types[type] = (index.types[type] || 0) + count;
-      }
-    } else {
-      // 创建新索引
-      const job = await this.jobService.findById(id);
-      if (!job) {
-        throw new Error(`Job ${id} not found`);
-      }
-
-      index = {
-        jobId: id,
-        streamerId: job.streamerId,
-        platform: job.platform,
-        roomId: job.roomId,
-        startTime: job.startTime?.getTime() || Date.now(),
-        endTime: job.endTime?.getTime() || Date.now(),
-        duration: job.duration || 0,
-        totalMessages: segmentInfo.messageCount,
-        uniqueUsers: messages ? this.countUniqueUsers(messages) : 0,
-        types: segmentInfo.types,
-        segments: [segmentInfo],
-        files: {},
-      };
+    const job = await this.jobService.findById(id);
+    if (!job) {
+      throw new Error(`Job ${id} not found`);
     }
+
+    const metadata = (job.metadata ?? {}) as any;
+    const currentIndex = metadata.danmakuIndex as DanmakuIndex | undefined;
+    const existingUserIds = Array.isArray(metadata.danmakuUserIds)
+      ? metadata.danmakuUserIds.map((userId: unknown) => String(userId))
+      : [];
+    const mergedUserIds = new Set(existingUserIds);
+
+    for (const message of messages || []) {
+      if (message.userId) {
+        mergedUserIds.add(String(message.userId));
+      }
+    }
+
+    const mergedTypes = { ...(currentIndex?.types || {}) };
+    for (const [type, count] of Object.entries(segmentInfo.types)) {
+      mergedTypes[type] = (mergedTypes[type] || 0) + count;
+    }
+
+    const segments = [...(currentIndex?.segments || []), segmentInfo].sort(
+      (left, right) =>
+        left.startTime - right.startTime || left.createdAt - right.createdAt
+    );
+    const endTime = Math.max(currentIndex?.endTime || 0, segmentInfo.endTime);
+
+    const index: DanmakuIndex = {
+      jobId: id,
+      streamerId: job.streamerId,
+      platform: job.platform,
+      roomId: job.roomId,
+      startTime: currentIndex?.startTime || 0,
+      endTime,
+      duration: Math.max(currentIndex?.duration || 0, endTime),
+      totalMessages:
+        (currentIndex?.totalMessages || 0) + segmentInfo.messageCount,
+      uniqueUsers: mergedUserIds.size,
+      types: mergedTypes,
+      segments,
+      files: currentIndex?.files || {},
+    };
 
     // 更新 Job metadata
     await this.jobService.updateMetadata(id, {
       danmakuIndex: index,
+      danmakuUserIds: Array.from(mergedUserIds),
     } as any);
   }
 }

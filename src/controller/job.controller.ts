@@ -1,6 +1,7 @@
 import {
   App,
   Body,
+  Config,
   Controller,
   Get,
   Inject,
@@ -20,6 +21,13 @@ import { VideoMergeService } from '../service/video-merge.service';
 
 @Controller('/api/jobs')
 export class JobController {
+  @Config('streamerhelper.recorder')
+  private recorderConfig: {
+    heartbeatInterval: number;
+    heartbeatTimeout: number;
+    maxRecordingTime: number;
+  };
+
   @Inject()
   ctx: Context;
 
@@ -290,7 +298,8 @@ export class JobController {
       // 检查是否有活跃的 Job（通过 Job 实体 + 心跳检测）
       const activeJob = await this.jobService.findActiveJobForStreamer(
         streamerId,
-        platform
+        platform,
+        this.recorderConfig.heartbeatTimeout * 1000
       );
       if (activeJob) {
         this.ctx.status = 409;
@@ -377,8 +386,6 @@ export class JobController {
           qualityNote: resolvedStream.note,
         });
 
-        // 启动成功，更新状态为 RECORDING
-        await this.jobService.updateStatus(job.id, JOB_STATUS.RECORDING);
         this.ctx.logger.info(`Recording started manually: ${job.jobId}`);
       } catch (startError) {
         // 启动失败，标记 Job 为 FAILED
@@ -491,7 +498,8 @@ export class JobController {
       // 检查是否有活跃的 Job（通过 Job 实体 + 心跳检测）
       const activeJob = await this.jobService.findActiveJobForStreamer(
         oldJob.streamerId,
-        oldJob.platform as Platform
+        oldJob.platform as Platform,
+        this.recorderConfig.heartbeatTimeout * 1000
       );
       if (activeJob) {
         this.ctx.status = 409;
@@ -580,8 +588,6 @@ export class JobController {
           }
         );
 
-        // 启动成功，更新状态为 RECORDING
-        await this.jobService.updateStatus(newJob.id, JOB_STATUS.RECORDING);
         this.ctx.logger.info(`Retry recording started: ${newJob.jobId}`);
       } catch (startError) {
         // 启动失败，标记 Job 为 FAILED

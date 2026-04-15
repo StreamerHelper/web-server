@@ -85,7 +85,7 @@ export class FFmpegService extends EventEmitter {
   /**
    * 启动 FFmpeg 进程
    */
-  start(options: FFmpegStartOptions): void {
+  async start(options: FFmpegStartOptions): Promise<void> {
     const {
       streamUrl,
       outputDir,
@@ -136,44 +136,56 @@ export class FFmpegService extends EventEmitter {
     this.logger?.debug('FFmpeg args', ffmpegArgs.join(' '));
 
     this.process = spawn('ffmpeg', ffmpegArgs);
-
-    this.process.on('error', err => {
-      this.logger?.error('Failed to start FFmpeg process', {
-        id: this.id,
-        error: err.message,
-      });
-      this.logFailureExit('spawn_error', {
-        error: err.message,
-      });
-
-      if (!this.process) {
-        return;
-      }
-
-      if (this.exitHandler) {
-        this.process.off('exit', this.exitHandler);
-      }
-
-      this.process = null;
-      this.exitHandler = null;
-      this.emit(FFmpegService.EVENT_EXIT, {
-        code: null,
-        signal: null,
-        isNatural: false,
-      });
-    });
+    const currentProcess = this.process;
 
     // 设置 exitHandler 引用，确保可以正确移除
     this.exitHandler = (code, signal) => this.handleExit(code, signal);
-    this.process.on('exit', this.exitHandler);
+    currentProcess.on('exit', this.exitHandler);
 
     // 监听 stderr 输出，直接回调外部
-    this.process.stderr?.on('data', data => {
+    currentProcess.stderr?.on('data', data => {
       const message = data.toString();
       this.handleStderrOutput(message);
 
       // 通知外部（用于心跳维护）
       this.onOutputCallback?.(message);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const handleSpawn = () => {
+        cleanup();
+        resolve();
+      };
+
+      const handleError = (err: Error) => {
+        cleanup();
+        this.logger?.error('Failed to start FFmpeg process', {
+          id: this.id,
+          error: err.message,
+        });
+        this.logFailureExit('spawn_error', {
+          error: err.message,
+        });
+
+        if (this.exitHandler) {
+          currentProcess.off('exit', this.exitHandler);
+        }
+
+        if (this.process === currentProcess) {
+          this.process = null;
+        }
+        this.exitHandler = null;
+        this.onOutputCallback = undefined;
+        reject(err);
+      };
+
+      const cleanup = () => {
+        currentProcess.off('spawn', handleSpawn);
+        currentProcess.off('error', handleError);
+      };
+
+      currentProcess.once('spawn', handleSpawn);
+      currentProcess.once('error', handleError);
     });
 
     this.logger?.debug('FFmpeg started', { id: this.id });

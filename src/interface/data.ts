@@ -268,6 +268,7 @@ export interface JobMetadataExtended {
   };
   totalSegments?: number;
   uploadedSegments?: string[];
+  danmakuUserIds?: string[];
 
   // 新增字段
   danmakuIndex?: DanmakuIndex; // 弹幕索引
@@ -281,7 +282,7 @@ export interface DanmakuUploadJobData {
   segmentId: string; // 分片 ID
   s3Key: string; // S3 存储路径
   localPath: string; // 本地文件路径
-  index: DanmakuIndex; // 弹幕索引（用于更新）
+  index?: DanmakuIndex; // 兼容旧任务数据
 }
 
 export interface TranscriptJobData {

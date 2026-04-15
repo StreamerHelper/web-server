@@ -48,6 +48,7 @@ export class DanmakuService extends EventEmitter {
   private connected = false;
   private messageBuffer: DanmakuMessage[] = [];
   private currentSegmentStart = 0;
+  private recordingStartTime = 0;
   private rotateTimer: NodeJS.Timeout | null = null;
 
   /**
@@ -60,7 +61,8 @@ export class DanmakuService extends EventEmitter {
 
     this.options = options;
     this.messageBuffer = [];
-    this.currentSegmentStart = Date.now();
+    this.recordingStartTime = Date.now();
+    this.currentSegmentStart = this.recordingStartTime;
 
     this.logger.info('Starting danmaku collector', {
       id: options.id,
@@ -161,8 +163,8 @@ export class DanmakuService extends EventEmitter {
       // 简化实现：假设直接是 JSON
       const message = JSON.parse(data.toString()) as DanmakuMessage;
 
-      // 设置相对时间
-      message.timestamp = Date.now() - this.currentSegmentStart;
+      // 统一使用相对整场录制的时间轴，便于跨分片检索和索引聚合。
+      message.timestamp = Date.now() - this.recordingStartTime;
 
       this.messageBuffer.push(message);
 

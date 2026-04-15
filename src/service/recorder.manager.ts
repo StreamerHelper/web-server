@@ -156,15 +156,16 @@ export class RecorderManager {
       await this.triggerAutoSubmission(options, data);
     });
 
-    // 启动录制（异步）
-    recording.start().catch(error => {
-      this.logger.error('Recording start failed', {
-        id: options.id,
-        platform,
-        streamerId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
+    void recording.start();
+
+    try {
+      await recording.waitUntilStarted();
+    } catch (error) {
+      if (this.recordings.get(key) === recording) {
+        this.recordings.delete(key);
+      }
+      throw error;
+    }
 
     this.logger.info('Recording started', {
       id: options.id,
