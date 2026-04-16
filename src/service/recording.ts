@@ -876,6 +876,7 @@ export class Recording extends EventEmitter {
     try {
       this.danmakuService = await this.danmakuManager.start(this.danmakuUrl, {
         id: this.id,
+        platform: this.platform,
         roomId: this.roomId,
         outputDir: this.danmakuDir,
         segmentTime: 10,
