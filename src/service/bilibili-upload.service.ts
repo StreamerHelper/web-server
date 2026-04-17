@@ -130,10 +130,10 @@ export class BilibiliUploadService {
     }
 
     // 3. 上传封面
-    let coverUrl = '';
-    if (options.cover) {
-      coverUrl = await this.uploadCoverFromS3(options.cover, cookies);
-    }
+    const coverUrl = await this.resolveCoverForSubmission(
+      options.cover,
+      cookies
+    );
 
     // 4. 提交稿件
     const result = await this.submitVideo(
@@ -593,13 +593,82 @@ export class BilibiliUploadService {
     return 'image/jpeg';
   }
 
+  private async resolveCoverForSubmission(
+    coverSource: string | undefined,
+    cookies: Record<string, string>
+  ): Promise<string> {
+    if (!coverSource) {
+      return '';
+    }
+
+    if (this.isBilibiliCoverUrl(coverSource)) {
+      return this.normalizeBilibiliCoverUrl(coverSource);
+    }
+
+    if (this.isExternalUrl(coverSource)) {
+      this.logger.warn(
+        'Skipping external cover URL for bilibili submission',
+        {
+          coverSource,
+        }
+      );
+      return '';
+    }
+
+    try {
+      const uploadedCoverUrl = await this.uploadCoverFromS3(
+        coverSource,
+        cookies
+      );
+      return this.normalizeBilibiliCoverUrl(uploadedCoverUrl);
+    } catch (error) {
+      this.logger.warn(
+        'Failed to upload cover to bilibili, submitting without cover',
+        {
+          coverSource,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+      return '';
+    }
+  }
+
+  private isBilibiliCoverUrl(coverUrl: string): boolean {
+    if (!coverUrl) {
+      return false;
+    }
+
+    const normalizedUrl = coverUrl.startsWith('//')
+      ? `https:${coverUrl}`
+      : coverUrl;
+
+    try {
+      const hostname = new URL(normalizedUrl).hostname.toLowerCase();
+      return hostname.endsWith('biliimg.com') || hostname.endsWith('hdslb.com');
+    } catch {
+      return false;
+    }
+  }
+
+  private isExternalUrl(coverSource: string): boolean {
+    return /^(https?:)?\/\//i.test(coverSource.trim());
+  }
+
+  private normalizeBilibiliCoverUrl(coverUrl: string): string {
+    const normalizedUrl = coverUrl.trim();
+    if (normalizedUrl.startsWith('http://')) {
+      return normalizedUrl.replace(/^http:/, '');
+    }
+    return normalizedUrl;
+  }
+
   /**
    * 提交视频稿件（公开方法）
    */
   async submitVideoParts(
     parts: Array<{ title: string; filename: string }>,
     options: BilibiliUploadOptions,
-    coverUrl?: string
+    coverSource?: string
   ): Promise<BilibiliUploadResult> {
     const credential = await this.credentialRepository.findValid();
     if (!credential) {
@@ -610,7 +679,13 @@ export class BilibiliUploadService {
       throw new Error('Bilibili credential expired. Please login again.');
     }
 
-    return this.submitVideo(parts, options, coverUrl || '', credential);
+    const cookies = credential.cookies as Record<string, string>;
+    const coverUrl = await this.resolveCoverForSubmission(
+      coverSource ?? options.cover,
+      cookies
+    );
+
+    return this.submitVideo(parts, options, coverUrl, credential);
   }
 
   /**

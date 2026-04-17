@@ -314,8 +314,7 @@ export class BilibiliSubmissionService {
           copyright: submission.copyright,
           source: submission.source,
           dynamic: submission.dynamic,
-        },
-        submission.cover
+        }
       );
 
       // 更新投稿结果
