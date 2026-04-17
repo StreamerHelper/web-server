@@ -1,14 +1,31 @@
-import { Provide, Scope, ScopeEnum } from '@midwayjs/core';
+import { Inject, Provide, Scope, ScopeEnum, Logger, ILogger } from '@midwayjs/core';
 import { InjectEntityModel } from '@midwayjs/typeorm';
+import { nanoid } from 'nanoid';
 import { Repository } from 'typeorm';
 import { Streamer } from '../entity';
 import { Platform, StreamerInfo } from '../interface';
+import { StorageService } from './storage.service';
+
+const MAX_STREAMER_COVER_BYTES = 5 * 1024 * 1024;
+const ALLOWED_STREAMER_COVER_TYPES: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
+export class InvalidStreamerCoverError extends Error {}
 
 @Provide()
 @Scope(ScopeEnum.Singleton)
 export class StreamerService {
   @InjectEntityModel(Streamer)
   streamerModel: Repository<Streamer>;
+
+  @Inject()
+  storageService: StorageService;
+
+  @Logger()
+  private logger: ILogger;
 
   /**
    * 创建主播
@@ -61,6 +78,17 @@ export class StreamerService {
     });
   }
 
+  async findByStreamerIds(streamerIds: string[]): Promise<Streamer[]> {
+    if (streamerIds.length === 0) {
+      return [];
+    }
+
+    return await this.streamerModel
+      .createQueryBuilder('streamer')
+      .where('streamer.streamerId IN (:...streamerIds)', { streamerIds })
+      .getMany();
+  }
+
   /**
    * 更新主播信息
    */
@@ -99,6 +127,55 @@ export class StreamerService {
    */
   async delete(id: string): Promise<void> {
     await this.streamerModel.delete({ id });
+  }
+
+  async buildStreamerInfo(streamer: Streamer): Promise<StreamerInfo> {
+    const info = streamer.toInfo();
+    return {
+      ...info,
+      coverUrl: await this.getCoverUrl(streamer.coverPath),
+    };
+  }
+
+  async uploadCoverDataUrl(
+    streamer: Pick<Streamer, 'id' | 'streamerId'>,
+    coverDataUrl: string
+  ): Promise<string> {
+    const { buffer, mimeType, extension } = this.parseCoverDataUrl(coverDataUrl);
+    const key = `streamers/${streamer.id || streamer.streamerId}/cover/${Date.now()}-${nanoid(10)}.${extension}`;
+    await this.storageService.upload(key, buffer, mimeType);
+    return key;
+  }
+
+  async deleteCover(coverPath?: string | null): Promise<void> {
+    if (!coverPath) {
+      return;
+    }
+
+    try {
+      await this.storageService.delete(coverPath);
+    } catch (error) {
+      this.logger.warn('Failed to delete streamer cover from storage', {
+        coverPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async getCoverUrl(coverPath?: string | null): Promise<string | null> {
+    if (!coverPath) {
+      return null;
+    }
+
+    try {
+      return await this.storageService.getSignedUrl(coverPath, 86400);
+    } catch (error) {
+      this.logger.warn('Failed to get streamer cover signed URL', {
+        coverPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   /**
@@ -157,5 +234,39 @@ export class StreamerService {
         huya: huyaCount,
       },
     };
+  }
+
+  private parseCoverDataUrl(coverDataUrl: string): {
+    buffer: Buffer;
+    mimeType: string;
+    extension: string;
+  } {
+    const match = coverDataUrl.match(
+      /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/
+    );
+    if (!match) {
+      throw new InvalidStreamerCoverError('Invalid cover image payload');
+    }
+
+    const mimeType = match[1].toLowerCase();
+    const extension = ALLOWED_STREAMER_COVER_TYPES[mimeType];
+    if (!extension) {
+      throw new InvalidStreamerCoverError(
+        'Unsupported cover image type. Please use JPG, PNG, or WebP.'
+      );
+    }
+
+    const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length === 0) {
+      throw new InvalidStreamerCoverError('Cover image is empty');
+    }
+
+    if (buffer.length > MAX_STREAMER_COVER_BYTES) {
+      throw new InvalidStreamerCoverError(
+        'Cover image is too large. Please keep it under 5MB.'
+      );
+    }
+
+    return { buffer, mimeType, extension };
   }
 }

@@ -1,9 +1,10 @@
-import { ILogger, Logger, Provide, Scope, ScopeEnum } from '@midwayjs/core';
+import { ILogger, Inject, Logger, Provide, Scope, ScopeEnum } from '@midwayjs/core';
 import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { In, LessThan, Repository } from 'typeorm';
 import { Job, Streamer } from '../entity';
 import { Highlight, JOB_STATUS, JobStatus } from '../interface';
+import { StorageService } from './storage.service';
 import dayjs = require('dayjs');
 
 @Provide()
@@ -23,6 +24,9 @@ export class JobService {
   @InjectEntityModel(Streamer)
   streamerModel: Repository<Streamer>;
 
+  @Inject()
+  storageService: StorageService;
+
   @Logger()
   private logger: ILogger;
 
@@ -33,10 +37,19 @@ export class JobService {
   async create(data: Partial<Job>): Promise<Job> {
     this.logger.debug('Creating job', { data });
 
+    let coverPath = data.coverPath;
+    if (coverPath === undefined && data.streamerId) {
+      const streamer = await this.streamerModel.findOne({
+        where: { streamerId: data.streamerId },
+      });
+      coverPath = streamer?.coverPath ?? null;
+    }
+
     // 自动生成 jobId（如果未提供）
     const jobData = {
       ...data,
       jobId: data.jobId || this.generateJobId(),
+      coverPath: coverPath ?? null,
     };
 
     const job = this.jobModel.create(jobData);
@@ -490,6 +503,7 @@ export class JobService {
         segmentCount: job.segmentCount,
         startTime: job.startTime,
         endTime: job.endTime,
+        coverUrl: await this.getSafeCoverUrl(job.coverPath),
       });
     }
 
@@ -507,6 +521,24 @@ export class JobService {
       .getRawMany();
 
     return result.map(r => r.streamerName);
+  }
+
+  private async getSafeCoverUrl(
+    coverPath?: string | null
+  ): Promise<string | null> {
+    if (!coverPath) {
+      return null;
+    }
+
+    try {
+      return await this.storageService.getSignedUrl(coverPath, 86400);
+    } catch (error) {
+      this.logger.warn('Failed to get job cover signed URL', {
+        coverPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   /**

@@ -18,6 +18,7 @@ import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.
 import { BilibiliUploadService, VideoPart } from './bilibili-upload.service';
 import { StorageService } from './storage.service';
 import { JobService } from './job.service';
+import { SubmissionTemplateService } from './submission-template.service';
 import { StreamerService } from './streamer.service';
 
 /**
@@ -35,7 +36,7 @@ const SEGMENT_DURATION_SECONDS = 10;
  */
 export interface CreateSubmissionInput {
   jobId: string;
-  title: string;
+  title?: string;
   description?: string;
   tags?: string[];
   tid?: number;
@@ -70,6 +71,9 @@ export class BilibiliSubmissionService {
   @Inject()
   private streamerService: StreamerService;
 
+  @Inject()
+  private submissionTemplateService: SubmissionTemplateService;
+
   /**
    * 创建投稿任务
    * 根据 Job 中的视频分片，规划分P结构
@@ -99,6 +103,23 @@ export class BilibiliSubmissionService {
       throw new Error('No video segments found');
     }
 
+    const streamer = await this.streamerService.findByStreamerId(job.streamerId);
+    const streamerName = job.streamerName || streamer?.name;
+    const uploadSettings = streamer?.uploadSettings || {};
+    const title = this.submissionTemplateService.resolveTitle(
+      input.title ?? uploadSettings.title,
+      {
+        streamerName,
+        startedAt: job.startTime || job.createdAt,
+      }
+    );
+    const description = input.description ?? uploadSettings.description ?? '';
+    const tags = input.tags ?? uploadSettings.tags ?? [];
+    const tid = this.submissionTemplateService.resolveTid(
+      input.tid ?? uploadSettings.tid
+    );
+    const cover = input.cover ?? job.coverPath ?? streamer?.coverPath ?? undefined;
+
     // 规划分P结构
     const parts = this.planParts(s3Keys);
 
@@ -111,11 +132,11 @@ export class BilibiliSubmissionService {
     // 创建投稿记录
     const submission = await this.submissionRepository.create({
       jobId: input.jobId,
-      title: input.title,
-      description: input.description || '',
-      tags: input.tags || [],
-      tid: input.tid || 171,
-      cover: input.cover,
+      title,
+      description,
+      tags,
+      tid,
+      cover,
       copyright: input.copyright || 1,
       source: input.source,
       dynamic: input.dynamic,
@@ -178,9 +199,6 @@ export class BilibiliSubmissionService {
     if (!submission) {
       throw new Error(`Submission not found: ${submissionId}`);
     }
-
-    // 获取最新的 streamer 信息并更新投稿配置
-    await this.updateSubmissionFromStreamer(submission);
 
     this.logger.info('Processing submission', {
       submissionId,
@@ -495,69 +513,4 @@ export class BilibiliSubmissionService {
     return this.submissionRepository.list(options);
   }
 
-  /**
-   * 从 streamer 获取最新投稿配置并更新 submission
-   */
-  private async updateSubmissionFromStreamer(
-    submission: BilibiliSubmissionEntity
-  ): Promise<void> {
-    try {
-      // 通过 jobId 获取 Job 信息
-      const job = await this.jobService.findByJobId(submission.jobId);
-      if (!job) {
-        this.logger.warn('Job not found for submission', {
-          submissionId: submission.id,
-          jobId: submission.jobId,
-        });
-        return;
-      }
-
-      // 获取 streamer 信息
-      const streamer = await this.streamerService.findByStreamerId(
-        job.streamerId
-      );
-      if (!streamer?.uploadSettings) {
-        this.logger.debug('No streamer upload settings found', {
-          submissionId: submission.id,
-          streamerId: job.streamerId,
-        });
-        return;
-      }
-
-      const { uploadSettings } = streamer;
-      let updated = false;
-
-      // 更新投稿信息（仅更新有值的字段）
-      if (uploadSettings.title) {
-        submission.title = uploadSettings.title;
-        updated = true;
-      }
-      if (uploadSettings.description !== undefined) {
-        submission.description = uploadSettings.description;
-        updated = true;
-      }
-      if (uploadSettings.tags && uploadSettings.tags.length > 0) {
-        submission.tags = uploadSettings.tags;
-        updated = true;
-      }
-      if (uploadSettings.tid) {
-        submission.tid = uploadSettings.tid;
-        updated = true;
-      }
-
-      if (updated) {
-        await this.submissionRepository.save(submission);
-        this.logger.info('Updated submission from streamer settings', {
-          submissionId: submission.id,
-          streamerId: job.streamerId,
-        });
-      }
-    } catch (error) {
-      this.logger.error('Failed to update submission from streamer', {
-        submissionId: submission.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      // 不抛出错误，继续使用原有配置
-    }
-  }
 }

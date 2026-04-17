@@ -531,7 +531,11 @@ export class BilibiliUploadService {
   ): Promise<string> {
     // 从 S3 下载封面
     const imageBuffer = await this.storageService.download(s3Key);
-    return this.uploadCover(imageBuffer, cookies);
+    return this.uploadCover(
+      imageBuffer,
+      cookies,
+      this.inferCoverMimeType(s3Key)
+    );
   }
 
   /**
@@ -539,19 +543,22 @@ export class BilibiliUploadService {
    */
   private async uploadCover(
     imageBuffer: Buffer,
-    cookies: Record<string, string>
+    cookies: Record<string, string>,
+    mimeType = 'image/jpeg'
   ): Promise<string> {
     const base64 = imageBuffer.toString('base64');
     const params = new URLSearchParams({
-      cover: `data:image/jpeg;base64,${base64}`,
+      cover: `data:${mimeType};base64,${base64}`,
       csrf: cookies['bili_jct'],
     });
 
-    const url = 'https://member.bilibili.com/x/vu/web/cover/up';
+    const url = `https://member.bilibili.com/x/vu/web/cover/up?ts=${Date.now()}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: 'https://member.bilibili.com',
+        Referer: 'https://member.bilibili.com/platform/upload/video/frame',
         Cookie: Object.entries(cookies)
           .map(([k, v]) => `${k}=${v}`)
           .join('; '),
@@ -573,6 +580,17 @@ export class BilibiliUploadService {
     }
 
     return data.data?.url || '';
+  }
+
+  private inferCoverMimeType(s3Key: string): string {
+    const lowerKey = s3Key.toLowerCase();
+    if (lowerKey.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lowerKey.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    return 'image/jpeg';
   }
 
   /**

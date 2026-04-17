@@ -13,6 +13,11 @@ export default {
     port: config.app.port,
   },
 
+  bodyParser: {
+    jsonLimit: '8mb',
+    formLimit: '1mb',
+  },
+
   // TypeORM 配置
   typeorm: {
     dataSource: {

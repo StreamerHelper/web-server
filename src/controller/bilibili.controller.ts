@@ -13,6 +13,8 @@ import {
   BilibiliUploadService,
   VideoPart,
 } from '../service/bilibili-upload.service';
+import { JobService } from '../service/job.service';
+import { SubmissionTemplateService } from '../service/submission-template.service';
 import { StreamerService } from '../service/streamer.service';
 
 @Controller('/api/bilibili')
@@ -31,6 +33,12 @@ export class BilibiliController {
 
   @Inject()
   streamerService: StreamerService;
+
+  @Inject()
+  jobService: JobService;
+
+  @Inject()
+  submissionTemplateService: SubmissionTemplateService;
 
   @Inject()
   bilibiliSubmissionService: BilibiliSubmissionService;
@@ -214,35 +222,54 @@ export class BilibiliController {
       description?: string;
       tags?: string[];
       tid?: number;
+      cover?: string;
+      jobId?: string;
       streamerId?: string;
     }
   ) {
     try {
-      // 如果指定了 streamerId, 获取主播的上传设置
-      if (body.streamerId) {
-        const streamer = await this.streamerService.findById(body.streamerId);
-        if (streamer?.uploadSettings) {
-          body = {
-            ...body,
-            ...streamer.uploadSettings,
-          };
-        }
+      let job = null;
+      if (body.jobId) {
+        job = await this.jobService.findByJobId(body.jobId);
       }
+
+      let streamer = null;
+      if (body.streamerId) {
+        streamer =
+          (await this.streamerService.findById(body.streamerId)) ||
+          (await this.streamerService.findByStreamerId(body.streamerId));
+      }
+
+      const uploadSettings = streamer?.uploadSettings || {};
+      const title = this.submissionTemplateService.resolveTitle(
+        body.title || uploadSettings.title,
+        {
+          streamerName: job?.streamerName || streamer?.name,
+          startedAt: job?.startTime || job?.createdAt || Date.now(),
+        }
+      );
+      const description = body.description ?? uploadSettings.description ?? '';
+      const tags = body.tags ?? uploadSettings.tags ?? [];
+      const tid = this.submissionTemplateService.resolveTid(
+        body.tid ?? uploadSettings.tid
+      );
+      const cover = body.cover ?? job?.coverPath ?? streamer?.coverPath ?? undefined;
 
       // 构建 VideoPart
       const videoPart: VideoPart = {
-        title: body.title,
-        filename: body.s3Key.split('/').pop() || body.title,
+        title,
+        filename: body.s3Key.split('/').pop() || title,
         s3Key: body.s3Key,
         duration: 0,
         size: 0,
       };
 
       const options: BilibiliUploadOptions = {
-        title: body.title,
-        description: body.description || '',
-        tags: body.tags || [],
-        tid: body.tid || 171, // 默认分区
+        title,
+        description,
+        tags,
+        tid,
+        cover,
         copyright: 1,
       };
 

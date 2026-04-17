@@ -355,10 +355,10 @@ export class RecorderManager {
       // 5. 创建投稿记录
       const submission = await this.submissionService.createSubmission({
         jobId: options.jobId,
-        title: uploadSettings.title || this.generateDefaultTitle(streamer.name),
+        title: uploadSettings.title,
         description: uploadSettings.description,
         tags: uploadSettings.tags || [],
-        tid: uploadSettings.tid || 171,
+        tid: uploadSettings.tid,
       });
 
       // 6. 派发投稿任务
@@ -385,16 +385,4 @@ export class RecorderManager {
     }
   }
 
-  /**
-   * 生成默认投稿标题
-   */
-  private generateDefaultTitle(streamerName: string): string {
-    const now = new Date();
-    const date = now.toLocaleDateString('zh-CN', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
-    return `${streamerName}的直播录像 ${date}`;
-  }
 }

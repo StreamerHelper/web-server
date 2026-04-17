@@ -76,6 +76,9 @@ export class Job {
   @Column({ name: 'error_message', nullable: true })
   errorMessage: string;
 
+  @Column({ name: 'cover_url', nullable: true, length: 1000 })
+  coverPath: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 

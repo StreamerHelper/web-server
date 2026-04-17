@@ -54,6 +54,9 @@ export class Streamer {
     tid?: number;
   };
 
+  @Column({ name: 'cover_path', nullable: true, length: 1000 })
+  coverPath: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 
@@ -71,6 +74,7 @@ export class Streamer {
       isActive: this.isActive,
       recordSettings: this.recordSettings,
       uploadSettings: this.uploadSettings,
+      coverPath: this.coverPath,
     };
   }
 }

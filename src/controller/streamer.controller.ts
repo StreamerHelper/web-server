@@ -12,7 +12,10 @@ import {
 import { Application, Context } from '@midwayjs/koa';
 import { Platform, StreamerInfo } from '../interface';
 import { PlatformService } from '../service/platform.service';
-import { StreamerService } from '../service/streamer.service';
+import {
+  InvalidStreamerCoverError,
+  StreamerService,
+} from '../service/streamer.service';
 
 @Controller('/api/streamers')
 export class StreamerController {
@@ -27,6 +30,10 @@ export class StreamerController {
 
   @Inject()
   platformService: PlatformService;
+
+  private async serializeStreamer(streamer: any) {
+    return this.streamerService.buildStreamerInfo(streamer);
+  }
 
   /**
    * GET /api/streamers - 获取主播列表
@@ -43,7 +50,7 @@ export class StreamerController {
       }
 
       return {
-        streamers: streamers.map(s => s.toInfo()),
+        streamers: await Promise.all(streamers.map(s => this.serializeStreamer(s))),
         total: streamers.length,
       };
     } catch (error) {
@@ -85,7 +92,7 @@ export class StreamerController {
         return { error: 'Streamer not found' };
       }
 
-      return streamer.toInfo();
+      return await this.serializeStreamer(streamer);
     } catch (error) {
       this.ctx.logger.error('Failed to get streamer', {
         error: error instanceof Error ? error.message : String(error),
@@ -130,9 +137,31 @@ export class StreamerController {
         uploadSettings: body.uploadSettings,
       });
 
+      let coverPath: string | null = null;
+      try {
+        if (body.coverDataUrl) {
+          coverPath = await this.streamerService.uploadCoverDataUrl(
+            streamer,
+            body.coverDataUrl
+          );
+          await this.streamerService.update(streamer.id, { coverPath });
+        }
+      } catch (error) {
+        if (coverPath) {
+          await this.streamerService.deleteCover(coverPath);
+        }
+        await this.streamerService.delete(streamer.id);
+        throw error;
+      }
+
       this.ctx.status = 201;
-      return streamer.toInfo();
+      const created = await this.streamerService.findById(streamer.id);
+      return created ? await this.serializeStreamer(created) : null;
     } catch (error) {
+      if (error instanceof InvalidStreamerCoverError) {
+        this.ctx.status = 400;
+        return { error: error.message };
+      }
       this.ctx.logger.error('Failed to add streamer', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -167,12 +196,46 @@ export class StreamerController {
       if (body.uploadSettings !== undefined)
         updateData.uploadSettings = body.uploadSettings;
 
-      await this.streamerService.update(id, updateData);
+      let nextCoverPath = streamer.coverPath;
+      let uploadedCoverPath: string | null = null;
+
+      if (body.coverDataUrl) {
+        uploadedCoverPath = await this.streamerService.uploadCoverDataUrl(
+          streamer,
+          body.coverDataUrl
+        );
+        nextCoverPath = uploadedCoverPath;
+      } else if (body.removeCover) {
+        nextCoverPath = null;
+      }
+
+      if (body.coverDataUrl !== undefined || body.removeCover) {
+        updateData.coverPath = nextCoverPath;
+      }
+
+      try {
+        await this.streamerService.update(id, updateData);
+      } catch (error) {
+        if (uploadedCoverPath) {
+          await this.streamerService.deleteCover(uploadedCoverPath);
+        }
+        throw error;
+      }
+
+      if (uploadedCoverPath && streamer.coverPath && streamer.coverPath !== uploadedCoverPath) {
+        await this.streamerService.deleteCover(streamer.coverPath);
+      } else if (body.removeCover && streamer.coverPath) {
+        await this.streamerService.deleteCover(streamer.coverPath);
+      }
 
       // 返回更新后的数据
       const updated = await this.streamerService.findById(id);
-      return updated?.toInfo();
+      return updated ? await this.serializeStreamer(updated) : null;
     } catch (error) {
+      if (error instanceof InvalidStreamerCoverError) {
+        this.ctx.status = 400;
+        return { error: error.message };
+      }
       this.ctx.logger.error('Failed to update streamer', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -195,6 +258,7 @@ export class StreamerController {
       }
 
       await this.streamerService.delete(id);
+      await this.streamerService.deleteCover(streamer.coverPath);
 
       return { success: true, message: 'Streamer deleted' };
     } catch (error) {
@@ -234,7 +298,7 @@ export class StreamerController {
       }
 
       return {
-        streamer: streamer.toInfo(),
+        streamer: await this.serializeStreamer(streamer),
         status,
       };
     } catch (error) {
