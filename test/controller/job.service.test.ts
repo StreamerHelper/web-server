@@ -89,4 +89,49 @@ describe('JobService browse cover data', () => {
     ]);
     expect(service.logger.warn).toHaveBeenCalled();
   });
+
+  it('returns video offsets for timeline aligned playback', async () => {
+    const service = new JobService() as any;
+    service.jobModel = {
+      findOne: jest.fn().mockResolvedValue({
+        id: 'job-db-id',
+        jobId: 'job-public-id',
+        streamerName: '主播C',
+        roomName: '直播间C',
+        platform: 'bilibili',
+        duration: 24000,
+        segmentCount: 3,
+        metadata: {
+          uploadedSegments: [
+            'raw/job-db-id/video/segment_20260418_100000.mkv',
+            'raw/job-db-id/video/segment_20260418_100010.mkv',
+            'raw/job-db-id/video/segment_20260418_100020.mkv',
+          ],
+        },
+      }),
+    };
+
+    const result = await service.getJobVideos('job-db-id');
+
+    expect(result.videos).toEqual([
+      expect.objectContaining({
+        index: 0,
+        startOffsetMs: 0,
+        endOffsetMs: 10000,
+        durationMs: 10000,
+      }),
+      expect.objectContaining({
+        index: 1,
+        startOffsetMs: 10000,
+        endOffsetMs: 20000,
+        durationMs: 10000,
+      }),
+      expect.objectContaining({
+        index: 2,
+        startOffsetMs: 20000,
+        endOffsetMs: 24000,
+        durationMs: 4000,
+      }),
+    ]);
+  });
 });

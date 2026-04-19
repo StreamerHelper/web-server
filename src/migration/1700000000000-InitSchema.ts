@@ -113,7 +113,7 @@ export class InitSchema1700000000000 implements MigrationInterface {
         "tags" TEXT[],
         "tid" INTEGER DEFAULT 171,
         "cover" VARCHAR(500),
-        "copyright" INTEGER DEFAULT 1,
+        "copyright" INTEGER DEFAULT 2,
         "source" VARCHAR(500),
         "dynamic" VARCHAR(500),
         "status" submission_status DEFAULT 'pending',

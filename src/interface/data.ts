@@ -353,7 +353,7 @@ export interface QueryTranscriptResponse {
 export interface ExportRequest {
   jobId: string;
   type: 'danmaku' | 'transcript';
-  format: 'xml' | 'json' | 'ass' | 'txt' | 'srt' | 'vtt';
+  format: 'xml' | 'json' | 'jsonl' | 'ass' | 'txt' | 'srt' | 'vtt';
 }
 
 /**

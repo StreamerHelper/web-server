@@ -553,15 +553,49 @@ export class JobService {
     // 从 metadata 获取视频分片信息
     const uploadedSegments = job.metadata?.uploadedSegments || [];
 
-    // 构建视频列表
-    const videos = uploadedSegments.map((s3Key: string, index: number) => {
-      // 从 s3Key 解析文件名，格式如: jobs/{jobId}/video/segment_20240115_100000.mkv
+    const rawVideos = uploadedSegments.map((s3Key: string, index: number) => {
       const filename = s3Key.split('/').pop() || `segment_${index}.mkv`;
+      const timestamp = this.parseVideoSegmentTimestamp(filename);
 
       return {
         index,
         filename,
         s3Key,
+        timestamp,
+      };
+    });
+
+    const firstTimestamp =
+      rawVideos.find(video => video.timestamp !== null)?.timestamp ?? null;
+    const defaultSegmentDuration =
+      rawVideos.length > 0
+        ? Math.max(Math.round(job.duration / rawVideos.length), 10_000)
+        : 10_000;
+
+    const videos = rawVideos.map((video, index) => {
+      const fallbackStartOffsetMs = index * defaultSegmentDuration;
+      const startOffsetMs =
+        video.timestamp !== null && firstTimestamp !== null
+          ? Math.max(0, video.timestamp - firstTimestamp)
+          : fallbackStartOffsetMs;
+
+      const nextVideo = rawVideos[index + 1];
+      const derivedEndOffsetMs =
+        nextVideo?.timestamp != null && firstTimestamp !== null
+          ? Math.max(startOffsetMs + 1000, nextVideo.timestamp - firstTimestamp)
+          : startOffsetMs + defaultSegmentDuration;
+      const endOffsetMs =
+        index === rawVideos.length - 1
+          ? Math.max(startOffsetMs + 1000, job.duration || derivedEndOffsetMs)
+          : derivedEndOffsetMs;
+
+      return {
+        index: video.index,
+        filename: video.filename,
+        s3Key: video.s3Key,
+        startOffsetMs,
+        endOffsetMs,
+        durationMs: Math.max(1000, endOffsetMs - startOffsetMs),
         // 播放地址（需要前端通过这个地址请求视频流）
         url: `/api/jobs/${id}/videos/${index}/stream`,
       };
@@ -623,5 +657,22 @@ export class JobService {
       duration: 0,
       size: 0,
     } as any;
+  }
+
+  private parseVideoSegmentTimestamp(filename: string): number | null {
+    const match = filename.match(/segment_(\d{8})_(\d{6})\.mkv$/);
+    if (!match) {
+      return null;
+    }
+
+    const [, date, time] = match;
+    const year = Number(date.slice(0, 4));
+    const month = Number(date.slice(4, 6)) - 1;
+    const day = Number(date.slice(6, 8));
+    const hour = Number(time.slice(0, 2));
+    const minute = Number(time.slice(2, 4));
+    const second = Number(time.slice(4, 6));
+
+    return Date.UTC(year, month, day, hour, minute, second);
   }
 }

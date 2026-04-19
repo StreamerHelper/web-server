@@ -20,16 +20,18 @@ import { StorageService } from './storage.service';
 import { JobService } from './job.service';
 import { SubmissionTemplateService } from './submission-template.service';
 import { StreamerService } from './streamer.service';
+import { buildPlatformRoomUrl } from '../utils/platform-room-url';
 
 /**
- * 每个分P的目标时长（10分钟 = 600秒）
+ * 每个分P的目标时长（1小时 = 3600秒）
  */
-const PART_DURATION_SECONDS = 600;
+const PART_DURATION_SECONDS = 3600;
 
 /**
  * 每个分片的时长（10秒）
  */
 const SEGMENT_DURATION_SECONDS = 10;
+const BILIBILI_COPYRIGHT_REPRINT = 2;
 
 /**
  * 创建投稿的输入参数
@@ -119,6 +121,10 @@ export class BilibiliSubmissionService {
       input.tid ?? uploadSettings.tid
     );
     const cover = input.cover ?? job.coverPath ?? streamer?.coverPath ?? undefined;
+    const source =
+      this.normalizeSource(input.source) ||
+      buildPlatformRoomUrl(job.platform, job.roomId) ||
+      buildPlatformRoomUrl(streamer?.platform, streamer?.roomId);
 
     // 规划分P结构
     const parts = this.planParts(s3Keys);
@@ -137,8 +143,8 @@ export class BilibiliSubmissionService {
       tags,
       tid,
       cover,
-      copyright: input.copyright || 1,
-      source: input.source,
+      copyright: BILIBILI_COPYRIGHT_REPRINT,
+      source,
       dynamic: input.dynamic,
       status: SubmissionStatus.PENDING,
       parts,
@@ -151,13 +157,13 @@ export class BilibiliSubmissionService {
 
   /**
    * 规划分P结构
-   * 将分片按照每10分钟一个分P进行分组
+   * 将分片按照每1小时一个分P进行分组
    */
   private planParts(s3Keys: string[]): SubmissionPart[] {
     // 按 S3 key 排序（文件名包含时间戳）
     const sortedKeys = [...s3Keys].sort();
 
-    // 计算每个分P包含的分片数（600秒 / 10秒 = 60个分片）
+    // 计算每个分P包含的分片数（3600秒 / 10秒 = 360个分片）
     const segmentsPerPart = Math.floor(
       PART_DURATION_SECONDS / SEGMENT_DURATION_SECONDS
     );
@@ -349,6 +355,11 @@ export class BilibiliSubmissionService {
 
       throw error;
     }
+  }
+
+  private normalizeSource(source?: string): string | undefined {
+    const trimmed = source?.trim();
+    return trimmed ? trimmed : undefined;
   }
 
   /**

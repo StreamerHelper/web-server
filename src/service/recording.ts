@@ -1091,12 +1091,20 @@ export class Recording extends EventEmitter {
     if (this.danmakuService) {
       this.danmakuSegmentHandler = async (segment: any) => {
         try {
+          const segmentFilename =
+            typeof segment.s3Key === 'string'
+              ? path.basename(segment.s3Key)
+              : path.basename(segment.localPath || `${Date.now()}.jsonl`);
+          const segmentId = segmentFilename.replace(/\.[^.]+$/, '');
+          const s3Key =
+            typeof segment.s3Key === 'string'
+              ? segment.s3Key
+              : `danmaku/${this.id}/${segmentFilename}`;
+
           this.logger.debug('Danmaku segment completed', {
             id: this.id,
-            segmentId: segment.id,
+            segmentId,
           });
-
-          const s3Key = `danmaku/${this.id}/${segment.id}.jsonl`;
 
           const danmakuUploadQueue =
             this.bullFramework.getQueue('danmaku-upload');
@@ -1104,7 +1112,7 @@ export class Recording extends EventEmitter {
             await danmakuUploadQueue.addJobToQueue(
               {
                 id: this.id,
-                segmentId: segment.id,
+                segmentId,
                 s3Key,
                 localPath: segment.localPath,
               },

@@ -78,7 +78,7 @@ export class BilibiliSubmissionEntity {
   @Column({ name: 'cover', nullable: true })
   cover: string;
 
-  @Column({ name: 'copyright', default: 1 })
+  @Column({ name: 'copyright', default: 2 })
   copyright: number;
 
   @Column({ name: 'source', nullable: true })

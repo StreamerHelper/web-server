@@ -699,7 +699,7 @@ export class BilibiliUploadService {
   ): Promise<BilibiliUploadResult> {
     // 构建稿件数据（参照 biliup 的 Studio 结构）
     const studio = {
-      copyright: options.copyright || 1,
+      copyright: 2,
       source: options.source || '',
       tid: options.tid || 171,
       cover: coverUrl,

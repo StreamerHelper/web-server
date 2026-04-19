@@ -14,8 +14,10 @@ import {
   VideoPart,
 } from '../service/bilibili-upload.service';
 import { JobService } from '../service/job.service';
+import { BilibiliPartitionService } from '../service/bilibili-partition.service';
 import { SubmissionTemplateService } from '../service/submission-template.service';
 import { StreamerService } from '../service/streamer.service';
+import { buildPlatformRoomUrl } from '../utils/platform-room-url';
 
 @Controller('/api/bilibili')
 export class BilibiliController {
@@ -42,6 +44,9 @@ export class BilibiliController {
 
   @Inject()
   bilibiliSubmissionService: BilibiliSubmissionService;
+
+  @Inject()
+  bilibiliPartitionService: BilibiliPartitionService;
 
   @Inject()
   bullFramework: Framework;
@@ -223,6 +228,7 @@ export class BilibiliController {
       tags?: string[];
       tid?: number;
       cover?: string;
+      source?: string;
       jobId?: string;
       streamerId?: string;
     }
@@ -254,6 +260,10 @@ export class BilibiliController {
         body.tid ?? uploadSettings.tid
       );
       const cover = body.cover ?? job?.coverPath ?? streamer?.coverPath ?? undefined;
+      const source =
+        body.source?.trim() ||
+        buildPlatformRoomUrl(job?.platform, job?.roomId) ||
+        buildPlatformRoomUrl(streamer?.platform, streamer?.roomId);
 
       // 构建 VideoPart
       const videoPart: VideoPart = {
@@ -270,7 +280,8 @@ export class BilibiliController {
         tags,
         tid,
         cover,
-        copyright: 1,
+        copyright: 2,
+        source,
       };
 
       const result = await this.bilibiliUploadService.upload(
@@ -299,87 +310,16 @@ export class BilibiliController {
    */
   @Get('/upload/partitions')
   async getPartitions() {
-    // 常用分区列表（简化版)
-    return {
-      partitions: [
-        {
-          id: 1,
-          name: '分区',
-          children: [
-            { id: 24, name: '搞笑' },
-            { id: 25, name: '游戏' },
-            { id: 47, name: '专栏' },
-            { id: 27, name: '音频' },
-            { id: 28, name: '娱乐' },
-            { id: 29, name: '番剧' },
-            { id: 30, name: '影视' },
-            { id: 31, name: '纪录片' },
-            { id: 207, name: '数码' },
-            { id: 208, name: '手游' },
-            { id: 229, name: '鬼畜' },
-            { id: 217, name: '动物圈' },
-            { id: 119, name: '舞蹈' },
-            { id: 155, name: '时尚' },
-            { id: 202, name: '广告' },
-            { id: 138, name: '趣味人文科普' },
-          ],
-        },
-        {
-          id: 160,
-          name: '生活',
-          children: [
-            { id: 161, name: '日常' },
-            { id: 162, name: '美食圈' },
-            { id: 163, name: '动物圈' },
-            { id: 164, name: '手办' },
-            { id: 165, name: '模玩' },
-            { id: 166, name: '萌宠' },
-            { id: 167, name: '运动' },
-            { id: 168, name: '搞笑' },
-            { id: 169, name: '家居房产' },
-            { id: 170, name: '手工' },
-            { id: 171, name: '绘画' },
-            { id: 172, name: '日常' },
-          ],
-        },
-        {
-          id: 177,
-          name: '知识',
-          children: [
-            { id: 178, name: '科学科普' },
-            { id: 179, name: '社科法律心理' },
-            { id: 180, name: '人文历史' },
-            { id: 181, name: '财经商业' },
-            { id: 182, name: '校园学习' },
-            { id: 183, name: '职业职场' },
-            { id: 184, name: '设计' },
-            { id: 185, name: '技能' },
-            { id: 188, name: '演讲' },
-          ],
-        },
-        {
-          id: 234,
-          name: '科技',
-          children: [
-            { id: 235, name: '计算机技术' },
-            { id: 236, name: '科工机械' },
-            { id: 237, name: '前沿科技' },
-          ],
-        },
-        {
-          id: 11,
-          name: '文章',
-          children: [
-            { id: 13, name: '漫画' },
-            { id: 12, name: '动画' },
-            { id: 14, name: '音乐' },
-            { id: 15, name: '游戏' },
-            { id: 16, name: '真人秀' },
-            { id: 17, name: '影视' },
-          ],
-        },
-      ],
-    };
+    try {
+      const partitions = await this.bilibiliPartitionService.listPartitions();
+      return { partitions };
+    } catch (error) {
+      this.ctx.logger.error('Failed to get bilibili partitions', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.ctx.status = 500;
+      return { error: 'Failed to get bilibili partitions' };
+    }
   }
 
   // ==================== 投稿相关 API ====================

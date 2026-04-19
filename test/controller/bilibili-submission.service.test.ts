@@ -49,6 +49,8 @@ describe('BilibiliSubmissionService title handling', () => {
       jobId: 'job-1',
       streamerId: 'streamer-1',
       streamerName: '主播A',
+      platform: 'bilibili',
+      roomId: '12345',
       startTime: new Date('2026-04-18T12:00:00+08:00'),
       createdAt: new Date('2026-04-18T12:00:00+08:00'),
       metadata: {
@@ -78,6 +80,8 @@ describe('BilibiliSubmissionService title handling', () => {
         tags: ['默认标签'],
         tid: 172,
         cover: 'streamers/streamer-1/cover/default.jpg',
+        copyright: 2,
+        source: 'https://live.bilibili.com/12345',
         status: SubmissionStatus.PENDING,
       })
     );
@@ -89,6 +93,8 @@ describe('BilibiliSubmissionService title handling', () => {
       jobId: 'job-rename',
       streamerId: 'streamer-rename',
       streamerName: '录制时主播名',
+      platform: 'bilibili',
+      roomId: '67890',
       startTime: new Date('2026-04-18T08:30:00+08:00'),
       createdAt: new Date('2026-04-18T08:30:00+08:00'),
       coverPath: 'jobs/job-rename/cover/snapshot.jpg',
@@ -122,6 +128,8 @@ describe('BilibiliSubmissionService title handling', () => {
       jobId: 'job-2',
       streamerId: 'streamer-2',
       streamerName: '主播B',
+      platform: 'huya',
+      roomId: 'room-200',
       startTime: new Date('2026-04-18T12:00:00+08:00'),
       createdAt: new Date('2026-04-18T12:00:00+08:00'),
       metadata: {
@@ -155,6 +163,52 @@ describe('BilibiliSubmissionService title handling', () => {
         tags: ['手动标签'],
         tid: 24,
         cover: 'streamers/streamer-2/cover/default.jpg',
+        copyright: 2,
+        source: 'https://www.huya.com/room-200',
+      })
+    );
+  });
+
+  it('groups uploaded segments into 1-hour parts by default', async () => {
+    const service = createService();
+    const uploadedSegments = Array.from({ length: 361 }, (_, index) =>
+      `raw/job-long/video/segment_${String(index + 1).padStart(3, '0')}.mkv`
+    );
+
+    service.jobService.findByJobId.mockResolvedValue({
+      jobId: 'job-long',
+      streamerId: 'streamer-long',
+      streamerName: '长直播主播',
+      platform: 'douyu',
+      roomId: '8899',
+      startTime: new Date('2026-04-18T12:00:00+08:00'),
+      createdAt: new Date('2026-04-18T12:00:00+08:00'),
+      metadata: {
+        uploadedSegments,
+      },
+    });
+    service.streamerService.findByStreamerId.mockResolvedValue({
+      name: '长直播主播',
+      uploadSettings: {},
+    });
+
+    await service.createSubmission({
+      jobId: 'job-long',
+    });
+
+    expect(service.submissionRepository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totalParts: 2,
+        parts: [
+          expect.objectContaining({
+            index: 1,
+            s3Keys: uploadedSegments.slice(0, 360),
+          }),
+          expect.objectContaining({
+            index: 2,
+            s3Keys: uploadedSegments.slice(360),
+          }),
+        ],
       })
     );
   });
