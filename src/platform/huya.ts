@@ -8,6 +8,7 @@ import {
   ResolvedStream,
   StreamStatus,
 } from '../interface';
+import { getHuyaDanmakuUrl } from '../service/huya-danmaku';
 
 interface HuyaStreamData {
   data: Array<{
@@ -112,7 +113,6 @@ export class HuyaAdapter implements PlatformAdapter {
       );
     }
 
-    const roomInfo = streamData.data[0].gameLiveInfo;
     const isLive = this.extractRoomState(html) === this.SHOW_STATUS_ONLINE;
 
     if (!isLive) {
@@ -132,15 +132,9 @@ export class HuyaAdapter implements PlatformAdapter {
       );
     }
 
-    const screenType = roomInfo.screenType;
-    const liveSourceType = roomInfo.liveSourceType;
-    const reSecret =
-      !screenType && [0, 8, 13].includes(liveSourceType);
-
     const candidates = this.buildStreamCandidates(
       streamInfoList,
       streamData.vMultiStreamInfo,
-      reSecret,
       quality
     );
 
@@ -172,7 +166,10 @@ export class HuyaAdapter implements PlatformAdapter {
   }
 
   async getDanmakuUrl(streamerId: string): Promise<string> {
-    return `wss://cdnws.streamhyla.huya.com/wsapp/sub/stream/${streamerId}`;
+    this.logger?.debug('Resolved Huya danmaku endpoint', {
+      streamerId,
+    });
+    return getHuyaDanmakuUrl();
   }
 
   async validateStreamerId(streamerId: string): Promise<boolean> {
@@ -260,7 +257,6 @@ export class HuyaAdapter implements PlatformAdapter {
   private buildStreamCandidates(
     streamInfoList: HuyaGameStreamInfo[],
     multiStreamInfo: HuyaMultiStreamInfo[],
-    reSecret: boolean,
     requestedQuality: RecordingQuality
   ): Array<{ url: string; effectiveQuality: RecordingQuality }> {
     const urls: Array<{ url: string; effectiveQuality: RecordingQuality }> =
@@ -290,22 +286,16 @@ export class HuyaAdapter implements PlatformAdapter {
       }
 
       for (const vStream of prioritizedQualities) {
-        const baseUrl = `${sFlvUrl}/${sStreamName}.${sFlvUrlSuffix}`;
-
-        let params: Record<string, string>;
-
-        if (reSecret) {
-          params = this.computeStreamParams(
-            baseParams,
-            sStreamName,
-            vStream.iBitRate
-          );
-        } else {
-          params = { ...antiCodeParams };
-          if (vStream.iBitRate) {
-            params['ratio'] = vStream.iBitRate.toString();
-          }
-        }
+        const baseUrl = this.buildHttpsStreamBaseUrl(
+          sFlvUrl,
+          sStreamName,
+          sFlvUrlSuffix
+        );
+        const params = this.computeStreamParams(
+          baseParams,
+          sStreamName,
+          vStream.iBitRate
+        );
 
         const queryString = new URLSearchParams(params).toString();
         urls.push({
@@ -319,6 +309,19 @@ export class HuyaAdapter implements PlatformAdapter {
     }
 
     return urls;
+  }
+
+  private buildHttpsStreamBaseUrl(
+    flvUrl: string,
+    streamName: string,
+    suffix: string
+  ): string {
+    try {
+      const parsed = new URL(flvUrl);
+      return `https://${parsed.host}${parsed.pathname}/${streamName}.${suffix}`;
+    } catch {
+      return `${flvUrl.replace(/^http:\/\//i, 'https://')}/${streamName}.${suffix}`;
+    }
   }
 
   private prioritizeQualities(

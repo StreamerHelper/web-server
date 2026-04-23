@@ -468,10 +468,10 @@ export class JobService {
     const groups: Record<string, any[]> = {};
 
     for (const job of jobs) {
-      // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于该值的任务
+      // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于等于该值的任务
       if (
         minSegmentCount !== undefined &&
-        job.segmentCount <= minSegmentCount
+        job.segmentCount < minSegmentCount
       ) {
         continue;
       }

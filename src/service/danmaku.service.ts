@@ -10,6 +10,7 @@ import {
 import { Application } from '@midwayjs/koa';
 import { EventEmitter } from 'events';
 import * as fsPromises from 'fs/promises';
+import { randomUUID } from 'crypto';
 import { Platform } from '../interface';
 import { DanmakuColor, DanmakuMessage } from '../interface/data';
 import * as WebSocket from 'ws';
@@ -24,6 +25,22 @@ import {
   signBilibiliWbiUrl,
 } from './bilibili-danmaku';
 import { DanmakuXmlMetadata, DanmakuXmlService } from './danmaku-xml.service';
+import {
+  buildDouyuHeartbeatPacket,
+  buildDouyuJoinGroupPacket,
+  buildDouyuLoginPacket,
+  decodeDouyuPackets,
+  getDouyuDanmakuUrl,
+  parseDouyuDanmakuMessage,
+} from './douyu-danmaku';
+import {
+  buildHuyaRegisterPacket,
+  decodeHuyaDanmakuMessages,
+  extractHuyaUidFromRoomPage,
+  getHuyaHeartbeatPacket,
+  peekHuyaCommandType,
+} from './huya-danmaku';
+import { BilibiliCredentialRepository } from '../repository/bilibili-credential.repository';
 const { WebSocket: WS } = WebSocket;
 import dayjs = require('dayjs');
 
@@ -58,6 +75,9 @@ export class DanmakuService extends EventEmitter {
   @Inject()
   danmakuXmlService: DanmakuXmlService;
 
+  @Inject()
+  bilibiliCredentialRepository: BilibiliCredentialRepository;
+
   @Logger()
   private logger: ILogger;
 
@@ -77,6 +97,9 @@ export class DanmakuService extends EventEmitter {
   private bilibiliHosts: BilibiliDanmuHost[] = [];
   private bilibiliHostIndex = 0;
   private bilibiliMessageCounter = 0;
+  private bilibiliAuthUid = 0;
+  private bilibiliCookieHeader = '';
+  private bilibiliBuvid = '';
 
   /**
    * 连接并开始收集
@@ -152,6 +175,16 @@ export class DanmakuService extends EventEmitter {
       return;
     }
 
+    if (this.isDouyuDanmaku(url)) {
+      await this.connectDouyu(url);
+      return;
+    }
+
+    if (this.isHuyaDanmaku(url)) {
+      await this.connectHuya(url);
+      return;
+    }
+
     await this.connectLegacy(url);
   }
 
@@ -174,6 +207,7 @@ export class DanmakuService extends EventEmitter {
 
       this.ws.on('open', () => {
         this.connected = true;
+        this.reconnectAttempts = 0;
         this.logger.info('Danmaku WebSocket connected', {
           id: this.options?.id,
           url,
@@ -181,8 +215,9 @@ export class DanmakuService extends EventEmitter {
         finish();
       });
 
-      this.ws.on('message', (data: Buffer) => {
-        this.handleMessage(data);
+      this.ws.on('message', raw => {
+        const data = this.normalizeWebSocketData(raw);
+        this.handleLegacyMessage(data);
       });
 
       this.ws.on('error', error => {
@@ -229,12 +264,276 @@ export class DanmakuService extends EventEmitter {
     });
   }
 
+  private async connectDouyu(url: string): Promise<void> {
+    const roomId = this.options?.roomId?.trim();
+    if (!roomId) {
+      throw new Error('Invalid Douyu room id');
+    }
+
+    const wsUrl = this.resolveDouyuSocketUrl(url);
+
+    return new Promise((resolve, reject) => {
+      let authenticated = false;
+      let settled = false;
+      this.ws = new WS(wsUrl);
+
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      this.ws.on('open', () => {
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        this.ws?.send(buildDouyuLoginPacket(roomId));
+        this.ws?.send(buildDouyuJoinGroupPacket(roomId));
+        this.startDouyuHeartbeat();
+        this.logger.info('Douyu danmaku socket opened', {
+          id: this.options?.id,
+          roomId,
+          url: wsUrl,
+        });
+        finish();
+      });
+
+      this.ws.on('message', raw => {
+        try {
+          const data = this.normalizeWebSocketData(raw);
+          const packets = decodeDouyuPackets(data);
+          const timestamp = Date.now() - this.recordingStartTime;
+
+          for (const packet of packets) {
+            if (packet.startsWith('type@=loginres/')) {
+              authenticated = true;
+              finish();
+              continue;
+            }
+            const parsed = parseDouyuDanmakuMessage(packet, timestamp, () =>
+              this.nextMessageId()
+            );
+            if (!parsed) {
+              continue;
+            }
+            this.pushDanmakuMessage(parsed);
+          }
+        } catch (error) {
+          const parsedError =
+            error instanceof Error ? error : new Error(String(error));
+          this.logger.error('Failed to decode Douyu danmaku packet', {
+            id: this.options?.id,
+            roomId,
+            error: parsedError.message,
+          });
+          this.emit('error', parsedError);
+          this.options?.onError?.(parsedError);
+        }
+      });
+
+      this.ws.on('error', error => {
+        this.logger.error('Douyu danmaku socket error', {
+          id: this.options?.id,
+          roomId,
+          url: wsUrl,
+          error: error.message,
+        });
+        if (!authenticated) {
+          finish(error);
+          return;
+        }
+        this.emit('error', error);
+        this.options?.onError?.(error);
+      });
+
+      this.ws.on('close', (code, reason) => {
+        this.connected = false;
+        this.stopHeartbeat();
+        const closeReason = reason.toString();
+        this.logger.warn('Douyu danmaku socket closed', {
+          id: this.options?.id,
+          roomId,
+          url: wsUrl,
+          code,
+          reason: closeReason,
+        });
+        this.emit('close');
+        if (!settled) {
+          finish(
+            new Error(
+              `Douyu danmaku socket closed before startup completed (code=${code}, reason=${closeReason})`
+            )
+          );
+          return;
+        }
+        if (!authenticated) {
+          return;
+        }
+        if (this.shouldReconnect) {
+          this.scheduleReconnect();
+        }
+      });
+
+      const startupTimer = setTimeout(() => {
+        if (!this.connected) {
+          finish(new Error('Douyu danmaku connection timeout'));
+        }
+      }, 10000);
+
+      const cleanup = () => {
+        clearTimeout(startupTimer);
+      };
+
+      this.ws.once('open', cleanup);
+      this.ws.once('error', cleanup);
+      this.ws.once('close', cleanup);
+    });
+  }
+
+  private async connectHuya(_url: string): Promise<void> {
+    const roomId = this.options?.roomId?.trim();
+    if (!roomId) {
+      throw new Error('Invalid Huya room id');
+    }
+
+    const presenterUid = await this.resolveHuyaPresenterUid(roomId);
+    const wsUrl = 'wss://cdnws.api.huya.com/';
+
+    return new Promise((resolve, reject) => {
+      let authenticated = false;
+      let settled = false;
+      this.ws = new WS(wsUrl);
+
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      this.ws.on('open', () => {
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        this.ws?.send(buildHuyaRegisterPacket(presenterUid));
+        this.startHuyaHeartbeat();
+        this.logger.info('Huya danmaku socket opened', {
+          id: this.options?.id,
+          roomId,
+          presenterUid,
+          url: wsUrl,
+        });
+        finish();
+      });
+
+      this.ws.on('message', raw => {
+        try {
+          const data = this.normalizeWebSocketData(raw);
+          const commandType = peekHuyaCommandType(data);
+          if (!authenticated && (commandType === 2 || commandType === 7)) {
+            authenticated = true;
+            finish();
+          }
+          const timestamp = Date.now() - this.recordingStartTime;
+          const messages = decodeHuyaDanmakuMessages(
+            data,
+            timestamp,
+            () => this.nextMessageId()
+          );
+
+          for (const message of messages) {
+            this.pushDanmakuMessage(message);
+          }
+        } catch (error) {
+          const parsedError =
+            error instanceof Error ? error : new Error(String(error));
+          this.logger.error('Failed to decode Huya danmaku packet', {
+            id: this.options?.id,
+            roomId,
+            error: parsedError.message,
+          });
+          this.emit('error', parsedError);
+          this.options?.onError?.(parsedError);
+        }
+      });
+
+      this.ws.on('error', error => {
+        this.logger.error('Huya danmaku socket error', {
+          id: this.options?.id,
+          roomId,
+          presenterUid,
+          url: wsUrl,
+          error: error.message,
+        });
+        if (!authenticated) {
+          finish(error);
+          return;
+        }
+        this.emit('error', error);
+        this.options?.onError?.(error);
+      });
+
+      this.ws.on('close', (code, reason) => {
+        this.connected = false;
+        this.stopHeartbeat();
+        const closeReason = reason.toString();
+        this.logger.warn('Huya danmaku socket closed', {
+          id: this.options?.id,
+          roomId,
+          presenterUid,
+          url: wsUrl,
+          code,
+          reason: closeReason,
+        });
+        this.emit('close');
+        if (!settled) {
+          finish(
+            new Error(
+              `Huya danmaku socket closed before startup completed (code=${code}, reason=${closeReason})`
+            )
+          );
+          return;
+        }
+        if (!authenticated) {
+          return;
+        }
+        if (this.shouldReconnect) {
+          this.scheduleReconnect();
+        }
+      });
+
+      const startupTimer = setTimeout(() => {
+        if (!this.connected) {
+          finish(new Error('Huya danmaku connection timeout'));
+        }
+      }, 10000);
+
+      const cleanup = () => {
+        clearTimeout(startupTimer);
+      };
+
+      this.ws.once('open', cleanup);
+      this.ws.once('error', cleanup);
+      this.ws.once('close', cleanup);
+    });
+  }
+
   private async connectBilibili(_url: string): Promise<void> {
     const roomId = Number(this.options?.roomId || 0);
     if (!Number.isFinite(roomId) || roomId <= 0) {
       throw new Error(`Invalid Bilibili room id: ${this.options?.roomId}`);
     }
 
+    await this.prepareBilibiliAuthContext();
     const actualRoomId = await this.resolveBilibiliRoomId(roomId);
     const danmuInfo = await this.fetchBilibiliDanmuInfo(actualRoomId);
     this.bilibiliHosts = this.getOrderedBilibiliHosts(danmuInfo.host_list);
@@ -277,8 +576,16 @@ export class DanmakuService extends EventEmitter {
           id: this.options?.id,
           roomId: actualRoomId,
           host: this.currentBilibiliHost?.host,
+          authUid: this.bilibiliAuthUid,
         });
-        this.ws?.send(buildBilibiliAuthPacket(actualRoomId, danmuInfo.token));
+        this.ws?.send(
+          buildBilibiliAuthPacket(
+            actualRoomId,
+            danmuInfo.token,
+            this.bilibiliAuthUid,
+            this.bilibiliBuvid
+          )
+        );
       });
 
       this.ws.on('message', raw => {
@@ -359,7 +666,7 @@ export class DanmakuService extends EventEmitter {
 
       this.ws.on('close', (code, reason) => {
         this.connected = false;
-        this.stopBilibiliHeartbeat();
+        this.stopHeartbeat();
         const closeReason = reason.toString();
         this.logger.warn('Bilibili danmaku socket closed', {
           id: this.options?.id,
@@ -394,7 +701,7 @@ export class DanmakuService extends EventEmitter {
       this.ws = null;
     }
     this.connected = false;
-    this.stopBilibiliHeartbeat();
+    this.stopHeartbeat();
   }
 
   /**
@@ -407,21 +714,12 @@ export class DanmakuService extends EventEmitter {
   /**
    * 处理接收到的消息
    */
-  private handleMessage(data: Buffer): void {
+  private handleLegacyMessage(data: Buffer): void {
     try {
-      // 这里需要根据实际平台的弹幕协议来解析
-      // 简化实现：假设直接是 JSON
       const message = JSON.parse(data.toString()) as DanmakuMessage;
-
-      // 统一使用相对整场录制的时间轴，便于跨分片检索和索引聚合。
       message.timestamp = Date.now() - this.recordingStartTime;
-
-      this.messageBuffer.push(message);
-
-      // 触发消息事件
-      this.emit('message', message);
+      this.pushDanmakuMessage(message);
     } catch (error) {
-      // 非JSON消息，忽略
       this.logger.debug('Failed to parse danmaku message', {
         data: data.toString(),
       });
@@ -434,17 +732,21 @@ export class DanmakuService extends EventEmitter {
       const parsed = parseBilibiliDanmakuCommand(
         message,
         Date.now() - this.recordingStartTime,
-        () => this.nextBilibiliMessageId()
+        () => this.nextMessageId()
       );
       if (!parsed) {
         continue;
       }
-      if (parsed.color === undefined && parsed.contentColor !== undefined) {
-        parsed.color = parsed.contentColor as DanmakuColor;
-      }
-      this.messageBuffer.push(parsed);
-      this.emit('message', parsed);
+      this.pushDanmakuMessage(parsed);
     }
+  }
+
+  private pushDanmakuMessage(message: DanmakuMessage): void {
+    if (message.color === undefined && message.contentColor !== undefined) {
+      message.color = message.contentColor as DanmakuColor;
+    }
+    this.messageBuffer.push(message);
+    this.emit('message', message);
   }
 
   /**
@@ -543,6 +845,54 @@ export class DanmakuService extends EventEmitter {
       this.options?.platform === 'bilibili' ||
       /broadcastlv\.chat\.bilibili\.com|chat\.bilibili\.com/i.test(url)
     );
+  }
+
+  private isDouyuDanmaku(url: string): boolean {
+    return (
+      this.options?.platform === 'douyu' ||
+      /danmuproxy\.douyu\.com/i.test(url)
+    );
+  }
+
+  private isHuyaDanmaku(url: string): boolean {
+    return (
+      this.options?.platform === 'huya' || /cdnws\.api\.huya\.com/i.test(url)
+    );
+  }
+
+  private resolveDouyuSocketUrl(url: string): string {
+    if (url && /^wss?:\/\//i.test(url)) {
+      const parsed = new URL(url);
+      if (/danmuproxy\.douyu\.com/i.test(parsed.hostname)) {
+        return getDouyuDanmakuUrl();
+      }
+      return url;
+    }
+
+    return getDouyuDanmakuUrl();
+  }
+
+  private async resolveHuyaPresenterUid(roomId: string): Promise<number> {
+    const response = await fetch(`https://www.huya.com/${roomId}`, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch Huya room page: HTTP ${response.status} ${response.statusText}`
+      );
+    }
+
+    const html = await response.text();
+    const presenterUid = extractHuyaUidFromRoomPage(html);
+    if (!presenterUid) {
+      throw new Error(`Failed to extract Huya presenter uid for room ${roomId}`);
+    }
+
+    return presenterUid;
   }
 
   private async resolveBilibiliRoomId(roomId: number): Promise<number> {
@@ -645,20 +995,80 @@ export class DanmakuService extends EventEmitter {
   }
 
   private buildBilibiliHttpHeaders(roomId: number): Record<string, string> {
-    return {
+    return this.withOptionalBilibiliCookie({
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       Referer: `https://live.bilibili.com/${roomId}`,
       Origin: 'https://live.bilibili.com',
-    };
+    });
   }
 
   private buildBilibiliWsHeaders(roomId: number): Record<string, string> {
-    return {
+    return this.withOptionalBilibiliCookie({
       ...this.buildBilibiliHttpHeaders(roomId),
       Pragma: 'no-cache',
       'Cache-Control': 'no-cache',
+    });
+  }
+
+  private async prepareBilibiliAuthContext(): Promise<void> {
+    this.bilibiliBuvid = this.bilibiliBuvid || this.generateFakeBuvid3();
+
+    try {
+      const credential = await this.bilibiliCredentialRepository.findValid();
+      const cookies = credential?.cookies;
+      this.bilibiliAuthUid = Number(credential?.mid || cookies?.Dedeuserid || 0);
+      this.bilibiliCookieHeader = this.buildBilibiliCookieHeader(
+        cookies || {},
+        this.bilibiliBuvid
+      );
+    } catch (error) {
+      this.logger.warn('Failed to load Bilibili credential for danmaku', {
+        id: this.options?.id,
+        roomId: this.options?.roomId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.bilibiliAuthUid = 0;
+      this.bilibiliCookieHeader = this.buildBilibiliCookieHeader(
+        {},
+        this.bilibiliBuvid
+      );
+    }
+  }
+
+  private withOptionalBilibiliCookie(
+    headers: Record<string, string>
+  ): Record<string, string> {
+    if (!this.bilibiliCookieHeader) {
+      return headers;
+    }
+
+    return {
+      ...headers,
+      Cookie: this.bilibiliCookieHeader,
     };
+  }
+
+  private buildBilibiliCookieHeader(
+    cookies: Partial<Record<'SESSDATA' | 'bili_jct' | 'Dedeuserid', string>>,
+    buvid: string
+  ): string {
+    const mergedCookies = [
+      ['buvid3', buvid],
+      ['SESSDATA', cookies.SESSDATA],
+      ['bili_jct', cookies.bili_jct],
+      ['Dedeuserid', cookies.Dedeuserid],
+    ].filter(([, value]) => typeof value === 'string' && value.length > 0);
+
+    return mergedCookies.map(([key, value]) => `${key}=${value}`).join('; ');
+  }
+
+  private generateFakeBuvid3(): string {
+    const raw = randomUUID().replace(/-/g, '').toUpperCase();
+    return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(
+      12,
+      16
+    )}-${raw.slice(16, 20)}-${raw.slice(20)}infoc`;
   }
 
   private getOrderedBilibiliHosts(hosts: BilibiliDanmuHost[]): BilibiliDanmuHost[] {
@@ -690,7 +1100,7 @@ export class DanmakuService extends EventEmitter {
   }
 
   private startBilibiliHeartbeat(): void {
-    this.stopBilibiliHeartbeat();
+    this.stopHeartbeat();
     if (!this.ws) {
       return;
     }
@@ -702,7 +1112,33 @@ export class DanmakuService extends EventEmitter {
     }, 30000);
   }
 
-  private stopBilibiliHeartbeat(): void {
+  private startDouyuHeartbeat(): void {
+    this.stopHeartbeat();
+    if (!this.ws) {
+      return;
+    }
+    this.ws.send(buildDouyuHeartbeatPacket());
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.connected) {
+        this.ws.send(buildDouyuHeartbeatPacket());
+      }
+    }, 30000);
+  }
+
+  private startHuyaHeartbeat(): void {
+    this.stopHeartbeat();
+    if (!this.ws) {
+      return;
+    }
+    this.ws.send(getHuyaHeartbeatPacket());
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.connected) {
+        this.ws.send(getHuyaHeartbeatPacket());
+      }
+    }, 60000);
+  }
+
+  private stopHeartbeat(): void {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -768,7 +1204,20 @@ export class DanmakuService extends EventEmitter {
     return (await response.json()) as T;
   }
 
-  private nextBilibiliMessageId(): string {
+  private normalizeWebSocketData(raw: WebSocket.RawData): Buffer {
+    if (Buffer.isBuffer(raw)) {
+      return raw;
+    }
+    if (Array.isArray(raw)) {
+      return Buffer.concat(raw);
+    }
+    if (typeof raw === 'string') {
+      return Buffer.from(raw);
+    }
+    return Buffer.from(raw as ArrayBuffer);
+  }
+
+  private nextMessageId(): string {
     this.bilibiliMessageCounter += 1;
     return `${this.options?.id || 'danmaku'}-${this.bilibiliMessageCounter}`;
   }
