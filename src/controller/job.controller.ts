@@ -11,7 +11,7 @@ import {
 } from '@midwayjs/core';
 import { Application, Context } from '@midwayjs/koa';
 import * as path from 'path';
-import { JOB_STATUS, JobStatus, Platform } from '../interface';
+import { JOB_STATUS, JobStatus, Platform, StorageError } from '../interface';
 import { JobService } from '../service/job.service';
 import { PlatformService } from '../service/platform.service';
 import { RecorderManager } from '../service/recorder.manager';
@@ -215,6 +215,53 @@ export class JobController {
   }
 
   /**
+   * GET /api/jobs/:id/cover - 代理任务封面
+   */
+  @Get('/:id/cover')
+  async getJobCover(@Param('id') id: string) {
+    try {
+      const job = await this.jobService.findById(id);
+
+      if (!job || !job.coverPath) {
+        this.ctx.status = 404;
+        return { error: 'Job cover not found' };
+      }
+
+      const object = await this.storageService.getObjectStream(job.coverPath);
+
+      this.ctx.status = 200;
+      this.ctx.set('Content-Type', object.contentType || 'application/octet-stream');
+      if (object.contentLength !== undefined) {
+        this.ctx.set('Content-Length', String(object.contentLength));
+      }
+      if (object.etag) {
+        this.ctx.set('ETag', object.etag);
+      }
+      if (object.lastModified) {
+        this.ctx.set('Last-Modified', object.lastModified.toUTCString());
+      }
+      this.ctx.set('Cache-Control', 'private, max-age=3600');
+      this.ctx.body = object.body;
+      return;
+    } catch (error) {
+      this.ctx.logger.error('Failed to get job cover', {
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (error instanceof StorageError) {
+        const isNotFound =
+          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(error.message);
+        this.ctx.status = isNotFound ? 404 : 502;
+        return { error: error.message };
+      }
+
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
+    }
+  }
+
+  /**
    * GET /api/jobs/:id/videos - 获取任务的视频列表
    */
   @Get('/:id/videos')
@@ -227,16 +274,11 @@ export class JobController {
         return { error: 'Job not found' };
       }
 
-      // 为每个视频生成预签名 URL（有效期 12 小时）
-      const videosWithUrls = await Promise.all(
-        result.videos.map(async (video: any) => ({
-          ...video,
-          playUrl: await this.storageService.getSignedUrl(
-            video.s3Key,
-            12 * 3600
-          ),
-        }))
-      );
+      // 使用相对路径，避免浏览器直接访问 MinIO 的 localhost/publicEndpoint
+      const videosWithUrls = result.videos.map((video: any) => ({
+        ...video,
+        playUrl: video.url,
+      }));
 
       return {
         ...result,
@@ -246,6 +288,77 @@ export class JobController {
       this.ctx.logger.error('Failed to get job videos', {
         error: error instanceof Error ? error.message : String(error),
       });
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
+    }
+  }
+
+  /**
+   * GET /api/jobs/:id/videos/:index/stream - 代理单个视频分片
+   */
+  @Get('/:id/videos/:index/stream')
+  async streamJobVideo(
+    @Param('id') id: string,
+    @Param('index') index: string
+  ) {
+    try {
+      const result = await this.jobService.getJobVideos(id);
+      if (!result) {
+        this.ctx.status = 404;
+        return { error: 'Job not found' };
+      }
+
+      const segmentIndex = Number(index);
+      if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+        this.ctx.status = 400;
+        return { error: 'Invalid segment index' };
+      }
+
+      const video = result.videos.find((item: any) => item.index === segmentIndex);
+      if (!video) {
+        this.ctx.status = 404;
+        return { error: 'Video segment not found' };
+      }
+
+      const range = this.ctx.get('range') || undefined;
+      const object = await this.storageService.getObjectStream(video.s3Key, range);
+
+      this.ctx.status = object.contentRange ? 206 : 200;
+      if (object.contentType) {
+        this.ctx.set('Content-Type', object.contentType);
+      } else {
+        this.ctx.set('Content-Type', 'video/x-matroska');
+      }
+      if (object.contentLength !== undefined) {
+        this.ctx.set('Content-Length', String(object.contentLength));
+      }
+      if (object.contentRange) {
+        this.ctx.set('Content-Range', object.contentRange);
+      }
+      this.ctx.set('Accept-Ranges', object.acceptRanges || 'bytes');
+      if (object.etag) {
+        this.ctx.set('ETag', object.etag);
+      }
+      if (object.lastModified) {
+        this.ctx.set('Last-Modified', object.lastModified.toUTCString());
+      }
+      this.ctx.body = object.body;
+      return;
+    } catch (error) {
+      this.ctx.logger.error('Failed to stream job video', {
+        id,
+        index,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (error instanceof StorageError) {
+        const message = error.message;
+        const isNotFound =
+          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(message);
+        this.ctx.status = isNotFound ? 404 : 502;
+        return { error: error.message };
+      }
+
       this.ctx.status = 500;
       return { error: 'Internal server error' };
     }
@@ -269,7 +382,12 @@ export class JobController {
 
       const result = await this.videoMergeService.mergeJobVideos(id, segments);
 
-      return result;
+      return {
+        ...result,
+        downloadUrl: `/api/jobs/${id}/videos/merged/download?filename=${encodeURIComponent(
+          result.filename
+        )}`,
+      };
     } catch (error) {
       this.ctx.logger.error('Failed to merge videos', {
         error: error instanceof Error ? error.message : String(error),
@@ -278,6 +396,65 @@ export class JobController {
       return {
         error: error instanceof Error ? error.message : 'Internal server error',
       };
+    }
+  }
+
+  /**
+   * GET /api/jobs/:id/videos/merged/download - 代理合并后视频下载
+   */
+  @Get('/:id/videos/merged/download')
+  async downloadMergedVideo(
+    @Param('id') id: string,
+    @Query('filename') filename?: string
+  ) {
+    try {
+      const safeFilename = filename?.trim();
+      if (
+        !safeFilename ||
+        safeFilename.includes('/') ||
+        safeFilename.includes('\\')
+      ) {
+        this.ctx.status = 400;
+        return { error: 'Invalid filename' };
+      }
+
+      const s3Key = `merged/${id}/${safeFilename}`;
+      const range = this.ctx.get('range') || undefined;
+      const object = await this.storageService.getObjectStream(s3Key, range);
+
+      this.ctx.status = object.contentRange ? 206 : 200;
+      this.ctx.set('Content-Type', object.contentType || 'video/x-matroska');
+      if (object.contentLength !== undefined) {
+        this.ctx.set('Content-Length', String(object.contentLength));
+      }
+      if (object.contentRange) {
+        this.ctx.set('Content-Range', object.contentRange);
+      }
+      this.ctx.set('Accept-Ranges', object.acceptRanges || 'bytes');
+      if (object.etag) {
+        this.ctx.set('ETag', object.etag);
+      }
+      if (object.lastModified) {
+        this.ctx.set('Last-Modified', object.lastModified.toUTCString());
+      }
+      this.ctx.body = object.body;
+      return;
+    } catch (error) {
+      this.ctx.logger.error('Failed to download merged video', {
+        id,
+        filename,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (error instanceof StorageError) {
+        const isNotFound =
+          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(error.message);
+        this.ctx.status = isNotFound ? 404 : 502;
+        return { error: error.message };
+      }
+
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
     }
   }
 

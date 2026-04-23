@@ -360,6 +360,6 @@ export interface ExportRequest {
  * 导出响应
  */
 export interface ExportResponse {
-  downloadUrl: string; // 预签名下载 URL
+  downloadUrl: string; // 浏览器可直接访问的下载地址
   expiresAt: number; // 过期时间
 }

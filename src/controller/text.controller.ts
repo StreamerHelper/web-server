@@ -9,6 +9,7 @@ import {
   Query,
 } from '@midwayjs/core';
 import { Context } from '@midwayjs/koa';
+import { StorageError } from '../interface';
 import {
   DanmakuMessage,
   DanmakuSegmentInfo,
@@ -286,6 +287,63 @@ export class TextController {
   }
 
   /**
+   * GET /api/text/export/download - 下载已生成的文本导出文件
+   */
+  @Get('/export/download')
+  async downloadExport(
+    @Query('jobId') jobId: string,
+    @Query('type') type: ExportRequest['type'],
+    @Query('format') format: ExportRequest['format']
+  ) {
+    try {
+      const job = await this.findJobByIdentifier(jobId);
+      if (!job) {
+        this.ctx.status = 404;
+        return { error: `Job ${jobId} not found` };
+      }
+
+      const exportKey = this.getExportKey(job.id, type, format);
+      if (!exportKey) {
+        this.ctx.status = 400;
+        return { error: `Export format ${format} for type ${type} is not supported yet` };
+      }
+
+      const object = await this.storageService.getObjectStream(exportKey);
+
+      this.ctx.status = 200;
+      this.ctx.set('Content-Type', object.contentType || 'application/octet-stream');
+      if (object.contentLength !== undefined) {
+        this.ctx.set('Content-Length', String(object.contentLength));
+      }
+      if (object.etag) {
+        this.ctx.set('ETag', object.etag);
+      }
+      if (object.lastModified) {
+        this.ctx.set('Last-Modified', object.lastModified.toUTCString());
+      }
+      this.ctx.body = object.body;
+      return;
+    } catch (error) {
+      this.logger.error('Failed to download text export', {
+        jobId,
+        type,
+        format,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (error instanceof StorageError) {
+        const isNotFound =
+          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(error.message);
+        this.ctx.status = isNotFound ? 404 : 502;
+        return { error: error.message };
+      }
+
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
+    }
+  }
+
+  /**
    * 导出弹幕为 ASS 格式
    */
   private async exportDanmaku(
@@ -302,14 +360,18 @@ export class TextController {
     allMessages.sort((left, right) => left.timestamp - right.timestamp);
 
     let exportContent = '';
-    let exportKey = '';
     let contentType = 'text/plain';
+
+    const exportKey = this.getExportKey(job.id, 'danmaku', format);
+    if (!exportKey) {
+      this.ctx.status = 400;
+      throw new Error(`Danmaku export format ${format} is not supported yet`);
+    }
 
     if (format === 'ass') {
       exportContent = this.danmakuAssService.messagesToAss(allMessages, {
         removeEmoji: true,
       });
-      exportKey = `danmaku/${job.id}/export.ass`;
       contentType = 'text/plain';
     } else if (format === 'xml') {
       exportContent = this.danmakuXmlService.messagesToXml(allMessages, {
@@ -321,20 +383,14 @@ export class TextController {
             job.startTime?.toISOString?.() || job.createdAt?.toISOString?.(),
         },
       });
-      exportKey = `danmaku/${job.id}/export.xml`;
       contentType = 'application/xml';
     } else if (format === 'json') {
       exportContent = `${JSON.stringify(allMessages, null, 2)}\n`;
-      exportKey = `danmaku/${job.id}/export.json`;
       contentType = 'application/json';
     } else if (format === 'jsonl') {
       exportContent =
         allMessages.map(message => JSON.stringify(message)).join('\n') + '\n';
-      exportKey = `danmaku/${job.id}/export.jsonl`;
       contentType = 'application/x-ndjson';
-    } else {
-      this.ctx.status = 400;
-      throw new Error(`Danmaku export format ${format} is not supported yet`);
     }
 
     await this.storageService.upload(
@@ -343,8 +399,9 @@ export class TextController {
       contentType
     );
 
-    // 生成预签名下载 URL
-    const downloadUrl = await this.storageService.getSignedUrl(exportKey, 3600);
+    const downloadUrl = `/api/text/export/download?jobId=${encodeURIComponent(
+      job.jobId || job.id
+    )}&type=danmaku&format=${encodeURIComponent(format)}`;
 
     this.logger.info('Danmaku exported', {
       jobId: job.jobId,
@@ -357,6 +414,18 @@ export class TextController {
       downloadUrl,
       expiresAt: Date.now() + 3600 * 1000,
     };
+  }
+
+  private getExportKey(
+    jobId: string,
+    type: ExportRequest['type'],
+    format: ExportRequest['format']
+  ): string | null {
+    if (type === 'danmaku' && ['ass', 'xml', 'json', 'jsonl'].includes(format)) {
+      return `danmaku/${jobId}/export.${format}`;
+    }
+
+    return null;
   }
 
   /**

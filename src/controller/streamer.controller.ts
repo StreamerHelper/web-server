@@ -10,8 +10,9 @@ import {
   Query,
 } from '@midwayjs/core';
 import { Application, Context } from '@midwayjs/koa';
-import { Platform, StreamerInfo } from '../interface';
+import { Platform, StorageError, StreamerInfo } from '../interface';
 import { PlatformService } from '../service/platform.service';
+import { StorageService } from '../service/storage.service';
 import {
   InvalidStreamerCoverError,
   StreamerService,
@@ -30,6 +31,9 @@ export class StreamerController {
 
   @Inject()
   platformService: PlatformService;
+
+  @Inject()
+  storageService: StorageService;
 
   private async serializeStreamer(streamer: any) {
     return this.streamerService.buildStreamerInfo(streamer);
@@ -97,6 +101,53 @@ export class StreamerController {
       this.ctx.logger.error('Failed to get streamer', {
         error: error instanceof Error ? error.message : String(error),
       });
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
+    }
+  }
+
+  /**
+   * GET /api/streamers/:id/cover - 代理主播封面
+   */
+  @Get('/:id/cover')
+  async getStreamerCover(@Param('id') id: string) {
+    try {
+      const streamer = await this.streamerService.findById(id);
+
+      if (!streamer || !streamer.coverPath) {
+        this.ctx.status = 404;
+        return { error: 'Streamer cover not found' };
+      }
+
+      const object = await this.storageService.getObjectStream(streamer.coverPath);
+
+      this.ctx.status = 200;
+      this.ctx.set('Content-Type', object.contentType || 'application/octet-stream');
+      if (object.contentLength !== undefined) {
+        this.ctx.set('Content-Length', String(object.contentLength));
+      }
+      if (object.etag) {
+        this.ctx.set('ETag', object.etag);
+      }
+      if (object.lastModified) {
+        this.ctx.set('Last-Modified', object.lastModified.toUTCString());
+      }
+      this.ctx.set('Cache-Control', 'private, max-age=3600');
+      this.ctx.body = object.body;
+      return;
+    } catch (error) {
+      this.ctx.logger.error('Failed to get streamer cover', {
+        id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (error instanceof StorageError) {
+        const isNotFound =
+          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(error.message);
+        this.ctx.status = isNotFound ? 404 : 502;
+        return { error: error.message };
+      }
+
       this.ctx.status = 500;
       return { error: 'Internal server error' };
     }

@@ -36,7 +36,7 @@ export class VideoMergeService {
     jobId: string,
     segmentIndexes: number[]
   ): Promise<{
-    downloadUrl: string;
+    s3Key: string;
     filename: string;
     duration: number;
     size: number;
@@ -106,14 +106,8 @@ export class VideoMergeService {
         'video/x-matroska'
       );
 
-      // 4. 生成预签名 URL（12 小时有效）
-      const downloadUrl = await this.storageService.getSignedUrl(
-        mergedS3Key,
-        12 * 3600
-      );
-
       return {
-        downloadUrl,
+        s3Key: mergedS3Key,
         filename: mergedFilename,
         duration,
         size: fileSize,

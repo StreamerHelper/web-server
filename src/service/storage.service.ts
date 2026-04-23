@@ -178,6 +178,60 @@ export class StorageService {
   }
 
   /**
+   * 获取对象流，用于代理给浏览器下载/播放
+   */
+  async getObjectStream(
+    key: string,
+    range?: string
+  ): Promise<{
+    body: Readable;
+    contentType?: string;
+    contentLength?: number;
+    contentRange?: string;
+    acceptRanges?: string;
+    etag?: string;
+    lastModified?: Date;
+  }> {
+    try {
+      const command = new GetObjectCommand({
+        Bucket: this.s3Config.bucket,
+        Key: key,
+        ...(range ? { Range: range } : {}),
+      });
+      const response = await this.client.send(command);
+
+      if (!response.Body) {
+        throw new StorageError(
+          `Empty response body for ${key}`,
+          'getObjectStream',
+          false
+        );
+      }
+
+      return {
+        body: response.Body as Readable,
+        contentType: response.ContentType,
+        contentLength: response.ContentLength,
+        contentRange: response.ContentRange,
+        acceptRanges: response.AcceptRanges,
+        etag: response.ETag,
+        lastModified: response.LastModified,
+      };
+    } catch (error) {
+      if (error instanceof StorageError) {
+        throw error;
+      }
+
+      const errorMsg = getS3ErrorMessage(error);
+      throw new StorageError(
+        `Failed to stream ${key}: ${errorMsg}`,
+        'getObjectStream',
+        true
+      );
+    }
+  }
+
+  /**
    * 获取下载 URL（使用 publicClient 生成浏览器可访问的 URL）
    */
   async getSignedUrl(key: string, expiresIn = 3600): Promise<string> {

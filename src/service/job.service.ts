@@ -503,7 +503,7 @@ export class JobService {
         segmentCount: job.segmentCount,
         startTime: job.startTime,
         endTime: job.endTime,
-        coverUrl: await this.getSafeCoverUrl(job.coverPath),
+        coverUrl: await this.getSafeCoverUrl(job.id, job.coverPath),
       });
     }
 
@@ -524,21 +524,14 @@ export class JobService {
   }
 
   private async getSafeCoverUrl(
+    jobId: string,
     coverPath?: string | null
   ): Promise<string | null> {
-    if (!coverPath) {
+    if (!jobId || !coverPath) {
       return null;
     }
 
-    try {
-      return await this.storageService.getSignedUrl(coverPath, 86400);
-    } catch (error) {
-      this.logger.warn('Failed to get job cover signed URL', {
-        coverPath,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
-    }
+    return `/api/jobs/${jobId}/cover`;
   }
 
   /**

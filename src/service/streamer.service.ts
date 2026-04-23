@@ -133,7 +133,7 @@ export class StreamerService {
     const info = streamer.toInfo();
     return {
       ...info,
-      coverUrl: await this.getCoverUrl(streamer.coverPath),
+      coverUrl: await this.getCoverUrl(streamer.id, streamer.coverPath),
     };
   }
 
@@ -162,20 +162,15 @@ export class StreamerService {
     }
   }
 
-  async getCoverUrl(coverPath?: string | null): Promise<string | null> {
-    if (!coverPath) {
+  async getCoverUrl(
+    streamerId: string,
+    coverPath?: string | null
+  ): Promise<string | null> {
+    if (!streamerId || !coverPath) {
       return null;
     }
 
-    try {
-      return await this.storageService.getSignedUrl(coverPath, 86400);
-    } catch (error) {
-      this.logger.warn('Failed to get streamer cover signed URL', {
-        coverPath,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
-    }
+    return `/api/streamers/${streamerId}/cover`;
   }
 
   /**
