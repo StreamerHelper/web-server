@@ -1,10 +1,18 @@
-import { ILogger, Inject, Logger, Provide, Scope, ScopeEnum } from '@midwayjs/core';
+import {
+  ILogger,
+  Inject,
+  Logger,
+  Provide,
+  Scope,
+  ScopeEnum,
+} from '@midwayjs/core';
 import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { In, LessThan, Repository } from 'typeorm';
 import { Job, Streamer } from '../entity';
 import { Highlight, JOB_STATUS, JobStatus } from '../interface';
 import { StorageService } from './storage.service';
+import { SubmissionTemplateService } from './submission-template.service';
 import dayjs = require('dayjs');
 
 @Provide()
@@ -26,6 +34,9 @@ export class JobService {
 
   @Inject()
   storageService: StorageService;
+
+  @Inject()
+  submissionTemplateService: SubmissionTemplateService;
 
   @Logger()
   private logger: ILogger;
@@ -463,16 +474,14 @@ export class JobService {
     queryBuilder.orderBy('job.startTime', 'DESC');
 
     const jobs = await queryBuilder.getMany();
+    const streamerById = await this.findStreamerMapForJobs(jobs);
 
     // 按日期分组
     const groups: Record<string, any[]> = {};
 
     for (const job of jobs) {
       // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于等于该值的任务
-      if (
-        minSegmentCount !== undefined &&
-        job.segmentCount < minSegmentCount
-      ) {
+      if (minSegmentCount !== undefined && job.segmentCount < minSegmentCount) {
         continue;
       }
 
@@ -484,12 +493,8 @@ export class JobService {
         groups[dateKey] = [];
       }
 
-      // 构建展示数据
-      const displayTitle = job.startTime
-        ? `${dayjs(job.startTime).format('YYYY年M月D日 HH:mm')} ${
-            job.streamerName
-          } 直播回放`
-        : `${job.streamerName} 直播回放`;
+      const streamer = streamerById.get(job.streamerId);
+      const displayTitle = this.resolveSubmissionTitle(job, streamer);
 
       groups[dateKey].push({
         id: job.id,
@@ -521,6 +526,35 @@ export class JobService {
       .getRawMany();
 
     return result.map(r => r.streamerName);
+  }
+
+  private async findStreamerMapForJobs(
+    jobs: Job[]
+  ): Promise<Map<string, Streamer>> {
+    const streamerIds = Array.from(
+      new Set(jobs.map(job => job.streamerId).filter(Boolean))
+    );
+
+    if (streamerIds.length === 0) {
+      return new Map();
+    }
+
+    const streamers = await this.streamerModel.find({
+      where: { streamerId: In(streamerIds) },
+    });
+
+    return new Map(streamers.map(streamer => [streamer.streamerId, streamer]));
+  }
+
+  private resolveSubmissionTitle(job: Job, streamer?: Streamer): string {
+    return this.submissionTemplateService.resolveTitle(
+      streamer?.uploadSettings?.title,
+      {
+        streamerName: job.streamerName || streamer?.name,
+        roomName: job.roomName,
+        startedAt: job.startTime || job.createdAt,
+      }
+    );
   }
 
   private async getSafeCoverUrl(

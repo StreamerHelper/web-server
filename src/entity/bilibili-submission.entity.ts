@@ -35,12 +35,22 @@ export enum PartStatus {
 export interface SubmissionPart {
   /** 分P序号（从1开始） */
   index: number;
+  /** 分P标题，固定使用日期+时间 */
+  title?: string;
   /** 组成这个分P的原始分片S3 key */
   s3Keys: string[];
   /** 分P状态 */
   status: PartStatus;
+  /** 分段投稿间隔，存在时表示该分P来自投稿节奏 */
+  rhythmIntervalMinutes?: number;
+  /** 分P起始时间 */
+  startedAt?: string;
+  /** 分P结束时间 */
+  endedAt?: string;
   /** B站上传后的文件名 */
   filename?: string;
+  /** B站上传后的分 P cid */
+  cid?: number;
   /** 视频时长（毫秒） */
   duration?: number;
   /** 文件大小 */
@@ -74,6 +84,9 @@ export class BilibiliSubmissionEntity {
 
   @Column({ name: 'tid', default: 171 })
   tid: number;
+
+  @Column({ name: 'human_type2', default: 2066 })
+  humanType2: number;
 
   @Column({ name: 'cover', nullable: true })
   cover: string;
@@ -116,6 +129,29 @@ export class BilibiliSubmissionEntity {
 
   @Column({ name: 'avid', type: 'bigint', nullable: true })
   avid: number;
+
+  // === B站合集信息 ===
+
+  @Column({ name: 'collection_auto_add', default: false })
+  collectionAutoAdd: boolean;
+
+  @Column({ name: 'collection_season_id', type: 'bigint', nullable: true })
+  collectionSeasonId: number;
+
+  @Column({ name: 'collection_section_id', type: 'bigint', nullable: true })
+  collectionSectionId: number;
+
+  @Column({ name: 'collection_season_title', nullable: true, length: 255 })
+  collectionSeasonTitle: string;
+
+  @Column({ name: 'collection_section_title', nullable: true, length: 255 })
+  collectionSectionTitle: string;
+
+  @Column({ name: 'collection_episode_id', type: 'bigint', nullable: true })
+  collectionEpisodeId: number;
+
+  @Column({ name: 'collection_added_at', type: 'timestamptz', nullable: true })
+  collectionAddedAt: Date;
 
   // === 错误信息 ===
 

@@ -4,6 +4,7 @@ import * as fs from 'fs/promises';
 import { UploadJobData } from '../interface';
 import { StorageService } from '../service/storage.service';
 import { JobService } from '../service/job.service';
+import { BilibiliSubmissionRhythmService } from '../service/bilibili-submission-rhythm.service';
 
 @Processor('upload')
 export class UploadProcessor implements IProcessor {
@@ -12,6 +13,9 @@ export class UploadProcessor implements IProcessor {
 
   @Inject()
   jobService: JobService;
+
+  @Inject()
+  rhythmService: BilibiliSubmissionRhythmService;
 
   @Inject()
   bullFramework: Framework;
@@ -43,6 +47,18 @@ export class UploadProcessor implements IProcessor {
 
       // 更新 metadata：记录已上传的分片
       await this.jobService.addUploadedSegment(id, s3Key);
+
+      if (s3Key.includes('/video/')) {
+        await this.rhythmService
+          .handleUploadedVideoSegment(id)
+          .catch(error => {
+            this.logger.error('Failed to schedule segmented submission', {
+              id,
+              s3Key,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      }
 
       this.logger.info('Upload completed', {
         id,

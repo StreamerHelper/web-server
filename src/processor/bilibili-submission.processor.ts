@@ -1,6 +1,7 @@
 import { IProcessor, Processor } from '@midwayjs/bullmq';
 import { ILogger, Inject, Logger } from '@midwayjs/core';
 import { BilibiliSubmissionService } from '../service/bilibili-submission.service';
+import { BilibiliSubmissionRhythmService } from '../service/bilibili-submission-rhythm.service';
 
 /**
  * 投稿任务数据
@@ -27,6 +28,9 @@ export class BilibiliSubmissionProcessor implements IProcessor {
   @Inject()
   private submissionService: BilibiliSubmissionService;
 
+  @Inject()
+  private rhythmService: BilibiliSubmissionRhythmService;
+
   @Logger()
   private logger: ILogger;
 
@@ -37,6 +41,12 @@ export class BilibiliSubmissionProcessor implements IProcessor {
 
     try {
       await this.submissionService.processSubmission(submissionId);
+      await this.rhythmService.queueNextForSubmission(submissionId).catch(error => {
+        this.logger.error('Failed to schedule next segmented submission', {
+          submissionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
 
       this.logger.info('Bilibili submission job completed', { submissionId });
 

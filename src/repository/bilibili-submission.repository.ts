@@ -95,6 +95,24 @@ export class BilibiliSubmissionRepository {
   }
 
   /**
+   * 替换完整分P列表
+   */
+  async updateParts(id: string, parts: SubmissionPart[]): Promise<void> {
+    const completedParts = parts.filter(
+      p => p.status === PartStatus.COMPLETED
+    ).length;
+
+    await this.repo.update(
+      { id },
+      {
+        parts,
+        totalParts: parts.length,
+        completedParts,
+      }
+    );
+  }
+
+  /**
    * 更新投稿结果（成功后）
    */
   async updateSubmissionResult(
@@ -102,12 +120,43 @@ export class BilibiliSubmissionRepository {
     bvid: string,
     avid: number
   ): Promise<void> {
+    await this.updateUploadedResult(id, bvid, avid);
+    await this.completeSubmission(id);
+  }
+
+  async updateUploadedResult(
+    id: string,
+    bvid: string,
+    avid: number
+  ): Promise<void> {
+    await this.repo.update(
+      { id },
+      {
+        bvid,
+        avid,
+      }
+    );
+  }
+
+  async completeSubmission(id: string): Promise<void> {
     await this.repo.update(
       { id },
       {
         status: SubmissionStatus.COMPLETED,
-        bvid,
-        avid,
+        lastError: null,
+      }
+    );
+  }
+
+  async updateCollectionResult(
+    id: string,
+    episodeId?: number | null
+  ): Promise<void> {
+    await this.repo.update(
+      { id },
+      {
+        collectionEpisodeId: episodeId ?? null,
+        collectionAddedAt: new Date(),
       }
     );
   }

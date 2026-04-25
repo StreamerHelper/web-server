@@ -10,7 +10,7 @@ describe('BilibiliController uploadVideo title resolution', () => {
     const service = new SubmissionTemplateService() as any;
     service.submissionConfig = {
       defaultTid: 171,
-      defaultTitleTemplate: '{streamerName}的直播录像 {date}',
+      defaultTitleTemplate: '{主播名}的直播录像 {日期}',
     };
     service.logger = {
       warn: jest.fn(),
@@ -27,6 +27,11 @@ describe('BilibiliController uploadVideo title resolution', () => {
       status: 200,
     };
     controller.submissionTemplateService = createTemplateService();
+    controller.bilibiliPartitionService = {
+      resolveHumanType2: jest
+        .fn()
+        .mockImplementation(value => value || 2066),
+    };
     controller.streamerService = {
       findById: jest.fn().mockResolvedValue(null),
       findByStreamerId: jest.fn().mockResolvedValue({
@@ -35,10 +40,10 @@ describe('BilibiliController uploadVideo title resolution', () => {
         roomId: '12345',
         coverPath: 'streamers/streamer-1/cover/default.jpg',
         uploadSettings: {
-          title: '{streamerName}默认标题 {date}',
+          title: '{主播名}默认标题 {日期}',
           description: '默认简介',
           tags: ['默认标签'],
-          tid: 171,
+          humanType2: 2066,
         },
       }),
     };
@@ -68,6 +73,7 @@ describe('BilibiliController uploadVideo title resolution', () => {
         title: '手动标题',
         description: '默认简介',
         tags: ['默认标签'],
+        humanType2: 2066,
         tid: 171,
         cover: 'streamers/streamer-1/cover/default.jpg',
         copyright: 2,
@@ -86,6 +92,11 @@ describe('BilibiliController uploadVideo title resolution', () => {
       status: 200,
     };
     controller.submissionTemplateService = createTemplateService();
+    controller.bilibiliPartitionService = {
+      resolveHumanType2: jest
+        .fn()
+        .mockImplementation(value => value || 2066),
+    };
     controller.streamerService = {
       findById: jest.fn().mockResolvedValue({
         name: '当前主播名',
@@ -95,7 +106,7 @@ describe('BilibiliController uploadVideo title resolution', () => {
         uploadSettings: {
           description: '默认简介',
           tags: ['默认标签'],
-          tid: 171,
+          humanType2: 2066,
         },
       }),
       findByStreamerId: jest.fn().mockResolvedValue(null),
@@ -104,6 +115,7 @@ describe('BilibiliController uploadVideo title resolution', () => {
       findByJobId: jest.fn().mockResolvedValue({
         jobId: 'job-1',
         streamerName: '录制时主播名',
+        roomName: '录制时房间名',
         platform: 'douyu',
         roomId: '7788',
         startTime: new Date('2026-04-18T12:34:00+08:00'),
@@ -120,7 +132,7 @@ describe('BilibiliController uploadVideo title resolution', () => {
 
     await controller.uploadVideo({
       s3Key: 'raw/job-1/video/segment_001.mkv',
-      title: '{streamerName} {date} {time}',
+      title: '{主播名} {房间名} {日期} {时间}',
       jobId: 'job-1',
       streamerId: 'streamer-1',
     });
@@ -129,13 +141,14 @@ describe('BilibiliController uploadVideo title resolution', () => {
     expect(controller.bilibiliUploadService.upload).toHaveBeenCalledWith(
       [
         expect.objectContaining({
-          title: '录制时主播名 2026-04-18 12:34',
+          title: '录制时主播名 录制时房间名 2026-04-18 12:34',
         }),
       ],
       expect.objectContaining({
-        title: '录制时主播名 2026-04-18 12:34',
+        title: '录制时主播名 录制时房间名 2026-04-18 12:34',
         description: '默认简介',
         tags: ['默认标签'],
+        humanType2: 2066,
         tid: 171,
         cover: 'jobs/job-1/cover/snapshot.jpg',
         copyright: 2,

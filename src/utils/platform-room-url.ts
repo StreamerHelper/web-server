@@ -18,5 +18,9 @@ export function buildPlatformRoomUrl(
     return `https://www.douyu.com/${roomId}`;
   }
 
+  if (platform === 'douyin') {
+    return `https://live.douyin.com/${roomId}`;
+  }
+
   return undefined;
 }

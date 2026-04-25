@@ -158,7 +158,7 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   upload: {
     defaultTid: 171,
-    defaultTitleTemplate: '{streamerName}的直播录像 {date}',
+    defaultTitleTemplate: '{主播名}的直播录像 {日期}',
   },
 };
 
@@ -176,7 +176,10 @@ function getEnvOverrides(): Partial<AppConfig> {
     };
   }
   if (process.env.APP_PORT) {
-    overrides.app = { ...overrides.app, port: parseInt(process.env.APP_PORT, 10) };
+    overrides.app = {
+      ...overrides.app,
+      port: parseInt(process.env.APP_PORT, 10),
+    };
   }
   if (process.env.APP_KEYS) {
     overrides.app = { ...overrides.app, keys: process.env.APP_KEYS };
@@ -184,22 +187,40 @@ function getEnvOverrides(): Partial<AppConfig> {
 
   // Database
   if (process.env.TYPEORM_HOST) {
-    overrides.database = { ...overrides.database, host: process.env.TYPEORM_HOST };
+    overrides.database = {
+      ...overrides.database,
+      host: process.env.TYPEORM_HOST,
+    };
   }
   if (process.env.TYPEORM_PORT) {
-    overrides.database = { ...overrides.database, port: parseInt(process.env.TYPEORM_PORT, 10) };
+    overrides.database = {
+      ...overrides.database,
+      port: parseInt(process.env.TYPEORM_PORT, 10),
+    };
   }
   if (process.env.TYPEORM_USERNAME) {
-    overrides.database = { ...overrides.database, username: process.env.TYPEORM_USERNAME };
+    overrides.database = {
+      ...overrides.database,
+      username: process.env.TYPEORM_USERNAME,
+    };
   }
   if (process.env.TYPEORM_PASSWORD) {
-    overrides.database = { ...overrides.database, password: process.env.TYPEORM_PASSWORD };
+    overrides.database = {
+      ...overrides.database,
+      password: process.env.TYPEORM_PASSWORD,
+    };
   }
   if (process.env.TYPEORM_DATABASE) {
-    overrides.database = { ...overrides.database, database: process.env.TYPEORM_DATABASE };
+    overrides.database = {
+      ...overrides.database,
+      database: process.env.TYPEORM_DATABASE,
+    };
   }
   if (process.env.TYPEORM_SSL) {
-    overrides.database = { ...overrides.database, ssl: process.env.TYPEORM_SSL === 'true' };
+    overrides.database = {
+      ...overrides.database,
+      ssl: process.env.TYPEORM_SSL === 'true',
+    };
   }
 
   // Redis
@@ -207,13 +228,22 @@ function getEnvOverrides(): Partial<AppConfig> {
     overrides.redis = { ...overrides.redis, host: process.env.REDIS_HOST };
   }
   if (process.env.REDIS_PORT) {
-    overrides.redis = { ...overrides.redis, port: parseInt(process.env.REDIS_PORT, 10) };
+    overrides.redis = {
+      ...overrides.redis,
+      port: parseInt(process.env.REDIS_PORT, 10),
+    };
   }
   if (process.env.REDIS_PASSWORD) {
-    overrides.redis = { ...overrides.redis, password: process.env.REDIS_PASSWORD };
+    overrides.redis = {
+      ...overrides.redis,
+      password: process.env.REDIS_PASSWORD,
+    };
   }
   if (process.env.REDIS_DB) {
-    overrides.redis = { ...overrides.redis, db: parseInt(process.env.REDIS_DB, 10) };
+    overrides.redis = {
+      ...overrides.redis,
+      db: parseInt(process.env.REDIS_DB, 10),
+    };
   }
 
   // S3
@@ -221,7 +251,10 @@ function getEnvOverrides(): Partial<AppConfig> {
     overrides.s3 = { ...overrides.s3, endpoint: process.env.S3_ENDPOINT };
   }
   if (process.env.S3_PUBLIC_ENDPOINT) {
-    overrides.s3 = { ...overrides.s3, publicEndpoint: process.env.S3_PUBLIC_ENDPOINT };
+    overrides.s3 = {
+      ...overrides.s3,
+      publicEndpoint: process.env.S3_PUBLIC_ENDPOINT,
+    };
   }
   if (process.env.S3_REGION) {
     overrides.s3 = { ...overrides.s3, region: process.env.S3_REGION };
@@ -294,7 +327,9 @@ export function loadConfig(): AppConfig {
     fileConfig = readConfigFile(effectivePath);
     console.log(`[Config] Loaded config from: ${effectivePath}`);
   } catch (error) {
-    console.warn(`[Config] Failed to read config file, using defaults: ${error}`);
+    console.warn(
+      `[Config] Failed to read config file, using defaults: ${error}`
+    );
   }
 
   const envOverrides = getEnvOverrides();

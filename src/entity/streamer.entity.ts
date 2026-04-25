@@ -6,7 +6,12 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { RecordingQuality, StreamerInfo } from '../interface';
+import {
+  BilibiliCollectionBinding,
+  RecordingQuality,
+  SubmissionRhythmSettings,
+  StreamerInfo,
+} from '../interface';
 
 @Entity('streamers')
 export class Streamer {
@@ -22,7 +27,7 @@ export class Streamer {
 
   @Column({
     type: 'enum',
-    enum: ['bilibili', 'huya', 'douyu'],
+    enum: ['bilibili', 'huya', 'douyu', 'douyin'],
     name: 'platform',
   })
   platform: string;
@@ -48,10 +53,12 @@ export class Streamer {
   @Column({ name: 'uploadSettings', type: 'jsonb', nullable: true })
   uploadSettings: {
     autoUpload?: boolean;
+    rhythm?: SubmissionRhythmSettings;
     title?: string;
     description?: string;
     tags?: string[];
-    tid?: number;
+    humanType2?: number;
+    collection?: BilibiliCollectionBinding;
   };
 
   @Column({ name: 'cover_path', nullable: true, length: 1000 })

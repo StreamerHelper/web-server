@@ -6,12 +6,11 @@ import {
   Scope,
   ScopeEnum,
 } from '@midwayjs/core';
-import * as crypto from 'crypto';
 import * as path from 'path';
 import { BilibiliCredential } from '../interface';
 import { BilibiliCredentialRepository } from '../repository/bilibili-credential.repository';
-import { BILIBILI_APP_KEYS } from './bilibili-auth.service';
 import { StorageService } from './storage.service';
+import { DEFAULT_BILIBILI_HUMAN_TYPE2 } from '../config/bilibili-partitions';
 
 /**
  * 视频分片信息
@@ -32,6 +31,7 @@ export interface BilibiliUploadOptions {
   description?: string;
   tags?: string[];
   tid?: number;
+  humanType2?: number;
   cover?: string;
   copyright?: number;
   source?: string;
@@ -45,6 +45,12 @@ export interface BilibiliUploadOptions {
 export interface BilibiliUploadResult {
   bvid: string;
   avid: number;
+}
+
+export interface BilibiliUploadedPart {
+  title: string;
+  filename: string;
+  cid: number;
 }
 
 // 上传线路配置
@@ -61,6 +67,11 @@ interface PreuploadResult {
   endpoint: string;
   bizId: number;
   uposUri: string;
+}
+
+interface BilibiliPredictedPartition {
+  id: number;
+  show?: boolean;
 }
 
 interface UploadPartInfo {
@@ -113,7 +124,7 @@ export class BilibiliUploadService {
     this.logger.info('Selected upload line', { line: line.name });
 
     // 2. 上传所有视频分 P
-    const uploadedParts: Array<{ title: string; filename: string }> = [];
+    const uploadedParts: BilibiliUploadedPart[] = [];
 
     for (const part of parts) {
       this.logger.info('Uploading video part', {
@@ -126,6 +137,7 @@ export class BilibiliUploadService {
       uploadedParts.push({
         title: part.title,
         filename: uploadResult.filename,
+        cid: uploadResult.cid,
       });
     }
 
@@ -188,7 +200,7 @@ export class BilibiliUploadService {
   async uploadPartFromLocal(
     localPath: string,
     part: VideoPart
-  ): Promise<string> {
+  ): Promise<{ filename: string; cid: number }> {
     const credential = await this.credentialRepository.findValid();
     if (!credential) {
       throw new Error('Bilibili not authenticated. Please login first.');
@@ -273,9 +285,13 @@ export class BilibiliUploadService {
     this.logger.info('Local file upload completed', {
       localPath,
       filename,
+      cid: preupload.bizId,
     });
 
-    return filename;
+    return {
+      filename,
+      cid: preupload.bizId,
+    };
   }
 
   /**
@@ -285,7 +301,7 @@ export class BilibiliUploadService {
     part: VideoPart,
     line: (typeof UPLOAD_LINES)[0],
     cookies: Record<string, string>
-  ): Promise<{ filename: string }> {
+  ): Promise<{ filename: string; cid: number }> {
     // 从 S3 下载文件
     const fileBuffer = await this.storageService.download(part.s3Key);
     const fileSize = fileBuffer.length;
@@ -342,7 +358,7 @@ export class BilibiliUploadService {
     );
     const filename = path.parse(filenameWithExt).name;
 
-    return { filename };
+    return { filename, cid: preupload.bizId };
   }
 
   /**
@@ -538,6 +554,17 @@ export class BilibiliUploadService {
     );
   }
 
+  private async uploadCoverFromDataUrl(
+    dataUrl: string,
+    cookies: Record<string, string>
+  ): Promise<string> {
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!match) {
+      throw new Error('Invalid cover data URL');
+    }
+    return this.uploadCover(Buffer.from(match[2], 'base64'), cookies, match[1]);
+  }
+
   /**
    * 上传封面到 B 站
    */
@@ -605,13 +632,28 @@ export class BilibiliUploadService {
       return this.normalizeBilibiliCoverUrl(coverSource);
     }
 
-    if (this.isExternalUrl(coverSource)) {
-      this.logger.warn(
-        'Skipping external cover URL for bilibili submission',
-        {
+    if (this.isDataUrl(coverSource)) {
+      try {
+        const uploadedCoverUrl = await this.uploadCoverFromDataUrl(
           coverSource,
-        }
-      );
+          cookies
+        );
+        return this.normalizeBilibiliCoverUrl(uploadedCoverUrl);
+      } catch (error) {
+        this.logger.warn(
+          'Failed to upload data URL cover to bilibili, submitting without cover',
+          {
+            error: error instanceof Error ? error.message : String(error),
+          }
+        );
+        return '';
+      }
+    }
+
+    if (this.isExternalUrl(coverSource)) {
+      this.logger.warn('Skipping external cover URL for bilibili submission', {
+        coverSource,
+      });
       return '';
     }
 
@@ -631,6 +673,20 @@ export class BilibiliUploadService {
       );
       return '';
     }
+  }
+
+  async resolveCoverForCreative(coverSource?: string): Promise<string> {
+    const credential = await this.credentialRepository.findValid();
+    if (!credential) {
+      throw new Error('Bilibili not authenticated. Please login first.');
+    }
+    if (new Date() >= credential.expiresAt) {
+      throw new Error('Bilibili credential expired. Please login again.');
+    }
+    return this.resolveCoverForSubmission(
+      coverSource,
+      credential.cookies as Record<string, string>
+    );
   }
 
   private isBilibiliCoverUrl(coverUrl: string): boolean {
@@ -654,6 +710,12 @@ export class BilibiliUploadService {
     return /^(https?:)?\/\//i.test(coverSource.trim());
   }
 
+  private isDataUrl(coverSource: string): boolean {
+    return /^data:image\/(?:jpeg|jpg|png|webp);base64,/i.test(
+      coverSource.trim()
+    );
+  }
+
   private normalizeBilibiliCoverUrl(coverUrl: string): string {
     const normalizedUrl = coverUrl.trim();
     if (normalizedUrl.startsWith('http://')) {
@@ -666,7 +728,7 @@ export class BilibiliUploadService {
    * 提交视频稿件（公开方法）
    */
   async submitVideoParts(
-    parts: Array<{ title: string; filename: string }>,
+    parts: BilibiliUploadedPart[],
     options: BilibiliUploadOptions,
     coverSource?: string
   ): Promise<BilibiliUploadResult> {
@@ -689,71 +751,61 @@ export class BilibiliUploadService {
   }
 
   /**
+   * 编辑已投稿稿件的分 P 列表，用于追加分 P
+   */
+  async editVideoParts(
+    avid: number,
+    parts: BilibiliUploadedPart[],
+    options: BilibiliUploadOptions,
+    coverSource?: string
+  ): Promise<BilibiliUploadResult> {
+    const credential = await this.credentialRepository.findValid();
+    if (!credential) {
+      throw new Error('Bilibili not authenticated. Please login first.');
+    }
+
+    if (new Date() >= credential.expiresAt) {
+      throw new Error('Bilibili credential expired. Please login again.');
+    }
+
+    const cookies = credential.cookies as Record<string, string>;
+    const coverUrl = await this.resolveCoverForSubmission(
+      coverSource ?? options.cover,
+      cookies
+    );
+
+    return this.editVideo(avid, parts, options, coverUrl, credential);
+  }
+
+  /**
    * 提交视频稿件
    */
   private async submitVideo(
-    parts: Array<{ title: string; filename: string }>,
+    parts: BilibiliUploadedPart[],
     options: BilibiliUploadOptions,
     coverUrl: string,
     credential: BilibiliCredential
   ): Promise<BilibiliUploadResult> {
-    // 构建稿件数据（参照 biliup 的 Studio 结构）
-    const studio = {
-      copyright: 2,
-      source: options.source || '',
-      tid: options.tid || 171,
-      cover: coverUrl,
-      title: options.title,
-      desc_format_id: 0,
-      desc: options.description || '',
-      dynamic: options.dynamic || '',
-      subtitle: { open: 0, lan: '' },
-      tag: (options.tags || []).join(','),
-      videos: parts.map((p, index) => ({
-        title: p.title || `P${index + 1}`,
-        filename: p.filename,
-        desc: '',
-      })),
-      dtime: 0,
-      open_subtitle: false,
-      interactive: 0,
-      dolby: 0,
-      lossless_music: 0,
-      no_reprint: options.noReprint || 0,
-      is_only_self: 0,
-      charging_pay: 0,
-    };
-
-    // 使用 App 端接口提交（参照 biliup 的 submitByApp 实现）
-    const timestamp = Math.floor(Date.now() / 1000);
-    const payload: Record<string, string | number> = {
-      access_key: credential.accessToken,
-      appkey: BILIBILI_APP_KEYS.BiliTV.appkey,
-      build: 7800300,
-      c_locale: 'zh-Hans_CN',
-      channel: 'bili',
-      disable_rcmd: 0,
-      mobi_app: 'android',
-      platform: 'android',
-      s_locale: 'zh-Hans_CN',
-      statistics: '"appId":1,"platform":3,"version":"7.80.0","abtest":""',
-      ts: timestamp,
-    };
-
-    // 构建签名字符串
-    const queryString = this.buildQueryString(payload);
-    const signature = this.sign(
-      queryString,
-      BILIBILI_APP_KEYS.BiliTV.appsecret
+    const cookies = credential.cookies as Record<string, string>;
+    const tid = await this.resolvePredictedLegacyTid(
+      cookies,
+      parts[0]?.filename || '',
+      options.title,
+      options.tid
     );
+    const humanType2 = options.humanType2 || DEFAULT_BILIBILI_HUMAN_TYPE2;
 
-    const url = `https://member.bilibili.com/x/vu/app/add?${queryString}&sign=${signature}`;
+    const studio = this.buildStudio(parts, options, coverUrl, tid, humanType2);
+
+    const url = new URL('https://member.bilibili.com/x/vu/web/add/v3');
+    url.searchParams.set('ts', String(Date.now()));
+    url.searchParams.set('csrf', cookies.bili_jct || '');
+
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent':
-          'Mozilla/5.0 BiliDroid/7.80.0 (bbcallen@gmail.com) os/android model/MI 6 mobi_app/android build/7800300 channel/bili innerVer/7800310 osVer/13 network/2',
+        ...this.buildBrowserHeaders(cookies),
       },
       body: JSON.stringify(studio),
     });
@@ -772,7 +824,6 @@ export class BilibiliUploadService {
       message: data.message,
     });
 
-    console.log(JSON.stringify(data, null, 2));
     if (data.code !== 0) {
       throw new Error(`Failed to submit video: ${data.message}`);
     }
@@ -784,24 +835,178 @@ export class BilibiliUploadService {
   }
 
   /**
-   * 构建查询字符串（不排序，按原始顺序）
+   * 编辑视频稿件
    */
-  private buildQueryString(params: Record<string, string | number>): string {
-    return Object.entries(params)
-      .map(
-        ([key, value]) =>
-          `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`
-      )
-      .join('&');
+  private async editVideo(
+    avid: number,
+    parts: BilibiliUploadedPart[],
+    options: BilibiliUploadOptions,
+    coverUrl: string,
+    credential: BilibiliCredential
+  ): Promise<BilibiliUploadResult> {
+    const cookies = credential.cookies as Record<string, string>;
+    const tid = await this.resolvePredictedLegacyTid(
+      cookies,
+      parts[0]?.filename || '',
+      options.title,
+      options.tid
+    );
+    const humanType2 = options.humanType2 || DEFAULT_BILIBILI_HUMAN_TYPE2;
+    const studio = {
+      ...this.buildStudio(parts, options, coverUrl, tid, humanType2),
+      aid: Number(avid),
+    };
+
+    const url = new URL('https://member.bilibili.com/x/vu/web/edit');
+    url.searchParams.set('t', String(Date.now()));
+    url.searchParams.set('csrf', cookies.bili_jct || '');
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...this.buildBrowserHeaders(cookies),
+      },
+      body: JSON.stringify(studio),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to edit video: HTTP ${response.status}`);
+    }
+
+    const data = (await response.json()) as {
+      code?: number;
+      message?: string;
+      data?: { bvid?: string; aid?: number };
+    };
+    this.logger.info('Edit video response', {
+      code: data.code,
+      message: data.message,
+    });
+
+    if (data.code !== 0) {
+      throw new Error(`Failed to edit video: ${data.message}`);
+    }
+
+    return {
+      bvid: data.data?.bvid || '',
+      avid: data.data?.aid || Number(avid),
+    };
   }
 
-  /**
-   * 签名（MD5）
-   */
-  private sign(queryString: string, appSecret: string): string {
-    return crypto
-      .createHash('md5')
-      .update(queryString + appSecret)
-      .digest('hex');
+  private buildStudio(
+    parts: BilibiliUploadedPart[],
+    options: BilibiliUploadOptions,
+    coverUrl: string,
+    tid: number,
+    humanType2: number
+  ) {
+    return {
+      copyright: options.copyright || 2,
+      source: options.source || '',
+      tid,
+      human_type2: humanType2,
+      cover: coverUrl,
+      title: options.title,
+      desc_format_id: 9999,
+      desc: options.description || '',
+      desc_v2: [],
+      dynamic: options.dynamic || '',
+      subtitle: { open: 0, lan: '' },
+      tag: (options.tags || []).join(','),
+      videos: parts.map(p => ({
+        title: p.title,
+        filename: p.filename,
+        cid: p.cid,
+        desc: '',
+      })),
+      dtime: 0,
+      open_subtitle: false,
+      interactive: 0,
+      recreate: -1,
+      act_reserve_create: 0,
+      dolby: 0,
+      lossless_music: 0,
+      no_reprint: options.noReprint || 0,
+      no_disturbance: options.dynamic ? 1 : 0,
+      is_only_self: 0,
+      charging_pay: 0,
+      up_selection_reply: false,
+      up_close_reply: false,
+      up_close_danmu: false,
+      web_os: 3,
+      is_360: -1,
+    };
+  }
+
+  private async resolvePredictedLegacyTid(
+    cookies: Record<string, string>,
+    filename: string,
+    title: string,
+    fallbackTid?: number
+  ): Promise<number> {
+    const url = new URL(
+      'https://member.bilibili.com/x/vupre/web/archive/types/predict'
+    );
+    url.searchParams.set('ts', String(Date.now()));
+    url.searchParams.set('csrf', cookies.bili_jct || '');
+
+    const form = new FormData();
+    form.set('filename', filename);
+    form.set('title', title);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: this.buildBrowserHeaders(cookies),
+      body: form,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to predict bilibili partition: ${response.status}`);
+    }
+
+    const result = (await response.json()) as {
+      code?: number;
+      message?: string;
+      data?: BilibiliPredictedPartition[];
+    };
+
+    if (result.code !== 0) {
+      throw new Error(
+        `Failed to predict bilibili partition: ${
+          result.message || result.code
+        }`
+      );
+    }
+
+    const predictedTid = result.data?.find(item => item.show !== false)?.id;
+    if (predictedTid && Number.isInteger(predictedTid) && predictedTid > 0) {
+      return predictedTid;
+    }
+
+    if (fallbackTid && Number.isInteger(fallbackTid) && fallbackTid > 0) {
+      return fallbackTid;
+    }
+
+    throw new Error('Bilibili partition prediction returned no usable tid');
+  }
+
+  private buildBrowserHeaders(
+    cookies: Record<string, string>
+  ): Record<string, string> {
+    return {
+      Cookie: this.buildCookieHeader(cookies),
+      Origin: 'https://member.bilibili.com',
+      Referer: 'https://member.bilibili.com/platform/upload/video/frame',
+      'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    };
+  }
+
+  private buildCookieHeader(cookies: Record<string, string>): string {
+    return Object.entries(cookies)
+      .filter(([, value]) => value)
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ');
   }
 }

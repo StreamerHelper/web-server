@@ -15,12 +15,19 @@ import {
   SubmissionStatus,
 } from '../entity/bilibili-submission.entity';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
-import { BilibiliUploadService, VideoPart } from './bilibili-upload.service';
+import {
+  BilibiliUploadedPart,
+  BilibiliUploadService,
+  VideoPart,
+} from './bilibili-upload.service';
 import { StorageService } from './storage.service';
 import { JobService } from './job.service';
 import { SubmissionTemplateService } from './submission-template.service';
 import { StreamerService } from './streamer.service';
 import { buildPlatformRoomUrl } from '../utils/platform-room-url';
+import { BilibiliCollectionBinding } from '../interface';
+import { BilibiliSeasonService } from './bilibili-season.service';
+import { BilibiliPartitionService } from './bilibili-partition.service';
 
 /**
  * 每个分P的目标时长（1小时 = 3600秒）
@@ -38,14 +45,16 @@ const BILIBILI_COPYRIGHT_REPRINT = 2;
  */
 export interface CreateSubmissionInput {
   jobId: string;
+  parts?: SubmissionPart[];
   title?: string;
   description?: string;
   tags?: string[];
-  tid?: number;
+  humanType2?: number;
   cover?: string;
   copyright?: number;
   source?: string;
   dynamic?: string;
+  collection?: BilibiliCollectionBinding;
 }
 
 /**
@@ -76,6 +85,12 @@ export class BilibiliSubmissionService {
   @Inject()
   private submissionTemplateService: SubmissionTemplateService;
 
+  @Inject()
+  private bilibiliSeasonService: BilibiliSeasonService;
+
+  @Inject()
+  private bilibiliPartitionService: BilibiliPartitionService;
+
   /**
    * 创建投稿任务
    * 根据 Job 中的视频分片，规划分P结构
@@ -105,29 +120,39 @@ export class BilibiliSubmissionService {
       throw new Error('No video segments found');
     }
 
-    const streamer = await this.streamerService.findByStreamerId(job.streamerId);
+    const streamer = await this.streamerService.findByStreamerId(
+      job.streamerId
+    );
     const streamerName = job.streamerName || streamer?.name;
     const uploadSettings = streamer?.uploadSettings || {};
     const title = this.submissionTemplateService.resolveTitle(
       input.title ?? uploadSettings.title,
       {
         streamerName,
+        roomName: job.roomName,
         startedAt: job.startTime || job.createdAt,
       }
     );
     const description = input.description ?? uploadSettings.description ?? '';
     const tags = input.tags ?? uploadSettings.tags ?? [];
-    const tid = this.submissionTemplateService.resolveTid(
-      input.tid ?? uploadSettings.tid
+    const tid = this.submissionTemplateService.resolveTid(undefined);
+    const humanType2 = this.bilibiliPartitionService.resolveHumanType2(
+      input.humanType2 ?? uploadSettings.humanType2
     );
-    const cover = input.cover ?? job.coverPath ?? streamer?.coverPath ?? undefined;
+    const collection = this.resolveCollectionBinding(
+      input.collection ?? uploadSettings.collection
+    );
+    const cover =
+      input.cover ?? job.coverPath ?? streamer?.coverPath ?? undefined;
     const source =
       this.normalizeSource(input.source) ||
       buildPlatformRoomUrl(job.platform, job.roomId) ||
       buildPlatformRoomUrl(streamer?.platform, streamer?.roomId);
 
     // 规划分P结构
-    const parts = this.planParts(s3Keys);
+    const parts = input.parts
+      ? this.normalizeSubmissionParts(input.parts)
+      : this.planParts(s3Keys);
 
     this.logger.info('Creating submission', {
       jobId: input.jobId,
@@ -142,10 +167,16 @@ export class BilibiliSubmissionService {
       description,
       tags,
       tid,
+      humanType2,
       cover,
       copyright: BILIBILI_COPYRIGHT_REPRINT,
       source,
       dynamic: input.dynamic,
+      collectionAutoAdd: collection.autoAdd,
+      collectionSeasonId: collection.seasonId,
+      collectionSectionId: collection.sectionId,
+      collectionSeasonTitle: collection.seasonTitle,
+      collectionSectionTitle: collection.sectionTitle,
       status: SubmissionStatus.PENDING,
       parts,
       totalParts: parts.length,
@@ -175,25 +206,58 @@ export class BilibiliSubmissionService {
       currentPart.push(key);
 
       if (currentPart.length >= segmentsPerPart) {
-        parts.push({
-          index: parts.length + 1,
-          s3Keys: [...currentPart],
-          status: PartStatus.PENDING,
-        });
+        parts.push(
+          this.buildSubmissionPart([...currentPart], parts.length + 1)
+        );
         currentPart = [];
       }
     }
 
     // 处理剩余的分片
     if (currentPart.length > 0) {
-      parts.push({
-        index: parts.length + 1,
-        s3Keys: currentPart,
-        status: PartStatus.PENDING,
-      });
+      parts.push(this.buildSubmissionPart(currentPart, parts.length + 1));
     }
 
     return parts;
+  }
+
+  normalizeSubmissionParts(parts: SubmissionPart[]): SubmissionPart[] {
+    return parts.map((part, index) =>
+      this.buildSubmissionPart(
+        part.s3Keys,
+        index + 1,
+        part.status,
+        part.rhythmIntervalMinutes,
+        part
+      )
+    );
+  }
+
+  buildSubmissionPart(
+    s3Keys: string[],
+    index: number,
+    status: PartStatus = PartStatus.PENDING,
+    rhythmIntervalMinutes?: number,
+    data: Partial<SubmissionPart> = {}
+  ): SubmissionPart {
+    const sortedKeys = [...s3Keys].sort();
+    const firstKey = sortedKeys[0];
+    const lastKey = sortedKeys[sortedKeys.length - 1];
+    const startedAt = this.parseSegmentDate(firstKey);
+    const endedAt = this.parseSegmentDate(lastKey);
+
+    return {
+      ...data,
+      index,
+      title: data.title || this.formatPartTitleFromS3Key(firstKey),
+      s3Keys: sortedKeys,
+      status,
+      rhythmIntervalMinutes,
+      startedAt: data.startedAt || startedAt?.toISOString(),
+      endedAt: data.endedAt || endedAt?.toISOString(),
+      duration:
+        data.duration ?? Math.round(sortedKeys.length * SEGMENT_DURATION_SECONDS * 1000),
+    };
   }
 
   /**
@@ -213,125 +277,182 @@ export class BilibiliSubmissionService {
       completedParts: submission.completedParts,
     });
 
-    // 更新状态为上传中
-    await this.submissionRepository.updateStatus(
-      submissionId,
-      SubmissionStatus.UPLOADING
-    );
-
+    let tempDir: string | undefined;
     try {
-      // 创建临时目录（使用项目根目录的 temp 文件夹）
-      const projectRoot = path.resolve(__dirname, '..', '..');
-      const tempBaseDir = path.join(projectRoot, 'temp', 'submissions');
-      await fs.mkdir(tempBaseDir, { recursive: true });
-      const tempDir = await fs.mkdtemp(path.join(tempBaseDir, 'submission-'));
-
-      // 处理每个分P
-      const uploadedParts: Array<{ title: string; filename: string }> = [];
-
-      for (const part of submission.parts) {
-        // 跳过已完成的分P
-        if (part.status === PartStatus.COMPLETED && part.filename) {
-          uploadedParts.push({
-            title: `P${part.index}`,
-            filename: part.filename,
-          });
-          continue;
-        }
-
-        this.logger.info('Processing part', {
-          submissionId,
-          partIndex: part.index,
-          segmentCount: part.s3Keys.length,
-        });
-
-        // 更新分P状态为合并中
-        await this.submissionRepository.updatePartStatus(
-          submissionId,
-          part.index,
-          PartStatus.MERGING
-        );
-
-        // 1. 下载并合并分片
-        const mergedFilePath = await this.downloadAndMergeSegments(
-          part.s3Keys,
-          tempDir,
-          part.index
-        );
-
-        // 更新分P状态为上传中
-        await this.submissionRepository.updatePartStatus(
-          submissionId,
-          part.index,
-          PartStatus.UPLOADING
-        );
-
-        // 2. 上传到B站
-        const videoPart: VideoPart = {
-          title: `P${part.index}`,
-          filename: path.basename(mergedFilePath),
-          s3Key: '', // 本地文件，不需要 S3 key
-          duration: 0,
-          size: 0,
-        };
-
-        const filename = await this.uploadService.uploadPartFromLocal(
-          mergedFilePath,
-          videoPart
-        );
-
-        // 更新分P状态为完成
-        await this.submissionRepository.updatePartStatus(
-          submissionId,
-          part.index,
-          PartStatus.COMPLETED,
-          { filename }
-        );
-
-        uploadedParts.push({
-          title: `P${part.index}`,
-          filename,
-        });
-
-        // 清理临时文件
-        await fs.unlink(mergedFilePath).catch(() => {});
-
-        this.logger.info('Part completed', {
-          submissionId,
-          partIndex: part.index,
-          filename,
-        });
-      }
-
-      // 3. 提交稿件
-      await this.submissionRepository.updateStatus(
-        submissionId,
-        SubmissionStatus.SUBMITTING
+      let result: { bvid: string; avid: number } = {
+        bvid: submission.bvid || '',
+        avid: Number(submission.avid || 0),
+      };
+      const parts = this.normalizeSubmissionParts(submission.parts || []);
+      const hasUnfinishedParts = parts.some(
+        part =>
+          part.status !== PartStatus.COMPLETED || !part.filename || !part.cid
       );
 
-      const result = await this.uploadService.submitVideoParts(
-        uploadedParts,
-        {
+      if (hasUnfinishedParts || !submission.avid || !submission.bvid) {
+        await this.submissionRepository.updateStatus(
+          submissionId,
+          SubmissionStatus.UPLOADING
+        );
+
+        // 创建临时目录（使用项目根目录的 temp 文件夹）
+        const projectRoot = path.resolve(__dirname, '..', '..');
+        const tempBaseDir = path.join(projectRoot, 'temp', 'submissions');
+        await fs.mkdir(tempBaseDir, { recursive: true });
+        tempDir = await fs.mkdtemp(path.join(tempBaseDir, 'submission-'));
+
+        const uploadedParts: BilibiliUploadedPart[] = [];
+
+        for (const part of parts) {
+          const partTitle = this.resolvePartTitle(part);
+
+          // 跳过已完成的分P
+          if (part.status === PartStatus.COMPLETED && part.filename && part.cid) {
+            uploadedParts.push({
+              title: partTitle,
+              filename: part.filename,
+              cid: part.cid,
+            });
+            if (part.title !== partTitle) {
+              await this.submissionRepository.updatePartStatus(
+                submissionId,
+                part.index,
+                PartStatus.COMPLETED,
+                { title: partTitle }
+              );
+            }
+            continue;
+          }
+
+          this.logger.info('Processing part', {
+            submissionId,
+            partIndex: part.index,
+            segmentCount: part.s3Keys.length,
+          });
+
+          // 更新分P状态为合并中
+          await this.submissionRepository.updatePartStatus(
+            submissionId,
+            part.index,
+            PartStatus.MERGING,
+            { title: partTitle }
+          );
+
+          // 1. 下载并合并分片
+          const mergedFilePath = await this.downloadAndMergeSegments(
+            part.s3Keys,
+            tempDir,
+            part.index
+          );
+
+          // 更新分P状态为上传中
+          await this.submissionRepository.updatePartStatus(
+            submissionId,
+            part.index,
+            PartStatus.UPLOADING
+          );
+
+          // 2. 上传到B站
+          const videoPart: VideoPart = {
+            title: partTitle,
+            filename: path.basename(mergedFilePath),
+            s3Key: '', // 本地文件，不需要 S3 key
+            duration: 0,
+            size: 0,
+          };
+
+          const uploadedPart = await this.uploadService.uploadPartFromLocal(
+            mergedFilePath,
+            videoPart
+          );
+
+          // 更新分P状态为完成
+          await this.submissionRepository.updatePartStatus(
+            submissionId,
+            part.index,
+            PartStatus.COMPLETED,
+            {
+              filename: uploadedPart.filename,
+              cid: uploadedPart.cid,
+              title: partTitle,
+            }
+          );
+
+          uploadedParts.push({
+            title: partTitle,
+            filename: uploadedPart.filename,
+            cid: uploadedPart.cid,
+          });
+
+          // 清理临时文件
+          await fs.unlink(mergedFilePath).catch(() => {});
+
+          this.logger.info('Part completed', {
+            submissionId,
+            partIndex: part.index,
+            filename: uploadedPart.filename,
+            cid: uploadedPart.cid,
+          });
+        }
+
+        // 3. 提交稿件
+        await this.submissionRepository.updateStatus(
+          submissionId,
+          SubmissionStatus.SUBMITTING
+        );
+
+        const submitOptions = {
           title: submission.title,
           description: submission.description,
           tags: submission.tags,
           tid: submission.tid,
+          humanType2: submission.humanType2,
           cover: submission.cover,
           copyright: submission.copyright,
           source: submission.source,
           dynamic: submission.dynamic,
-        }
-      );
+        };
 
-      // 更新投稿结果
-      await this.submissionRepository.updateSubmissionResult(
+        if (submission.avid && submission.bvid) {
+          const editResult = await this.uploadService.editVideoParts(
+            Number(submission.avid),
+            uploadedParts,
+            submitOptions
+          );
+          result = {
+            bvid: editResult.bvid || submission.bvid,
+            avid: editResult.avid || Number(submission.avid),
+          };
+        } else {
+          result = await this.uploadService.submitVideoParts(
+            uploadedParts,
+            submitOptions
+          );
+        }
+
+        await this.submissionRepository.updateUploadedResult(
+          submissionId,
+          result.bvid,
+          result.avid
+        );
+      } else {
+        result = {
+          bvid: submission.bvid,
+          avid: Number(submission.avid),
+        };
+      }
+
+      await this.submissionRepository.updateStatus(
         submissionId,
-        result.bvid,
-        result.avid
+        SubmissionStatus.SUBMITTING
       );
+      await this.addSubmissionToCollectionIfNeeded(submission, result.avid);
+      await this.submissionRepository.completeSubmission(submissionId);
 
       // 清理临时目录
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      if (tempDir) {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      }
 
       this.logger.info('Submission completed', {
         submissionId,
@@ -352,14 +473,132 @@ export class BilibiliSubmissionService {
         SubmissionStatus.FAILED,
         errorMessage
       );
+      if (tempDir) {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      }
 
       throw error;
     }
   }
 
+  private resolveCollectionBinding(collection?: BilibiliCollectionBinding): {
+    autoAdd: boolean;
+    seasonId: number | null;
+    sectionId: number | null;
+    seasonTitle: string | null;
+    sectionTitle: string | null;
+  } {
+    const seasonId = Number(collection?.seasonId || 0);
+    const sectionId = Number(collection?.sectionId || 0);
+    const autoAdd = Boolean(
+      collection?.autoAdd &&
+        Number.isFinite(seasonId) &&
+        seasonId > 0 &&
+        Number.isFinite(sectionId) &&
+        sectionId > 0
+    );
+
+    return {
+      autoAdd,
+      seasonId: autoAdd ? seasonId : null,
+      sectionId: autoAdd ? sectionId : null,
+      seasonTitle: autoAdd ? collection?.seasonTitle || null : null,
+      sectionTitle: autoAdd ? collection?.sectionTitle || null : null,
+    };
+  }
+
+  private async addSubmissionToCollectionIfNeeded(
+    submission: BilibiliSubmissionEntity,
+    avid: number
+  ): Promise<void> {
+    if (
+      !submission.collectionAutoAdd ||
+      !submission.collectionSectionId ||
+      !submission.collectionSeasonId
+    ) {
+      return;
+    }
+
+    const collectionResult = await this.bilibiliSeasonService.addVideoToSeason({
+      aid: Number(avid),
+      sectionId: Number(submission.collectionSectionId),
+      title: submission.title,
+    });
+
+    await this.submissionRepository.updateCollectionResult(
+      submission.id,
+      collectionResult.episodeId
+    );
+
+    this.logger.info('Submission added to bilibili collection', {
+      submissionId: submission.id,
+      aid: avid,
+      seasonId: submission.collectionSeasonId,
+      sectionId: submission.collectionSectionId,
+      episodeId: collectionResult.episodeId,
+      alreadyExists: collectionResult.alreadyExists,
+    });
+  }
+
   private normalizeSource(source?: string): string | undefined {
     const trimmed = source?.trim();
     return trimmed ? trimmed : undefined;
+  }
+
+  private resolvePartTitle(part: SubmissionPart): string {
+    return part.title || this.formatPartTitleFromS3Key(part.s3Keys?.[0]);
+  }
+
+  private formatPartTitleFromS3Key(s3Key?: string): string {
+    const dateParts = this.parseSegmentFilename(s3Key);
+    if (!dateParts) {
+      return this.formatPartTitle(new Date());
+    }
+
+    return `${dateParts.year}-${dateParts.month}-${dateParts.day} ${dateParts.hour}:${dateParts.minute}`;
+  }
+
+  private parseSegmentDate(s3Key?: string): Date | undefined {
+    const dateParts = this.parseSegmentFilename(s3Key);
+    if (!dateParts) {
+      return undefined;
+    }
+
+    return new Date(
+      Number(dateParts.year),
+      Number(dateParts.month) - 1,
+      Number(dateParts.day),
+      Number(dateParts.hour),
+      Number(dateParts.minute),
+      Number(dateParts.second)
+    );
+  }
+
+  private parseSegmentFilename(s3Key?: string):
+    | {
+        year: string;
+        month: string;
+        day: string;
+        hour: string;
+        minute: string;
+        second: string;
+      }
+    | undefined {
+    const basename = s3Key ? path.basename(s3Key) : '';
+    const match = basename.match(/segment_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+    if (!match) {
+      return undefined;
+    }
+
+    const [, year, month, day, hour, minute, second] = match;
+    return { year, month, day, hour, minute, second };
+  }
+
+  private formatPartTitle(date: Date): string {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+      date.getDate()
+    )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
   /**
@@ -522,5 +761,4 @@ export class BilibiliSubmissionService {
   }): Promise<{ items: BilibiliSubmissionEntity[]; total: number }> {
     return this.submissionRepository.list(options);
   }
-
 }

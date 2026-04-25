@@ -32,7 +32,7 @@ export class Job {
 
   @Column({
     type: 'enum',
-    enum: ['bilibili', 'huya', 'douyu'],
+    enum: ['bilibili', 'huya', 'douyu', 'douyin'],
     name: 'platform',
   })
   platform: string;

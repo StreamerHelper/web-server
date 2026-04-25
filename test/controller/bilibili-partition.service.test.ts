@@ -1,76 +1,52 @@
 import { BilibiliPartitionService } from '../../src/service/bilibili-partition.service';
 
 describe('BilibiliPartitionService', () => {
-  it('groups predicted partitions by human type when available', () => {
+  it('uses the tid_v2 partition tree as the default selectable list', () => {
     const service = new BilibiliPartitionService() as any;
 
-    const partitions = service.buildPartitions(
-      [
-        { id: 1002, name: '娱乐' },
-        { id: 1008, name: '游戏' },
-      ],
-      [
-        {
-          id: 242,
-          parent: 5,
-          parent_name: '娱乐',
-          name: '娱乐粉丝创作',
-          show: true,
-          rank: 40,
-          human_type: { id: 1002 },
-        },
-        {
-          id: 65,
-          parent: 4,
-          parent_name: '游戏',
-          name: '网络游戏',
-          show: true,
-          rank: 30,
-          human_type: { id: 1008 },
-        },
-      ]
-    );
+    const partitions = service.buildPartitions();
+    const game = partitions.find(partition => partition.id === 1008);
 
-    expect(partitions).toEqual([
-      {
-        id: 1002,
-        name: '娱乐',
-        children: [{ id: 242, name: '娱乐粉丝创作' }],
-      },
-      {
-        id: 1008,
-        name: '游戏',
-        children: [{ id: 65, name: '网络游戏' }],
-      },
-    ]);
+    expect(game?.name).toBe('游戏');
+    expect(game?.children).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 2066,
+          name: '单机主机类游戏',
+        }),
+        expect.objectContaining({
+          id: 2070,
+          name: 'MOBA游戏',
+        }),
+      ])
+    );
   });
 
-  it('falls back to legacy parent when human type is missing and ignores hidden items', () => {
+  it('filters and renames top-level groups with the creative-center list', () => {
     const service = new BilibiliPartitionService() as any;
 
-    const partitions = service.buildPartitions([], [
-      {
-        id: 122,
-        parent: 36,
-        parent_name: '知识',
-        name: '野生技能协会',
-        show: true,
-      },
-      {
-        id: 65,
-        parent: 4,
-        parent_name: '游戏',
-        name: '网络游戏',
-        show: false,
-      },
+    const partitions = service.buildPartitions([
+      { id: 1008, name: '游戏专区' },
+      { id: 1011, name: '人工智能' },
     ]);
 
-    expect(partitions).toEqual([
-      {
-        id: 36,
-        name: '知识',
-        children: [{ id: 122, name: '野生技能协会' }],
-      },
-    ]);
+    expect(partitions.map(partition => partition.id)).toEqual([1008, 1011]);
+    expect(partitions[0].name).toBe('游戏专区');
+    expect(partitions[0].children).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 2066,
+          name: '单机主机类游戏',
+        }),
+      ])
+    );
+  });
+
+  it('resolves invalid selections to the default new partition', () => {
+    const service = new BilibiliPartitionService() as any;
+
+    expect(service.resolveHumanType2(2066)).toBe(2066);
+    expect(service.resolveHumanType2(171)).toBe(2066);
+    expect(service.resolveHumanType2(undefined)).toBe(2066);
   });
 });

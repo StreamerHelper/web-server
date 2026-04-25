@@ -12,6 +12,7 @@ import {
 import { Application } from '@midwayjs/koa';
 import { JOB_STATUS, Platform } from '../interface';
 import { BilibiliSubmissionService } from './bilibili-submission.service';
+import { BilibiliSubmissionRhythmService } from './bilibili-submission-rhythm.service';
 import { DanmakuManager } from './danmaku.service';
 import { JobService } from './job.service';
 import { PlatformService } from './platform.service';
@@ -55,6 +56,9 @@ export class RecorderManager {
 
   @Inject()
   submissionService: BilibiliSubmissionService;
+
+  @Inject()
+  rhythmService: BilibiliSubmissionRhythmService;
 
   @Inject()
   platformService: PlatformService;
@@ -352,13 +356,23 @@ export class RecorderManager {
       // 4. 获取投稿配置
       const uploadSettings = streamer.uploadSettings || {};
 
+      if (uploadSettings.rhythm?.mode === 'segmented') {
+        await this.rhythmService.flushJob(options.id);
+        this.logger.info('Segmented submission flushed after recording ended', {
+          jobId: options.jobId,
+          reason: endData.reason,
+          segmentCount: videoSegments.length,
+        });
+        return;
+      }
+
       // 5. 创建投稿记录
       const submission = await this.submissionService.createSubmission({
         jobId: options.jobId,
         title: uploadSettings.title,
         description: uploadSettings.description,
         tags: uploadSettings.tags || [],
-        tid: uploadSettings.tid,
+        humanType2: uploadSettings.humanType2,
       });
 
       // 6. 派发投稿任务

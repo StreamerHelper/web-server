@@ -297,7 +297,11 @@ export class FFmpegService extends EventEmitter {
     requestedQuality?: RecordingQuality,
     effectiveQuality?: RecordingQuality
   ): string[] {
-    const headers = this.buildHttpHeaders(streamUrl, this.platform, this.roomId);
+    const headers = this.buildHttpHeaders(
+      streamUrl,
+      this.platform,
+      this.roomId
+    );
     const metadataComment = this.buildMetadataComment(
       requestedQuality,
       effectiveQuality
@@ -438,13 +442,19 @@ export class FFmpegService extends EventEmitter {
     if (platform === 'douyu' && roomId) {
       return `https://www.douyu.com/${roomId}`;
     }
+    if (platform === 'douyin' && roomId) {
+      return `https://live.douyin.com/${roomId}`;
+    }
     if (/bilivideo\.com/i.test(streamUrl)) {
       return 'https://live.bilibili.com/';
     }
     return undefined;
   }
 
-  private buildOrigin(streamUrl: string, platform?: Platform): string | undefined {
+  private buildOrigin(
+    streamUrl: string,
+    platform?: Platform
+  ): string | undefined {
     if (platform === 'bilibili' || /bilivideo\.com/i.test(streamUrl)) {
       return 'https://live.bilibili.com';
     }
@@ -453,6 +463,9 @@ export class FFmpegService extends EventEmitter {
     }
     if (platform === 'douyu') {
       return 'https://www.douyu.com';
+    }
+    if (platform === 'douyin') {
+      return 'https://live.douyin.com';
     }
     return undefined;
   }

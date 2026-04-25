@@ -17,6 +17,7 @@ import {
 } from '../interface';
 import { BilibiliAdapter } from '../platform/bilibili';
 import { DouyuAdapter } from '../platform/douyu';
+import { DouyinAdapter } from '../platform/douyin';
 import { HuyaAdapter } from '../platform/huya';
 
 /**
@@ -34,6 +35,7 @@ export class PlatformService {
   private adapters = new Map<Platform, new (logger: any) => PlatformAdapter>([
     ['bilibili', BilibiliAdapter],
     ['douyu', DouyuAdapter],
+    ['douyin', DouyinAdapter],
     ['huya', HuyaAdapter],
   ]);
 

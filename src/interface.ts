@@ -1,4 +1,4 @@
-export type Platform = 'bilibili' | 'huya' | 'douyu';
+export type Platform = 'bilibili' | 'huya' | 'douyu' | 'douyin';
 export type RecordingQuality = 'low' | 'medium' | 'high';
 
 export interface StreamerInfo {
@@ -18,11 +18,28 @@ export interface StreamerInfo {
   };
   uploadSettings?: {
     autoUpload?: boolean;
+    rhythm?: SubmissionRhythmSettings;
     title?: string;
     description?: string;
     tags?: string[];
-    tid?: number;
+    humanType2?: number;
+    collection?: BilibiliCollectionBinding;
   };
+}
+
+export type SubmissionRhythmMode = 'complete' | 'segmented';
+
+export interface SubmissionRhythmSettings {
+  mode?: SubmissionRhythmMode;
+  intervalMinutes?: number;
+}
+
+export interface BilibiliCollectionBinding {
+  autoAdd?: boolean;
+  seasonId?: number | null;
+  sectionId?: number | null;
+  seasonTitle?: string | null;
+  sectionTitle?: string | null;
 }
 
 export interface StreamStatus {
@@ -170,7 +187,7 @@ export interface UploadActivityInput {
   description: string;
   platform: Platform;
   tags?: string[];
-  tid?: number;
+  humanType2?: number;
   videoType?: 'full' | 'highlight';
 }
 

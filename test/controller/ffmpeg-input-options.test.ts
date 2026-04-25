@@ -40,4 +40,17 @@ describe('FFmpeg input option selection', () => {
     expect(options).not.toContain('-reconnect_streamed');
     expect(options).not.toContain('-multiple_requests');
   });
+
+  it('adds anti-leech headers for douyin streams', () => {
+    const service = new FFmpegService() as any;
+
+    const headers = service.buildHttpHeaders(
+      'https://pull-flv-l6.douyincdn.com/stage/live.flv',
+      'douyin',
+      '742000000000'
+    );
+
+    expect(headers).toContain('Referer: https://live.douyin.com/742000000000');
+    expect(headers).toContain('Origin: https://live.douyin.com');
+  });
 });

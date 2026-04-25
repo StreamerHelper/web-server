@@ -492,7 +492,9 @@ export class Recording extends EventEmitter {
       uploadSummary,
     });
 
-    if (this.shouldLogAbnormalRecorderExit(reason, finalStatus, uploadSummary)) {
+    if (
+      this.shouldLogAbnormalRecorderExit(reason, finalStatus, uploadSummary)
+    ) {
       this.logAbnormalRecorderExit(reason, finalStatus, uploadSummary);
     }
 
@@ -873,6 +875,14 @@ export class Recording extends EventEmitter {
    * 启动弹幕录制
    */
   private async startDanmaku(): Promise<void> {
+    if (!this.danmakuUrl) {
+      this.logger.debug('Danmaku recording skipped: no danmaku URL', {
+        id: this.id,
+        platform: this.platform,
+      });
+      return;
+    }
+
     try {
       this.danmakuService = await this.danmakuManager.start(this.danmakuUrl, {
         id: this.id,

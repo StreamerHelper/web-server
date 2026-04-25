@@ -1,4 +1,11 @@
-import { Inject, Provide, Scope, ScopeEnum, Logger, ILogger } from '@midwayjs/core';
+import {
+  Inject,
+  Provide,
+  Scope,
+  ScopeEnum,
+  Logger,
+  ILogger,
+} from '@midwayjs/core';
 import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { Repository } from 'typeorm';
@@ -141,8 +148,11 @@ export class StreamerService {
     streamer: Pick<Streamer, 'id' | 'streamerId'>,
     coverDataUrl: string
   ): Promise<string> {
-    const { buffer, mimeType, extension } = this.parseCoverDataUrl(coverDataUrl);
-    const key = `streamers/${streamer.id || streamer.streamerId}/cover/${Date.now()}-${nanoid(10)}.${extension}`;
+    const { buffer, mimeType, extension } =
+      this.parseCoverDataUrl(coverDataUrl);
+    const key = `streamers/${
+      streamer.id || streamer.streamerId
+    }/cover/${Date.now()}-${nanoid(10)}.${extension}`;
     await this.storageService.upload(key, buffer, mimeType);
     return key;
   }
@@ -211,13 +221,14 @@ export class StreamerService {
     active: number;
     byPlatform: Record<Platform, number>;
   }> {
-    const [total, active, bilibiliCount, douyuCount, huyaCount] =
+    const [total, active, bilibiliCount, douyuCount, huyaCount, douyinCount] =
       await Promise.all([
         this.streamerModel.count(),
         this.streamerModel.count({ where: { isActive: true } }),
         this.streamerModel.count({ where: { platform: 'bilibili' } }),
         this.streamerModel.count({ where: { platform: 'douyu' } }),
         this.streamerModel.count({ where: { platform: 'huya' } }),
+        this.streamerModel.count({ where: { platform: 'douyin' } }),
       ]);
 
     return {
@@ -227,6 +238,7 @@ export class StreamerService {
         bilibili: bilibiliCount,
         douyu: douyuCount,
         huya: huyaCount,
+        douyin: douyinCount,
       },
     };
   }

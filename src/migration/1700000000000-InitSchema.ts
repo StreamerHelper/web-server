@@ -19,7 +19,7 @@ export class InitSchema1700000000000 implements MigrationInterface {
 
     // 创建枚举类型
     await queryRunner.query(`
-      CREATE TYPE "platform_enum" AS ENUM ('bilibili', 'huya', 'douyu');
+      CREATE TYPE "platform_enum" AS ENUM ('bilibili', 'huya', 'douyu', 'douyin');
     `);
 
     await queryRunner.query(`
@@ -112,6 +112,7 @@ export class InitSchema1700000000000 implements MigrationInterface {
         "description" VARCHAR(2000),
         "tags" TEXT[],
         "tid" INTEGER DEFAULT 171,
+        "human_type2" INTEGER DEFAULT 2066,
         "cover" VARCHAR(500),
         "copyright" INTEGER DEFAULT 2,
         "source" VARCHAR(500),
@@ -120,9 +121,16 @@ export class InitSchema1700000000000 implements MigrationInterface {
         "parts" JSONB NOT NULL DEFAULT '[]',
         "total_parts" INTEGER DEFAULT 0,
         "completed_parts" INTEGER DEFAULT 0,
-        "bvid" VARCHAR(20),
-        "avid" BIGINT,
-        "last_error" VARCHAR(2000),
+	        "bvid" VARCHAR(20),
+	        "avid" BIGINT,
+	        "collection_auto_add" BOOLEAN DEFAULT false,
+	        "collection_season_id" BIGINT,
+	        "collection_section_id" BIGINT,
+	        "collection_season_title" VARCHAR(255),
+	        "collection_section_title" VARCHAR(255),
+	        "collection_episode_id" BIGINT,
+	        "collection_added_at" TIMESTAMPTZ,
+	        "last_error" VARCHAR(2000),
         "created_at" TIMESTAMPTZ DEFAULT NOW(),
         "updated_at" TIMESTAMPTZ DEFAULT NOW()
       );

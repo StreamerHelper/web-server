@@ -5,7 +5,7 @@ describe('SubmissionTemplateService', () => {
     const service = new SubmissionTemplateService() as any;
     service.submissionConfig = {
       defaultTid: 171,
-      defaultTitleTemplate: '{streamerName}的直播录像 {date}',
+      defaultTitleTemplate: '{主播名}的直播录像 {日期}',
     };
     service.logger = {
       warn: jest.fn(),
@@ -13,16 +13,17 @@ describe('SubmissionTemplateService', () => {
     return service as any;
   };
 
-  it('renders canonical placeholders and legacy aliases', () => {
+  it('renders Chinese placeholders', () => {
     const service = createService();
 
-    const title = service.resolveTitle('{{name}} {date} {time}', {
+    const title = service.resolveTitle('{主播名} {房间名} {日期} {时间}', {
       streamerName: '主播A',
+      roomName: '录制时房间名',
       startedAt: '2026-04-18T12:34:00+08:00',
     });
 
     expect(title).toContain('主播A');
-    expect(title).toMatch(/^主播A \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(title).toMatch(/^主播A 录制时房间名 \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
     expect(title).not.toContain('{');
   });
 

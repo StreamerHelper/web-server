@@ -15,9 +15,14 @@ import {
 } from '../service/bilibili-upload.service';
 import { JobService } from '../service/job.service';
 import { BilibiliPartitionService } from '../service/bilibili-partition.service';
+import {
+  BilibiliSeasonService,
+  CreateBilibiliSeasonInput,
+} from '../service/bilibili-season.service';
 import { SubmissionTemplateService } from '../service/submission-template.service';
 import { StreamerService } from '../service/streamer.service';
 import { buildPlatformRoomUrl } from '../utils/platform-room-url';
+import { BilibiliCollectionBinding } from '../interface';
 
 @Controller('/api/bilibili')
 export class BilibiliController {
@@ -47,6 +52,9 @@ export class BilibiliController {
 
   @Inject()
   bilibiliPartitionService: BilibiliPartitionService;
+
+  @Inject()
+  bilibiliSeasonService: BilibiliSeasonService;
 
   @Inject()
   bullFramework: Framework;
@@ -226,11 +234,12 @@ export class BilibiliController {
       title: string;
       description?: string;
       tags?: string[];
-      tid?: number;
+      humanType2?: number;
       cover?: string;
       source?: string;
       jobId?: string;
       streamerId?: string;
+      collection?: BilibiliCollectionBinding;
     }
   ) {
     try {
@@ -251,15 +260,18 @@ export class BilibiliController {
         body.title || uploadSettings.title,
         {
           streamerName: job?.streamerName || streamer?.name,
+          roomName: job?.roomName,
           startedAt: job?.startTime || job?.createdAt || Date.now(),
         }
       );
       const description = body.description ?? uploadSettings.description ?? '';
       const tags = body.tags ?? uploadSettings.tags ?? [];
-      const tid = this.submissionTemplateService.resolveTid(
-        body.tid ?? uploadSettings.tid
+      const tid = this.submissionTemplateService.resolveTid(undefined);
+      const humanType2 = this.bilibiliPartitionService.resolveHumanType2(
+        body.humanType2 ?? uploadSettings.humanType2
       );
-      const cover = body.cover ?? job?.coverPath ?? streamer?.coverPath ?? undefined;
+      const cover =
+        body.cover ?? job?.coverPath ?? streamer?.coverPath ?? undefined;
       const source =
         body.source?.trim() ||
         buildPlatformRoomUrl(job?.platform, job?.roomId) ||
@@ -279,6 +291,7 @@ export class BilibiliController {
         description,
         tags,
         tid,
+        humanType2,
         cover,
         copyright: 2,
         source,
@@ -288,11 +301,23 @@ export class BilibiliController {
         [videoPart],
         options
       );
+      const collection = this.resolveCollectionBinding(
+        body.collection ?? uploadSettings.collection
+      );
+      let collectionResult = null;
+      if (collection.autoAdd && collection.sectionId) {
+        collectionResult = await this.bilibiliSeasonService.addVideoToSeason({
+          aid: result.avid,
+          sectionId: collection.sectionId,
+          title,
+        });
+      }
 
       return {
         bvid: result.bvid,
         avid: result.avid,
         url: `https://www.bilibili.com/video/${result.bvid}`,
+        collection: collectionResult,
       };
     } catch (error) {
       this.ctx.logger.error('Failed to upload video', {
@@ -306,12 +331,98 @@ export class BilibiliController {
   }
 
   /**
+   * GET /api/bilibili/seasons - 获取当前 B站账号的合集列表
+   */
+  @Get('/seasons')
+  async listSeasons(
+    @Query()
+    query: {
+      pn?: number;
+      ps?: number;
+      refresh?: string | number | boolean;
+    }
+  ) {
+    try {
+      this.ctx.set('Cache-Control', 'no-store');
+      const result = await this.bilibiliSeasonService.listSeasons({
+        pn: query.pn ? parseInt(String(query.pn)) : 1,
+        ps: query.ps ? parseInt(String(query.ps)) : 50,
+        forceRefresh:
+          query.refresh === true ||
+          query.refresh === 1 ||
+          query.refresh === '1' ||
+          query.refresh === 'true',
+      });
+      return result;
+    } catch (error) {
+      this.ctx.logger.error('Failed to get bilibili seasons', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.ctx.status = 500;
+      return {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to get bilibili seasons',
+      };
+    }
+  }
+
+  /**
+   * POST /api/bilibili/seasons - 创建 B站合集
+   */
+  @Post('/seasons')
+  async createSeason(@Body() body: CreateBilibiliSeasonInput) {
+    try {
+      const season = await this.bilibiliSeasonService.createSeason(body);
+      return { season };
+    } catch (error) {
+      this.ctx.logger.error('Failed to create bilibili season', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.ctx.status = 500;
+      return {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to create bilibili season',
+      };
+    }
+  }
+
+  private resolveCollectionBinding(collection?: BilibiliCollectionBinding): {
+    autoAdd: boolean;
+    seasonId: number | null;
+    sectionId: number | null;
+  } {
+    const seasonId = Number(collection?.seasonId || 0);
+    const sectionId = Number(collection?.sectionId || 0);
+    const autoAdd = Boolean(
+      collection?.autoAdd &&
+        Number.isFinite(seasonId) &&
+        seasonId > 0 &&
+        Number.isFinite(sectionId) &&
+        sectionId > 0
+    );
+
+    return {
+      autoAdd,
+      seasonId: autoAdd ? seasonId : null,
+      sectionId: autoAdd ? sectionId : null,
+    };
+  }
+
+  /**
    * GET /api/bilibili/upload/partitions - 获取分区列表
    */
   @Get('/upload/partitions')
-  async getPartitions() {
+  async getPartitions(@Query('refresh') refresh?: string) {
     try {
-      const partitions = await this.bilibiliPartitionService.listPartitions();
+      this.ctx.set('Cache-Control', 'no-store');
+      const forceRefresh = refresh === '1' || refresh === 'true';
+      const partitions = await this.bilibiliPartitionService.listPartitions({
+        forceRefresh,
+      });
       return { partitions };
     } catch (error) {
       this.ctx.logger.error('Failed to get bilibili partitions', {
