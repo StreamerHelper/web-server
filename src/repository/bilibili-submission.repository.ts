@@ -38,6 +38,17 @@ export class BilibiliSubmissionRepository {
     return this.repo.find({ where: { jobId }, order: { createdAt: 'DESC' } });
   }
 
+  async findByJobIds(jobIds: string[]): Promise<BilibiliSubmissionEntity[]> {
+    if (jobIds.length === 0) {
+      return [];
+    }
+
+    return this.repo.find({
+      where: { jobId: In(jobIds) },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
   /**
    * 获取待处理的投稿（用于断点续传）
    */

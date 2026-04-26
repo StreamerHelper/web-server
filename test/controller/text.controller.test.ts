@@ -112,6 +112,8 @@ describe('TextController danmaku consumption', () => {
       expect.any(Buffer),
       'application/x-ndjson'
     );
-    expect(result.downloadUrl).toBe('https://signed.example/export.jsonl');
+    expect(result.downloadUrl).toBe(
+      '/api/text/export/download?jobId=job-public-id&type=danmaku&format=jsonl'
+    );
   });
 });

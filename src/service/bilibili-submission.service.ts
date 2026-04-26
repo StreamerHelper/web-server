@@ -40,6 +40,12 @@ const PART_DURATION_SECONDS = 3600;
 const SEGMENT_DURATION_SECONDS = 10;
 const BILIBILI_COPYRIGHT_REPRINT = 2;
 
+interface MergedPartFile {
+  filePath: string;
+  duration: number;
+  fileSize: number;
+}
+
 /**
  * 创建投稿的输入参数
  */
@@ -339,17 +345,22 @@ export class BilibiliSubmissionService {
           );
 
           // 1. 下载并合并分片
-          const mergedFilePath = await this.downloadAndMergeSegments(
+          const mergedPart = await this.downloadAndMergeSegments(
             part.s3Keys,
             tempDir,
             part.index
           );
+          const mergedFilePath = mergedPart.filePath;
 
           // 更新分P状态为上传中
           await this.submissionRepository.updatePartStatus(
             submissionId,
             part.index,
-            PartStatus.UPLOADING
+            PartStatus.UPLOADING,
+            {
+              duration: mergedPart.duration,
+              size: mergedPart.fileSize,
+            }
           );
 
           // 2. 上传到B站
@@ -357,8 +368,8 @@ export class BilibiliSubmissionService {
             title: partTitle,
             filename: path.basename(mergedFilePath),
             s3Key: '', // 本地文件，不需要 S3 key
-            duration: 0,
-            size: 0,
+            duration: mergedPart.duration,
+            size: mergedPart.fileSize,
           };
 
           const uploadedPart = await this.uploadService.uploadPartFromLocal(
@@ -375,6 +386,8 @@ export class BilibiliSubmissionService {
               filename: uploadedPart.filename,
               cid: uploadedPart.cid,
               title: partTitle,
+              duration: mergedPart.duration,
+              size: mergedPart.fileSize,
             }
           );
 
@@ -608,7 +621,7 @@ export class BilibiliSubmissionService {
     s3Keys: string[],
     tempDir: string,
     partIndex: number
-  ): Promise<string> {
+  ): Promise<MergedPartFile> {
     const segmentFiles: string[] = [];
 
     // 下载所有分片
@@ -632,12 +645,16 @@ export class BilibiliSubmissionService {
       outputPath,
     });
 
-    await this.mergeSegments(segmentFiles, outputPath);
+    const mergeResult = await this.mergeSegments(segmentFiles, outputPath);
 
     // 清理分片文件
     await Promise.all(segmentFiles.map(f => fs.unlink(f).catch(() => {})));
 
-    return outputPath;
+    return {
+      filePath: outputPath,
+      duration: mergeResult.duration,
+      fileSize: mergeResult.fileSize,
+    };
   }
 
   /**

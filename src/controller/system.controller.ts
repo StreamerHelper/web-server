@@ -63,6 +63,7 @@ export class SystemController {
       const transcodeQueue = this.bullFramework.getQueue('transcode');
       const analyzeQueue = this.bullFramework.getQueue('analyze');
       const cleanupQueue = this.bullFramework.getQueue('cleanup');
+      const storageDeleteQueue = this.bullFramework.getQueue('storage-delete');
 
       const queueStats = {
         recording: {
@@ -80,6 +81,10 @@ export class SystemController {
         cleanup: {
           waiting: (await cleanupQueue?.getWaitingCount()) || 0,
           active: (await cleanupQueue?.getActiveCount()) || 0,
+        },
+        storageDelete: {
+          waiting: (await storageDeleteQueue?.getWaitingCount()) || 0,
+          active: (await storageDeleteQueue?.getActiveCount()) || 0,
         },
       };
 

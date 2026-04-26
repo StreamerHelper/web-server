@@ -8,6 +8,7 @@ import {
 } from 'typeorm';
 import {
   BilibiliCollectionBinding,
+  RecordingAutoDeleteSettings,
   RecordingQuality,
   SubmissionRhythmSettings,
   StreamerInfo,
@@ -48,6 +49,7 @@ export class Streamer {
   recordSettings: {
     quality?: RecordingQuality;
     detectHighlights?: boolean;
+    autoDelete?: RecordingAutoDeleteSettings;
   };
 
   @Column({ name: 'uploadSettings', type: 'jsonb', nullable: true })

@@ -359,7 +359,11 @@ describe('BilibiliSubmissionService title handling', () => {
     });
     service.downloadAndMergeSegments = jest
       .fn()
-      .mockResolvedValue('/tmp/part_2.mkv');
+      .mockResolvedValue({
+        filePath: '/tmp/part_2.mkv',
+        duration: 1800000,
+        fileSize: 512000000,
+      });
     service.uploadService.uploadPartFromLocal.mockResolvedValue({
       filename: 'new-file',
       cid: 1002,
@@ -395,6 +399,15 @@ describe('BilibiliSubmissionService title handling', () => {
       'submission-append',
       'BV1xx411c7mD',
       123456
+    );
+    expect(service.submissionRepository.updatePartStatus).toHaveBeenCalledWith(
+      'submission-append',
+      2,
+      PartStatus.COMPLETED,
+      expect.objectContaining({
+        duration: 1800000,
+        size: 512000000,
+      })
     );
   });
 

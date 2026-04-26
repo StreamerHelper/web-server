@@ -1,6 +1,11 @@
 export type Platform = 'bilibili' | 'huya' | 'douyu' | 'douyin';
 export type RecordingQuality = 'low' | 'medium' | 'high';
 
+export interface RecordingAutoDeleteSettings {
+  enabled?: boolean;
+  delayMinutes?: number;
+}
+
 export interface StreamerInfo {
   id: string;
   streamerId: string;
@@ -15,6 +20,7 @@ export interface StreamerInfo {
   recordSettings?: {
     quality?: RecordingQuality;
     detectHighlights?: boolean;
+    autoDelete?: RecordingAutoDeleteSettings;
   };
   uploadSettings?: {
     autoUpload?: boolean;
@@ -53,6 +59,20 @@ export interface StreamStatus {
 
 export type JobStatus = (typeof JOB_STATUS)[keyof typeof JOB_STATUS];
 
+export interface JobSubmissionSummary {
+  id: string;
+  jobId: string;
+  title: string;
+  status: 'pending' | 'uploading' | 'submitting' | 'completed' | 'failed';
+  bvid?: string | null;
+  avid?: number | null;
+  totalParts: number;
+  completedParts: number;
+  lastError?: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export enum JOB_STATUS {
   PENDING = 'pending',
   RECORDING = 'recording',
@@ -70,6 +90,13 @@ export interface JobMetadata {
   effectiveQuality?: RecordingQuality;
   qualityApplied?: boolean;
   qualityNote?: string;
+  autoDelete?: RecordingAutoDeleteSettings;
+  storageDeleteScheduledAt?: string;
+  storageDeleteDelayMinutes?: number;
+  storageDeleted?: boolean;
+  storageDeletedAt?: string;
+  storageDeletedKeys?: string[];
+  storageDeleteReason?: string;
   ffmpegRequestedQuality?: RecordingQuality;
   resolution?: string;
   bitrate?: number;
@@ -405,6 +432,11 @@ export interface AnalyzeJobData {
 export interface CleanupJobData {
   id: string; // 内部 UUID，用于数据库操作
   localPath: string; // 本地临时目录路径
+}
+
+export interface StorageDeleteJobData {
+  id: string; // 内部 UUID，用于数据库操作
+  reason?: 'manual' | 'scheduled';
 }
 
 export interface UploadJobData {

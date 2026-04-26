@@ -218,4 +218,142 @@ describe('JobService browse cover data', () => {
       }),
     ]);
   });
+
+  it('attaches B站 submission summaries to jobs by public jobId', async () => {
+    const service = new JobService() as any;
+    const jobs = [
+      {
+        id: 'job-db-1',
+        jobId: 'job-public-1',
+      },
+      {
+        id: 'job-db-2',
+        jobId: 'job-public-2',
+      },
+    ];
+    const createdAt = new Date('2026-04-18T10:00:00+08:00');
+    const updatedAt = new Date('2026-04-18T10:30:00+08:00');
+
+    service.bilibiliSubmissionRepository = {
+      findByJobIds: jest.fn().mockResolvedValue([
+        {
+          id: 'submission-1',
+          jobId: 'job-public-1',
+          title: '主播A的直播录像',
+          status: 'completed',
+          bvid: 'BV1xx411c7mD',
+          avid: 123,
+          totalParts: 2,
+          completedParts: 2,
+          lastError: null,
+          createdAt,
+          updatedAt,
+        },
+      ]),
+    };
+
+    const result = await service.attachSubmissionSummaries(jobs as any);
+
+    expect(service.bilibiliSubmissionRepository.findByJobIds).toHaveBeenCalledWith(
+      ['job-public-1', 'job-public-2']
+    );
+    expect(result[0].submissions).toEqual([
+      expect.objectContaining({
+        id: 'submission-1',
+        jobId: 'job-public-1',
+        title: '主播A的直播录像',
+        status: 'completed',
+        bvid: 'BV1xx411c7mD',
+        totalParts: 2,
+        completedParts: 2,
+      }),
+    ]);
+    expect(result[1].submissions).toEqual([]);
+  });
+
+  it('deletes all job-scoped storage objects without touching streamer assets', async () => {
+    const service = new JobService() as any;
+    const job = {
+      id: 'job-db-id',
+      jobId: 'job-public-id',
+      videoPath: 'processed/job-db-id/full.mp4',
+      danmakuPath: null,
+      coverPath: 'streamers/streamer-1/cover/current.jpg',
+      metadata: {
+        stream_url: 'https://example.com/live.flv',
+        uploadedSegments: ['raw/job-db-id/video/segment_001.mkv'],
+        uploadedDanmakuSegments: ['danmaku/job-db-id/segment_001.jsonl'],
+        danmakuIndex: {
+          segments: [
+            {
+              s3Key: 'danmaku/job-db-id/segment_002.jsonl',
+            },
+          ],
+          files: {
+            ass: 'danmaku/job-db-id/export.ass',
+          },
+        },
+        transcriptIndex: {
+          segments: [
+            {
+              s3Key: 'transcript/job-db-id/segment_001.jsonl',
+            },
+          ],
+        },
+      },
+    };
+    const listedObjects: Record<string, string[]> = {
+      'merged/job-db-id/': ['merged/job-db-id/clip.mkv'],
+      'jobs/job-public-id/': ['jobs/job-public-id/cover/snapshot.jpg'],
+    };
+
+    service.jobModel = {
+      findOne: jest.fn().mockResolvedValue(job),
+      update: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn().mockResolvedValue(undefined),
+    };
+    service.storageService = {
+      list: jest
+        .fn()
+        .mockImplementation((prefix: string) =>
+          Promise.resolve(listedObjects[prefix] || [])
+        ),
+      deleteMultiple: jest.fn().mockResolvedValue(undefined),
+    };
+    service.logger = {
+      info: jest.fn(),
+    };
+
+    const result = await service.deleteJobStorage('job-db-id', 'manual');
+    const deletedKeys = service.storageService.deleteMultiple.mock.calls.flatMap(
+      (call: [string[]]) => call[0]
+    );
+
+    expect(result.deletedKeys).toEqual(deletedKeys);
+    expect(deletedKeys).toEqual(
+      expect.arrayContaining([
+        'processed/job-db-id/full.mp4',
+        'raw/job-db-id/video/segment_001.mkv',
+        'danmaku/job-db-id/segment_001.jsonl',
+        'danmaku/job-db-id/segment_002.jsonl',
+        'danmaku/job-db-id/export.ass',
+        'transcript/job-db-id/segment_001.jsonl',
+        'merged/job-db-id/clip.mkv',
+        'jobs/job-public-id/cover/snapshot.jpg',
+      ])
+    );
+    expect(deletedKeys).not.toContain('streamers/streamer-1/cover/current.jpg');
+    expect(deletedKeys).not.toContain('https://example.com/live.flv');
+    expect(service.jobModel.update).toHaveBeenCalledWith(
+      { id: 'job-db-id' },
+      { videoPath: null, danmakuPath: null }
+    );
+    expect(service.jobModel.query).toHaveBeenCalledWith(
+      expect.stringContaining('SET metadata'),
+      [
+        'job-db-id',
+        expect.stringContaining('"storageDeleted":true'),
+      ]
+    );
+  });
 });

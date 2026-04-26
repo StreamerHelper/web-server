@@ -18,6 +18,10 @@ import { RecorderManager } from '../service/recorder.manager';
 import { StorageService } from '../service/storage.service';
 import { StreamerService } from '../service/streamer.service';
 import { VideoMergeService } from '../service/video-merge.service';
+import {
+  normalizeAutoDeleteSettings,
+  resolveRecordingQuality,
+} from '../utils/record-settings';
 
 @Controller('/api/jobs')
 export class JobController {
@@ -69,7 +73,9 @@ export class JobController {
     try {
       // 如果传入 id，返回单个任务
       if (id) {
-        const job = await this.jobService.findById(id);
+        const job = await this.jobService.attachSubmissionSummary(
+          await this.jobService.findById(id)
+        );
         if (!job) {
           this.ctx.status = 404;
           return { error: 'Job not found' };
@@ -106,7 +112,7 @@ export class JobController {
       }
 
       return {
-        jobs: result.jobs,
+        jobs: await this.jobService.attachSubmissionSummaries(result.jobs),
         total: result.total,
         limit,
         offset,
@@ -204,7 +210,7 @@ export class JobController {
         return { error: 'Job not found' };
       }
 
-      return job;
+      return await this.jobService.attachSubmissionSummary(job);
     } catch (error) {
       this.ctx.logger.error('Failed to get job', {
         error: error instanceof Error ? error.message : String(error),
@@ -508,11 +514,12 @@ export class JobController {
         return { error: 'Streamer not found' };
       }
 
-      const requestedQuality = streamer.recordSettings?.quality as
-        | 'low'
-        | 'medium'
-        | 'high'
-        | undefined;
+      const requestedQuality = resolveRecordingQuality(
+        streamer.recordSettings?.quality
+      );
+      const autoDelete = normalizeAutoDeleteSettings(
+        streamer.recordSettings?.autoDelete
+      );
       const resolvedStream = await this.platformService.resolveStream(
         platform,
         streamerId,
@@ -540,6 +547,7 @@ export class JobController {
           effectiveQuality: resolvedStream.effectiveQuality,
           qualityApplied: resolvedStream.qualityApplied,
           qualityNote: resolvedStream.note,
+          autoDelete,
         },
       });
 
@@ -647,9 +655,14 @@ export class JobController {
         return { error: 'Cannot delete active job' };
       }
 
+      const deleteResult = await this.jobService.deleteJobStorage(id, 'manual');
       await this.jobService.cancel(id);
 
-      return { success: true, message: 'Job deleted' };
+      return {
+        success: true,
+        message: 'Job deleted',
+        deletedKeys: deleteResult.deletedKeys.length,
+      };
     } catch (error) {
       this.ctx.logger.error('Failed to delete job', {
         error: error instanceof Error ? error.message : String(error),
@@ -706,11 +719,12 @@ export class JobController {
       const streamer = await this.streamerService.findByStreamerId(
         oldJob.streamerId
       );
-      const requestedQuality = streamer?.recordSettings?.quality as
-        | 'low'
-        | 'medium'
-        | 'high'
-        | undefined;
+      const requestedQuality = resolveRecordingQuality(
+        streamer?.recordSettings?.quality
+      );
+      const autoDelete = normalizeAutoDeleteSettings(
+        streamer?.recordSettings?.autoDelete
+      );
       const resolvedStream = await this.platformService.resolveStream(
         oldJob.platform as Platform,
         oldJob.streamerId,
@@ -738,6 +752,7 @@ export class JobController {
           effectiveQuality: resolvedStream.effectiveQuality,
           qualityApplied: resolvedStream.qualityApplied,
           qualityNote: resolvedStream.note,
+          autoDelete,
         },
       });
 

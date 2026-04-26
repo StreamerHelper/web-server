@@ -22,6 +22,7 @@ import {
   RecordingInputOptions,
 } from './recording';
 import { StreamerService } from './streamer.service';
+import { normalizeAutoDeleteSettings } from '../utils/record-settings';
 
 /**
  * 录制管理器（单例）
@@ -158,6 +159,7 @@ export class RecorderManager {
 
       // 触发自动投稿
       await this.triggerAutoSubmission(options, data);
+      await this.scheduleStorageDeletion(options.id, options.jobId);
     });
 
     void recording.start();
@@ -394,6 +396,59 @@ export class RecorderManager {
     } catch (error) {
       this.logger.error('Failed to trigger auto submission', {
         jobId: options.jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async scheduleStorageDeletion(
+    id: string,
+    jobId: string
+  ): Promise<void> {
+    try {
+      const job = await this.jobService.findById(id);
+      const autoDelete = normalizeAutoDeleteSettings(
+        job?.metadata?.autoDelete
+      );
+
+      if (!job || !autoDelete?.enabled || job.metadata?.storageDeleted) {
+        return;
+      }
+
+      const queue = this.bullFramework.getQueue('storage-delete');
+      if (!queue) {
+        this.logger.warn('Storage delete queue not found', { id, jobId });
+        return;
+      }
+
+      const delayMs = autoDelete.delayMinutes! * 60 * 1000;
+      const scheduledAt = new Date(Date.now() + delayMs).toISOString();
+
+      await queue.addJobToQueue(
+        {
+          id,
+          reason: 'scheduled',
+        },
+        {
+          delay: delayMs,
+        }
+      );
+      await this.jobService.updateMetadata(id, {
+        autoDelete,
+        storageDeleteScheduledAt: scheduledAt,
+        storageDeleteDelayMinutes: autoDelete.delayMinutes,
+      });
+
+      this.logger.info('Storage delete scheduled', {
+        id,
+        jobId,
+        delayMinutes: autoDelete.delayMinutes,
+        scheduledAt,
+      });
+    } catch (error) {
+      this.logger.error('Failed to schedule storage delete', {
+        id,
+        jobId,
         error: error instanceof Error ? error.message : String(error),
       });
     }

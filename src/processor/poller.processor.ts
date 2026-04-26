@@ -6,6 +6,10 @@ import { JobService } from '../service/job.service';
 import { PlatformService } from '../service/platform.service';
 import { RecorderManager } from '../service/recorder.manager';
 import { StreamerService } from '../service/streamer.service';
+import {
+  normalizeAutoDeleteSettings,
+  resolveRecordingQuality,
+} from '../utils/record-settings';
 
 /**
  * 主播状态轮询任务
@@ -118,11 +122,12 @@ export class PollerProcessor implements IProcessor {
         viewerCount: status.viewerCount,
       });
 
-      const requestedQuality = streamer.recordSettings?.quality as
-        | 'low'
-        | 'medium'
-        | 'high'
-        | undefined;
+      const requestedQuality = resolveRecordingQuality(
+        streamer.recordSettings?.quality
+      );
+      const autoDelete = normalizeAutoDeleteSettings(
+        streamer.recordSettings?.autoDelete
+      );
       const resolvedStream = await this.platformService.resolveStream(
         platform,
         streamerId,
@@ -150,6 +155,7 @@ export class PollerProcessor implements IProcessor {
           effectiveQuality: resolvedStream.effectiveQuality,
           qualityApplied: resolvedStream.qualityApplied,
           qualityNote: resolvedStream.note,
+          autoDelete,
         },
       });
 

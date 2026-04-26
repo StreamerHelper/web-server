@@ -10,10 +10,16 @@ import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { In, LessThan, Repository } from 'typeorm';
 import { Job, Streamer } from '../entity';
-import { Highlight, JOB_STATUS, JobStatus } from '../interface';
+import { Highlight, JOB_STATUS, JobStatus, JobSubmissionSummary } from '../interface';
+import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
 import { StorageService } from './storage.service';
 import { SubmissionTemplateService } from './submission-template.service';
 import dayjs = require('dayjs');
+
+export interface JobStorageDeletionResult {
+  jobId: string;
+  deletedKeys: string[];
+}
 
 @Provide()
 @Scope(ScopeEnum.Singleton)
@@ -37,6 +43,9 @@ export class JobService {
 
   @Inject()
   submissionTemplateService: SubmissionTemplateService;
+
+  @Inject()
+  bilibiliSubmissionRepository: BilibiliSubmissionRepository;
 
   @Logger()
   private logger: ILogger;
@@ -364,6 +373,102 @@ export class JobService {
     );
   }
 
+  async attachSubmissionSummaries<T extends Job>(
+    jobs: T[]
+  ): Promise<Array<T & { submissions: JobSubmissionSummary[] }>> {
+    if (jobs.length === 0) {
+      return [];
+    }
+
+    const jobIds = Array.from(new Set(jobs.map(job => job.jobId).filter(Boolean)));
+    const submissions = this.bilibiliSubmissionRepository?.findByJobIds
+      ? await this.bilibiliSubmissionRepository.findByJobIds(jobIds)
+      : [];
+    const submissionsByJobId = new Map<string, JobSubmissionSummary[]>();
+
+    for (const submission of submissions) {
+      const summary: JobSubmissionSummary = {
+        id: submission.id,
+        jobId: submission.jobId,
+        title: submission.title,
+        status: submission.status,
+        bvid: submission.bvid,
+        avid: submission.avid,
+        totalParts: submission.totalParts,
+        completedParts: submission.completedParts,
+        lastError: submission.lastError,
+        createdAt: submission.createdAt,
+        updatedAt: submission.updatedAt,
+      };
+
+      const items = submissionsByJobId.get(submission.jobId) || [];
+      items.push(summary);
+      submissionsByJobId.set(submission.jobId, items);
+    }
+
+    return jobs.map(job =>
+      Object.assign(job, {
+        submissions: submissionsByJobId.get(job.jobId) || [],
+      })
+    );
+  }
+
+  async attachSubmissionSummary<T extends Job>(
+    job: T | null
+  ): Promise<(T & { submissions: JobSubmissionSummary[] }) | null> {
+    if (!job) {
+      return null;
+    }
+
+    const [result] = await this.attachSubmissionSummaries([job]);
+    return result;
+  }
+
+  async deleteJobStorage(
+    id: string,
+    reason: 'manual' | 'scheduled' = 'manual'
+  ): Promise<JobStorageDeletionResult> {
+    const job = await this.findById(id);
+    if (!job) {
+      throw new Error('Job not found');
+    }
+
+    const keys = await this.collectJobStorageKeys(job);
+    const deletedKeys: string[] = [];
+
+    for (let i = 0; i < keys.length; i += 50) {
+      const batch = keys.slice(i, i + 50);
+      await this.storageService.deleteMultiple(batch);
+      deletedKeys.push(...batch);
+    }
+
+    await this.jobModel.update(
+      { id },
+      {
+        videoPath: null,
+        danmakuPath: null,
+      } as any
+    );
+    await this.updateMetadata(id, {
+      storageDeleted: true,
+      storageDeletedAt: new Date().toISOString(),
+      storageDeletedKeys: deletedKeys,
+      storageDeleteReason: reason,
+    });
+
+    this.logger.info('Job storage deleted', {
+      id,
+      jobId: job.jobId,
+      reason,
+      deletedKeys: deletedKeys.length,
+    });
+
+    return {
+      jobId: job.jobId,
+      deletedKeys,
+    };
+  }
+
   private async appendMetadataArrayValue(
     id: string,
     field: string,
@@ -480,6 +585,10 @@ export class JobService {
     const groups: Record<string, any[]> = {};
 
     for (const job of jobs) {
+      if (job.metadata?.storageDeleted) {
+        continue;
+      }
+
       // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于等于该值的任务
       if (minSegmentCount !== undefined && job.segmentCount < minSegmentCount) {
         continue;
@@ -566,6 +675,92 @@ export class JobService {
     }
 
     return `/api/jobs/${jobId}/cover`;
+  }
+
+  private async collectJobStorageKeys(job: Job): Promise<string[]> {
+    const keys = new Set<string>();
+
+    for (const key of [job.videoPath, job.danmakuPath, job.coverPath]) {
+      this.addDeletableStorageKey(keys, key, job);
+    }
+
+    this.collectMetadataStorageKeys(keys, job.metadata, job);
+
+    for (const prefix of this.getJobStoragePrefixes(job)) {
+      const listedKeys = await this.storageService.list(prefix);
+      for (const key of listedKeys) {
+        this.addDeletableStorageKey(keys, key, job);
+      }
+    }
+
+    return Array.from(keys).sort();
+  }
+
+  private collectMetadataStorageKeys(
+    keys: Set<string>,
+    value: unknown,
+    job: Job
+  ): void {
+    if (typeof value === 'string') {
+      this.addDeletableStorageKey(keys, value, job);
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        this.collectMetadataStorageKeys(keys, item, job);
+      }
+      return;
+    }
+
+    if (value && typeof value === 'object') {
+      for (const item of Object.values(value as Record<string, unknown>)) {
+        this.collectMetadataStorageKeys(keys, item, job);
+      }
+    }
+  }
+
+  private addDeletableStorageKey(
+    keys: Set<string>,
+    value: unknown,
+    job: Job
+  ): void {
+    if (typeof value !== 'string') {
+      return;
+    }
+
+    const key = value.trim();
+    if (!key || !this.isJobStorageKey(key, job)) {
+      return;
+    }
+
+    keys.add(key);
+  }
+
+  private isJobStorageKey(key: string, job: Job): boolean {
+    if (
+      key.startsWith('/') ||
+      key.includes('..') ||
+      /^(https?:|wss?:|data:|\/\/)/i.test(key)
+    ) {
+      return false;
+    }
+
+    return this.getJobStoragePrefixes(job).some(prefix =>
+      key.startsWith(prefix)
+    );
+  }
+
+  private getJobStoragePrefixes(job: Job): string[] {
+    const identifiers = Array.from(new Set([job.id, job.jobId].filter(Boolean)));
+    return identifiers.flatMap(identifier => [
+      `raw/${identifier}/`,
+      `danmaku/${identifier}/`,
+      `transcript/${identifier}/`,
+      `processed/${identifier}/`,
+      `merged/${identifier}/`,
+      `jobs/${identifier}/`,
+    ]);
   }
 
   /**
