@@ -1,9 +1,14 @@
 import { MidwayConfig } from '@midwayjs/core';
+import * as path from 'path';
 import { getConfig } from './loader';
 
 // 加载配置
 const config = getConfig();
 const isProduction = config.app.nodeEnv === 'production';
+const logDir =
+  process.env.LOG_DIR ||
+  process.env.MIDWAY_LOGGER_DIR ||
+  path.join(process.cwd(), 'logs');
 
 export default {
   // Cookie 签名密钥
@@ -123,6 +128,9 @@ export default {
 
   // 日志配置
   midwayLogger: {
+    default: {
+      dir: logDir,
+    },
     clients: {
       appLogger: {
         level: isProduction ? 'info' : 'debug',

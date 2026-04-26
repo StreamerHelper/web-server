@@ -448,4 +448,64 @@ describe('BilibiliSubmissionService title handling', () => {
       service.submissionRepository.completeSubmission
     ).toHaveBeenCalledWith('submission-collection');
   });
+
+  it('passes the uploaded part cid when adding a new submission to collection', async () => {
+    const service = createService();
+    service.submissionRepository.findById.mockResolvedValue({
+      id: 'submission-new-collection',
+      status: SubmissionStatus.PENDING,
+      totalParts: 1,
+      completedParts: 0,
+      parts: [
+        {
+          index: 1,
+          title: '2026-04-26 12:00',
+          s3Keys: ['raw/job-new/video/segment_20260426_120000.mkv'],
+          status: PartStatus.PENDING,
+        },
+      ],
+      bvid: null,
+      avid: null,
+      title: '新投稿合集标题',
+      description: '简介',
+      tags: ['直播'],
+      tid: 171,
+      humanType2: 2066,
+      cover: null,
+      copyright: 2,
+      source: 'https://live.bilibili.com/12345',
+      dynamic: '',
+      collectionAutoAdd: true,
+      collectionSeasonId: 1001,
+      collectionSectionId: 2002,
+    });
+    service.downloadAndMergeSegments = jest.fn().mockResolvedValue({
+      filePath: '/tmp/part_1.mkv',
+      duration: 1800000,
+      fileSize: 512000000,
+    });
+    service.uploadService.uploadPartFromLocal.mockResolvedValue({
+      filename: 'uploaded-file',
+      cid: 654321,
+    });
+    service.uploadService.submitVideoParts.mockResolvedValue({
+      bvid: 'BV1xx411c7mD',
+      avid: 123456,
+    });
+    service.bilibiliSeasonService.addVideoToSeason.mockResolvedValue({
+      episodeId: 3003,
+      alreadyExists: false,
+    });
+
+    await service.processSubmission('submission-new-collection');
+
+    expect(service.bilibiliSeasonService.addVideoToSeason).toHaveBeenCalledWith(
+      {
+        aid: 123456,
+        sectionId: 2002,
+        title: '新投稿合集标题',
+        cid: 654321,
+      }
+    );
+  });
 });

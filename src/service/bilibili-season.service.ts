@@ -14,6 +14,7 @@ const CREATIVE_REFERER =
   'https://member.bilibili.com/platform/upload/video/frame';
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+const VIDEO_INFO_RETRY_DELAYS = [5_000, 15_000, 30_000, 60_000];
 
 export interface BilibiliSeasonSection {
   id: number;
@@ -111,6 +112,8 @@ interface RawEpisode {
 @Provide()
 @Scope(ScopeEnum.Singleton)
 export class BilibiliSeasonService {
+  private readonly videoInfoRetryDelays = VIDEO_INFO_RETRY_DELAYS;
+
   @Logger()
   private logger: ILogger;
 
@@ -234,9 +237,19 @@ export class BilibiliSeasonService {
       });
     }
 
-    const videoInfo = await this.getVideoInfo(aid, credential.cookies);
-    const cid = Number(input.cid || videoInfo.pages?.[0]?.cid || 0);
-    const title = (input.title || videoInfo.title || '').trim();
+    const inputCid = Number(input.cid || 0);
+    let cid = Number.isFinite(inputCid) ? inputCid : 0;
+    let title = (input.title || '').trim();
+
+    if (!cid || !title) {
+      const videoInfo = await this.getVideoInfoWithRetry(
+        aid,
+        credential.cookies
+      );
+      cid = Number(cid || videoInfo.pages?.[0]?.cid || 0);
+      title = (title || videoInfo.title || '').trim();
+    }
+
     if (!Number.isFinite(cid) || cid <= 0) {
       throw new Error(`Failed to resolve cid for Bilibili aid ${aid}`);
     }
@@ -285,6 +298,35 @@ export class BilibiliSeasonService {
     };
   }
 
+  private async getVideoInfoWithRetry(
+    aid: number,
+    cookies: BilibiliCredential['cookies']
+  ): Promise<RawVideoInfo> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= this.videoInfoRetryDelays.length; attempt++) {
+      if (attempt > 0) {
+        const delayMs = this.videoInfoRetryDelays[attempt - 1];
+        this.logger.warn('Bilibili video info is not ready, retrying later', {
+          aid,
+          attempt: attempt + 1,
+          delayMs,
+          error:
+            lastError instanceof Error ? lastError.message : String(lastError),
+        });
+        await this.sleep(delayMs);
+      }
+
+      try {
+        return await this.getVideoInfo(aid, cookies);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError;
+  }
+
   private async getVideoInfo(
     aid: number,
     cookies: BilibiliCredential['cookies']
@@ -299,6 +341,10 @@ export class BilibiliSeasonService {
       ),
     });
     return this.expectSuccess(result, '获取B站视频信息');
+  }
+
+  private async sleep(delayMs: number): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
   }
 
   private async findSeasonById(

@@ -290,6 +290,7 @@ export class BilibiliSubmissionService {
         avid: Number(submission.avid || 0),
       };
       const parts = this.normalizeSubmissionParts(submission.parts || []);
+      const uploadedParts: BilibiliUploadedPart[] = [];
       const hasUnfinishedParts = parts.some(
         part =>
           part.status !== PartStatus.COMPLETED || !part.filename || !part.cid
@@ -306,8 +307,6 @@ export class BilibiliSubmissionService {
         const tempBaseDir = path.join(projectRoot, 'temp', 'submissions');
         await fs.mkdir(tempBaseDir, { recursive: true });
         tempDir = await fs.mkdtemp(path.join(tempBaseDir, 'submission-'));
-
-        const uploadedParts: BilibiliUploadedPart[] = [];
 
         for (const part of parts) {
           const partTitle = this.resolvePartTitle(part);
@@ -459,7 +458,12 @@ export class BilibiliSubmissionService {
         submissionId,
         SubmissionStatus.SUBMITTING
       );
-      await this.addSubmissionToCollectionIfNeeded(submission, result.avid);
+      await this.addSubmissionToCollectionIfNeeded(
+        submission,
+        result.avid,
+        uploadedParts[0]?.cid ||
+          parts.find(part => Number(part.cid || 0) > 0)?.cid
+      );
       await this.submissionRepository.completeSubmission(submissionId);
 
       // 清理临时目录
@@ -522,7 +526,8 @@ export class BilibiliSubmissionService {
 
   private async addSubmissionToCollectionIfNeeded(
     submission: BilibiliSubmissionEntity,
-    avid: number
+    avid: number,
+    cid?: number
   ): Promise<void> {
     if (
       !submission.collectionAutoAdd ||
@@ -532,11 +537,23 @@ export class BilibiliSubmissionService {
       return;
     }
 
-    const collectionResult = await this.bilibiliSeasonService.addVideoToSeason({
+    const collectionInput: {
+      aid: number;
+      sectionId: number;
+      title: string;
+      cid?: number;
+    } = {
       aid: Number(avid),
       sectionId: Number(submission.collectionSectionId),
       title: submission.title,
-    });
+    };
+    const resolvedCid = Number(cid || 0);
+    if (Number.isFinite(resolvedCid) && resolvedCid > 0) {
+      collectionInput.cid = resolvedCid;
+    }
+
+    const collectionResult =
+      await this.bilibiliSeasonService.addVideoToSeason(collectionInput);
 
     await this.submissionRepository.updateCollectionResult(
       submission.id,

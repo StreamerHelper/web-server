@@ -198,6 +198,141 @@ describe('BilibiliSeasonService', () => {
     });
   });
 
+  it('retries video info lookup when the submitted archive is not visible yet', async () => {
+    let videoInfoCalls = 0;
+    let episodeAdded = false;
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = new URL(String(input));
+          if (url.pathname === '/x2/creative/web/season/section') {
+            return new Response(
+              JSON.stringify({
+                code: 0,
+                data: {
+                  episodes: episodeAdded
+                    ? [
+                        {
+                          id: 3003,
+                          aid: 123456,
+                          cid: 654321,
+                          title: '接口标题',
+                        },
+                      ]
+                    : [],
+                },
+              }),
+              { status: 200 }
+            );
+          }
+          if (url.pathname === '/x/web-interface/view') {
+            videoInfoCalls += 1;
+            if (videoInfoCalls === 1) {
+              return new Response(
+                JSON.stringify({
+                  code: -404,
+                  message: '啥都木有',
+                }),
+                { status: 200 }
+              );
+            }
+
+            return new Response(
+              JSON.stringify({
+                code: 0,
+                data: {
+                  title: '接口标题',
+                  pages: [{ cid: 654321 }],
+                },
+              }),
+              { status: 200 }
+            );
+          }
+          if (url.pathname === '/x2/creative/web/season/section/episodes/add') {
+            const body = JSON.parse(String(init?.body || '{}'));
+            expect(body.episodes[0]).toEqual({
+              aid: 123456,
+              cid: 654321,
+              title: '接口标题',
+              charging_pay: 0,
+            });
+            episodeAdded = true;
+            return new Response(JSON.stringify({ code: 0 }), { status: 200 });
+          }
+          return new Response(JSON.stringify({ code: -404 }), { status: 404 });
+        }
+      );
+
+    const service = createService() as any;
+    service.videoInfoRetryDelays = [1234];
+    service.sleep = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.addVideoToSeason({
+      aid: 123456,
+      sectionId: 2002,
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        added: true,
+        episodeId: 3003,
+        cid: 654321,
+        title: '接口标题',
+      })
+    );
+    expect(videoInfoCalls).toBe(2);
+    expect(service.sleep).toHaveBeenCalledWith(1234);
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('uses provided title and cid without waiting for video info indexing', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = new URL(String(input));
+          if (url.pathname === '/x2/creative/web/season/section') {
+            return new Response(
+              JSON.stringify({
+                code: 0,
+                data: { episodes: [] },
+              }),
+              { status: 200 }
+            );
+          }
+          if (url.pathname === '/x2/creative/web/season/section/episodes/add') {
+            const body = JSON.parse(String(init?.body || '{}'));
+            expect(body.episodes[0]).toEqual({
+              aid: 123456,
+              cid: 654321,
+              title: '本地标题',
+              charging_pay: 0,
+            });
+            return new Response(JSON.stringify({ code: 0 }), { status: 200 });
+          }
+          throw new Error(`Unexpected request: ${url.pathname}`);
+        }
+      );
+
+    const service = createService() as any;
+    service.sleep = jest.fn();
+
+    await service.addVideoToSeason({
+      aid: 123456,
+      sectionId: 2002,
+      title: '本地标题',
+      cid: 654321,
+    });
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([input]) => new URL(String(input)).pathname === '/x/web-interface/view'
+      )
+    ).toBe(false);
+    expect(service.sleep).not.toHaveBeenCalled();
+  });
+
   it('creates a season and returns the created season with its default section', async () => {
     jest
       .spyOn(global, 'fetch')
