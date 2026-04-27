@@ -265,7 +265,7 @@ export class FFmpegService extends EventEmitter {
     this.emit(FFmpegService.EVENT_EXIT, event);
 
     if (isNaturalExit) {
-      this.logger?.info('FFmpeg process exited - stream ended', {
+      this.logger?.info('FFmpeg process exited naturally', {
         id: this.id,
         code,
         signal,

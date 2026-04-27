@@ -13,6 +13,7 @@ import {
   RecordingQuality,
   ResolvedStream,
   SegmentInfo,
+  StreamStatus,
 } from '../interface';
 import { DanmakuManager } from './danmaku.service';
 import { FFmpegExitEvent, FFmpegService } from './ffmpeg.service';
@@ -37,6 +38,7 @@ export interface RecordingInputOptions {
   qualityApplied?: boolean;
   qualityNote?: string;
   refreshStream?: () => Promise<ResolvedStream>;
+  checkLiveStatus?: () => Promise<StreamStatus>;
 }
 
 /**
@@ -235,6 +237,7 @@ export class Recording extends EventEmitter {
   // ========== 录制器配置 ==========
   private readonly recordingConfig: RecordingConfig;
   private readonly refreshStream?: () => Promise<ResolvedStream>;
+  private readonly checkLiveStatus?: () => Promise<StreamStatus>;
   private readonly startedPromise: Promise<void>;
   private resolveStarted!: () => void;
   private rejectStarted!: (error: Error) => void;
@@ -258,6 +261,7 @@ export class Recording extends EventEmitter {
     this.qualityApplied = options.qualityApplied;
     this.qualityNote = options.qualityNote;
     this.refreshStream = options.refreshStream;
+    this.checkLiveStatus = options.checkLiveStatus;
     this.videoDir = path.join(this.outputDir, 'video');
     this.danmakuDir = path.join(this.outputDir, 'danmaku');
     this.startTime = Date.now();
@@ -596,12 +600,115 @@ export class Recording extends EventEmitter {
       return;
     }
 
+    this.logger.info('FFmpeg process exited naturally', {
+      id: this.id,
+      code: event.code,
+      signal: event.signal,
+    });
+
+    if (await this.continueRecordingAfterNaturalExit(event)) {
+      return;
+    }
+
     this.logger.info('FFmpeg process exited - stream ended', {
       id: this.id,
       code: event.code,
       signal: event.signal,
     });
     this.resolveEndReason?.('completed');
+  }
+
+  private async continueRecordingAfterNaturalExit(
+    event: FFmpegExitEvent
+  ): Promise<boolean> {
+    if (this.isStopping || !this.refreshStream) {
+      return false;
+    }
+
+    const liveStatus = await this.safeCheckLiveStatus();
+    if (liveStatus && !liveStatus.isLive) {
+      this.logger.info('Natural FFmpeg exit confirmed stream is offline', {
+        id: this.id,
+        platform: this.platform,
+        streamerId: this.streamerId,
+        roomId: liveStatus.roomId,
+      });
+      return false;
+    }
+
+    if (liveStatus?.isLive) {
+      this.logger.info(
+        'Natural FFmpeg exit while stream is still live, refreshing stream URL',
+        {
+          id: this.id,
+          platform: this.platform,
+          streamerId: this.streamerId,
+          title: liveStatus.title,
+        }
+      );
+    }
+
+    try {
+      await this.refreshStreamUrl();
+      this.ffmpegRestartAttempts = 0;
+      await this.startFFmpegProcess();
+      this.logger.info('FFmpeg continued after refreshing stream URL', {
+        id: this.id,
+        platform: this.platform,
+        streamerId: this.streamerId,
+        streamUrl: this.streamUrl,
+      });
+      return true;
+    } catch (error) {
+      if (this.isOfflineStreamError(error)) {
+        this.logger.info('Stream refresh reports stream is offline', {
+          id: this.id,
+          platform: this.platform,
+          streamerId: this.streamerId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+
+      this.logger.warn(
+        'Failed to refresh stream after natural FFmpeg exit, scheduling restart',
+        {
+          id: this.id,
+          platform: this.platform,
+          streamerId: this.streamerId,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+      this.scheduleFFmpegRestart({
+        code: event.code,
+        signal: event.signal,
+        isNatural: false,
+      });
+      return true;
+    }
+  }
+
+  private async safeCheckLiveStatus(): Promise<StreamStatus | null> {
+    if (!this.checkLiveStatus) {
+      return null;
+    }
+
+    try {
+      return await this.checkLiveStatus();
+    } catch (error) {
+      this.logger.warn('Failed to check live status after FFmpeg exit', {
+        id: this.id,
+        platform: this.platform,
+        streamerId: this.streamerId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private isOfflineStreamError(error: unknown): boolean {
+    const code = (error as { code?: unknown })?.code;
+    return code === 'STREAM_OFFLINE';
   }
 
   private async startFFmpegProcess(): Promise<void> {

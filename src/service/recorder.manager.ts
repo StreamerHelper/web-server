@@ -137,6 +137,8 @@ export class RecorderManager {
           streamerId,
           options.requestedQuality
         ),
+      checkLiveStatus: async () =>
+        await this.platformService.checkLiveStatus(platform, streamerId),
     });
 
     // 注册到管理器
