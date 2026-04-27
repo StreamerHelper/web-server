@@ -116,6 +116,11 @@ export interface JobMetadata {
   lastFFmpegOutputTime?: number; // FFmpeg 最后输出时间（毫秒）
   recordedSegments?: number; // 已录制的分片数
   lastSegmentTime?: number; // 最后分片时间戳
+  streamRecoveryInProgress?: boolean; // 直播流恢复中，避免巡检误判为孤儿任务
+  streamRecoveryAttempt?: number;
+  streamRecoveryReason?: string;
+  streamRecoveryLastAt?: string;
+  streamRecoveryLastError?: string;
 }
 
 export interface RecordParams {

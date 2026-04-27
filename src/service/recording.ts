@@ -135,7 +135,7 @@ interface UploadSettlementSummary {
 export class Recording extends EventEmitter {
   // 事件类型定义
   static readonly EVENT_END = 'end' as const;
-  private static readonly MAX_FFMPEG_RESTART_ATTEMPTS = 5;
+  private static readonly MAX_FFMPEG_RESTART_ATTEMPTS = 3;
   private static readonly FFMPEG_RESTART_BASE_DELAY_MS = 2000;
   private static readonly FFMPEG_RESTART_MAX_DELAY_MS = 15000;
 
@@ -230,6 +230,8 @@ export class Recording extends EventEmitter {
   private ffmpegRestartTimer: NodeJS.Timeout | null = null;
   private lastFFmpegOutputTime = 0; // FFmpeg 最后输出时间
   private ffmpegRestartAttempts = 0;
+  private isHandlingHeartbeatTimeout = false;
+  private isStreamRecoveryPendingOutput = false;
   private failureReason: string | null = null;
   private recordingFailed = false;
   private throttledUpdateHeartbeat: (() => void) & { cancel(): void }; // 节流的心跳更新函数
@@ -579,7 +581,7 @@ export class Recording extends EventEmitter {
           error: err.message,
         });
       });
-      this.scheduleFFmpegRestart(event);
+      this.scheduleFFmpegRestart(event, 'ffmpeg_exit');
     }
   }
 
@@ -679,11 +681,14 @@ export class Recording extends EventEmitter {
           error: error instanceof Error ? error.message : String(error),
         }
       );
-      this.scheduleFFmpegRestart({
-        code: event.code,
-        signal: event.signal,
-        isNatural: false,
-      });
+      this.scheduleFFmpegRestart(
+        {
+          code: event.code,
+          signal: event.signal,
+          isNatural: false,
+        },
+        'stream_refresh_failed'
+      );
       return true;
     }
   }
@@ -732,7 +737,10 @@ export class Recording extends EventEmitter {
     });
   }
 
-  private scheduleFFmpegRestart(event: FFmpegExitEvent): void {
+  private scheduleFFmpegRestart(
+    event: FFmpegExitEvent,
+    reason: 'ffmpeg_exit' | 'heartbeat_timeout' | 'stream_refresh_failed'
+  ): void {
     if (this.ffmpegRestartTimer || this.isStopping) {
       return;
     }
@@ -740,17 +748,23 @@ export class Recording extends EventEmitter {
     this.ffmpegRestartAttempts += 1;
 
     if (this.ffmpegRestartAttempts > Recording.MAX_FFMPEG_RESTART_ATTEMPTS) {
-      this.logger.error('FFmpeg restart limit reached', {
+      this.logger.warn('FFmpeg recovery limit reached, completing recording', {
         id: this.id,
         attempts: this.ffmpegRestartAttempts - 1,
         code: event.code,
         signal: event.signal,
+        reason,
       });
-      this.recordingFailed = true;
-      this.failureReason = `FFmpeg restart limit reached after ${
-        this.ffmpegRestartAttempts - 1
-      } attempts`;
-      this.resolveEndReason?.('ffmpeg_error');
+      this.persistStreamRecoveryState({
+        streamRecoveryInProgress: false,
+        streamRecoveryAttempt: this.ffmpegRestartAttempts - 1,
+        streamRecoveryReason: reason,
+        streamRecoveryLastAt: new Date().toISOString(),
+        streamRecoveryLastError: `Recovery limit reached after ${
+          this.ffmpegRestartAttempts - 1
+        } attempts`,
+      });
+      this.resolveEndReason?.('completed');
       return;
     }
 
@@ -762,21 +776,35 @@ export class Recording extends EventEmitter {
     this.lastFFmpegOutputTime = Date.now();
     this.resetHeartbeatTimer();
 
-    this.logger.warn('FFmpeg exited unexpectedly, scheduling restart', {
+    this.isStreamRecoveryPendingOutput = true;
+    this.persistStreamRecoveryState({
+      streamRecoveryInProgress: true,
+      streamRecoveryAttempt: this.ffmpegRestartAttempts,
+      streamRecoveryReason: reason,
+      streamRecoveryLastAt: new Date().toISOString(),
+      streamRecoveryLastError: '',
+      lastFFmpegOutputTime: this.lastFFmpegOutputTime,
+    });
+
+    this.logger.warn('FFmpeg stream interrupted, scheduling recovery', {
       id: this.id,
       code: event.code,
       signal: event.signal,
       attempt: this.ffmpegRestartAttempts,
+      maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
       delayMs,
+      reason,
     });
 
     this.ffmpegRestartTimer = setTimeout(() => {
       this.ffmpegRestartTimer = null;
-      void this.restartFFmpegProcess();
+      void this.restartFFmpegProcess(reason);
     }, delayMs);
   }
 
-  private async restartFFmpegProcess(): Promise<void> {
+  private async restartFFmpegProcess(
+    reason: 'ffmpeg_exit' | 'heartbeat_timeout' | 'stream_refresh_failed'
+  ): Promise<void> {
     if (this.isStopping) {
       return;
     }
@@ -784,23 +812,67 @@ export class Recording extends EventEmitter {
     try {
       await this.refreshStreamUrl();
       await this.startFFmpegProcess();
-      this.logger.info('FFmpeg restarted', {
+      this.persistStreamRecoveryState({
+        streamRecoveryInProgress: true,
+        streamRecoveryAttempt: this.ffmpegRestartAttempts,
+        streamRecoveryReason: reason,
+        streamRecoveryLastAt: new Date().toISOString(),
+        streamRecoveryLastError: '',
+        lastFFmpegOutputTime: this.lastFFmpegOutputTime,
+      });
+      this.logger.info('FFmpeg restarted, waiting for output', {
         id: this.id,
         attempt: this.ffmpegRestartAttempts,
+        maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
+        reason,
         streamUrl: this.streamUrl,
       });
     } catch (error) {
+      if (this.isOfflineStreamError(error)) {
+        this.logger.info('Stream refresh reports stream is offline', {
+          id: this.id,
+          platform: this.platform,
+          streamerId: this.streamerId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.persistStreamRecoveryState({
+          streamRecoveryInProgress: false,
+          streamRecoveryAttempt: this.ffmpegRestartAttempts,
+          streamRecoveryReason: reason,
+          streamRecoveryLastAt: new Date().toISOString(),
+          streamRecoveryLastError: '',
+        });
+        this.resolveEndReason?.('completed');
+        return;
+      }
+
       this.logger.error('Failed to restart FFmpeg', {
         id: this.id,
         attempt: this.ffmpegRestartAttempts,
+        maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
+        reason,
         error: error instanceof Error ? error.message : String(error),
       });
 
-      this.scheduleFFmpegRestart({
-        code: null,
-        signal: null,
-        isNatural: false,
+      this.persistStreamRecoveryState({
+        streamRecoveryInProgress: true,
+        streamRecoveryAttempt: this.ffmpegRestartAttempts,
+        streamRecoveryReason: reason,
+        streamRecoveryLastAt: new Date().toISOString(),
+        streamRecoveryLastError:
+          error instanceof Error ? error.message : String(error),
+        lastFFmpegOutputTime: this.lastFFmpegOutputTime,
       });
+
+      this.scheduleFFmpegRestart(
+        {
+          code: null,
+          signal: null,
+          isNatural: false,
+        },
+        'stream_refresh_failed'
+      );
     }
   }
 
@@ -919,6 +991,7 @@ export class Recording extends EventEmitter {
       this.segmentCount++;
       this.lastSegmentTime = timestamp;
       this.ffmpegRestartAttempts = 0;
+      this.markStreamRecovered();
 
       // 触发上传
       const uploadQueue = this.bullFramework.getQueue('upload');
@@ -1034,6 +1107,7 @@ export class Recording extends EventEmitter {
    */
   private async handleFFmpegOutput(message?: string): Promise<void> {
     this.lastFFmpegOutputTime = Date.now();
+    this.markStreamRecovered();
 
     if (message) {
       this.captureMediaMetadata(message);
@@ -1102,10 +1176,125 @@ export class Recording extends EventEmitter {
         return;
       }
 
-      // FFmpeg 超时无输出
-      this.logger.error('FFmpeg heartbeat timeout');
-      this.resolveEndReason?.('heartbeat_timeout');
+      await this.handleHeartbeatTimeout();
     }, this.recordingConfig.heartbeatTimeout);
+  }
+
+  private async handleHeartbeatTimeout(): Promise<void> {
+    if (this.isHandlingHeartbeatTimeout || this.isStopping) {
+      return;
+    }
+
+    this.isHandlingHeartbeatTimeout = true;
+    const nextAttempt = Math.min(
+      this.ffmpegRestartAttempts + 1,
+      Recording.MAX_FFMPEG_RESTART_ATTEMPTS
+    );
+
+    try {
+      this.lastFFmpegOutputTime = Date.now();
+      await this.persistStreamRecoveryStateAsync({
+        streamRecoveryInProgress: true,
+        streamRecoveryAttempt: nextAttempt,
+        streamRecoveryReason: 'heartbeat_timeout',
+        streamRecoveryLastAt: new Date().toISOString(),
+        streamRecoveryLastError: '',
+        lastFFmpegOutputTime: this.lastFFmpegOutputTime,
+      });
+
+      const liveStatus = await this.safeCheckLiveStatus();
+      if (liveStatus && !liveStatus.isLive) {
+        this.logger.info('Heartbeat timeout confirmed stream is offline', {
+          id: this.id,
+          platform: this.platform,
+          streamerId: this.streamerId,
+          roomId: liveStatus.roomId,
+        });
+        this.persistStreamRecoveryState({
+          streamRecoveryInProgress: false,
+          streamRecoveryAttempt: this.ffmpegRestartAttempts,
+          streamRecoveryReason: 'heartbeat_timeout',
+          streamRecoveryLastAt: new Date().toISOString(),
+          streamRecoveryLastError: '',
+        });
+        this.resolveEndReason?.('completed');
+        return;
+      }
+
+      try {
+        await this.processListChanges();
+      } catch (error) {
+        this.logger.warn('Failed to flush segments before stream recovery', {
+          id: this.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      this.logger.warn('FFmpeg heartbeat timeout, recovering stream', {
+        id: this.id,
+        platform: this.platform,
+        streamerId: this.streamerId,
+        attempt: nextAttempt,
+        maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
+      });
+
+      await this.ffmpeg.stop();
+      this.scheduleFFmpegRestart(
+        {
+          code: null,
+          signal: null,
+          isNatural: false,
+        },
+        'heartbeat_timeout'
+      );
+    } catch (error) {
+      this.logger.error('Failed to handle FFmpeg heartbeat timeout', {
+        id: this.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.scheduleFFmpegRestart(
+        {
+          code: null,
+          signal: null,
+          isNatural: false,
+        },
+        'heartbeat_timeout'
+      );
+    } finally {
+      this.isHandlingHeartbeatTimeout = false;
+    }
+  }
+
+  private markStreamRecovered(): void {
+    if (!this.isStreamRecoveryPendingOutput) {
+      return;
+    }
+
+    this.isStreamRecoveryPendingOutput = false;
+    this.ffmpegRestartAttempts = 0;
+    this.persistStreamRecoveryState({
+      streamRecoveryInProgress: false,
+      streamRecoveryAttempt: 0,
+      streamRecoveryReason: '',
+      streamRecoveryLastAt: new Date().toISOString(),
+      streamRecoveryLastError: '',
+      lastFFmpegOutputTime: this.lastFFmpegOutputTime,
+    });
+  }
+
+  private persistStreamRecoveryState(metadata: Record<string, any>): void {
+    this.persistStreamRecoveryStateAsync(metadata).catch(error => {
+      this.logger.error('Failed to update stream recovery metadata', {
+        id: this.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  private async persistStreamRecoveryStateAsync(
+    metadata: Record<string, any>
+  ): Promise<void> {
+    await this.jobService.updateMetadata(this.id, metadata);
   }
 
   /**

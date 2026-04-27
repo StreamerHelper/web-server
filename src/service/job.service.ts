@@ -215,6 +215,31 @@ export class JobService {
     const elapsed = now - lastActiveTime;
 
     if (elapsed > heartbeatTimeoutMs) {
+      const recoveryStartedAt = job.metadata?.streamRecoveryLastAt
+        ? Date.parse(job.metadata.streamRecoveryLastAt)
+        : job.updatedAt.getTime();
+      const recoveryElapsed = Number.isFinite(recoveryStartedAt)
+        ? now - recoveryStartedAt
+        : Number.POSITIVE_INFINITY;
+      const recoveryGraceMs = Math.max(heartbeatTimeoutMs * 10, 120000);
+
+      if (
+        job.metadata?.streamRecoveryInProgress &&
+        recoveryElapsed <= recoveryGraceMs
+      ) {
+        this.logger.warn('Job heartbeat timeout while stream recovery is active', {
+          jobId: job.jobId,
+          streamerId,
+          platform,
+          elapsed,
+          heartbeatTimeoutMs,
+          recoveryElapsed,
+          recoveryGraceMs,
+          recoveryAttempt: job.metadata.streamRecoveryAttempt,
+        });
+        return job;
+      }
+
       // 检查异常崩溃导致的孤儿 Job，并更新其状态
       this.logger.warn('Job heartbeat timeout, marking as failed', {
         jobId: job.jobId,
