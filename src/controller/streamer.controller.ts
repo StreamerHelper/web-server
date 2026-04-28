@@ -10,7 +10,12 @@ import {
   Query,
 } from '@midwayjs/core';
 import { Application, Context } from '@midwayjs/koa';
-import { Platform, StorageError, StreamerInfo } from '../interface';
+import {
+  Platform,
+  PlatformError,
+  StorageError,
+  StreamerInfo,
+} from '../interface';
 import { PlatformService } from '../service/platform.service';
 import { StorageService } from '../service/storage.service';
 import {
@@ -37,6 +42,22 @@ export class StreamerController {
 
   private async serializeStreamer(streamer: any) {
     return this.streamerService.buildStreamerInfo(streamer);
+  }
+
+  private platformErrorStatus(error: PlatformError): number {
+    if (error.code === 'UNSUPPORTED_URL' || error.code === 'UNKNOWN_PLATFORM') {
+      return 400;
+    }
+    return 502;
+  }
+
+  private platformErrorResponse(error: PlatformError) {
+    this.ctx.status = this.platformErrorStatus(error);
+    return {
+      error: error.message,
+      code: error.code,
+      platform: error.platform,
+    };
   }
 
   /**
@@ -353,6 +374,15 @@ export class StreamerController {
         status,
       };
     } catch (error) {
+      if (error instanceof PlatformError) {
+        this.ctx.logger.warn('Failed to check streamer status: platform error', {
+          platform: error.platform,
+          code: error.code,
+          error: error.message,
+        });
+        return this.platformErrorResponse(error);
+      }
+
       this.ctx.logger.error('Failed to check streamer status', {
         error: error instanceof Error ? error.message : String(error),
       });

@@ -119,4 +119,66 @@ describe('Recording abnormal exit logging', () => {
       'FFmpeg heartbeat timed out while recording'
     );
   });
+
+  it('marks stream refresh recovery exhaustion as failed recorder exits', () => {
+    const { recording } = createRecording();
+
+    const finalStatus = recording.getFinalStatus('stream_refresh_failed', {
+      expectedVideoSegments: 0,
+      uploadedVideoSegments: 0,
+      failedVideoSegments: 0,
+      expectedDanmakuSegments: 0,
+      uploadedDanmakuSegments: 0,
+      failedDanmakuSegments: 0,
+      settled: true,
+      timedOut: false,
+    });
+
+    expect(finalStatus).toBe(JOB_STATUS.FAILED);
+    expect(recording.failureReason).toBe(
+      'Stream URL refresh failed and live status could not be confirmed'
+    );
+    expect(
+      recording.shouldLogAbnormalRecorderExit(
+        'stream_refresh_failed',
+        JOB_STATUS.FAILED,
+        {
+          expectedVideoSegments: 0,
+          uploadedVideoSegments: 0,
+          failedVideoSegments: 0,
+          expectedDanmakuSegments: 0,
+          uploadedDanmakuSegments: 0,
+          failedDanmakuSegments: 0,
+          settled: true,
+          timedOut: false,
+        }
+      )
+    ).toBe(true);
+  });
+
+  it('does not complete jobs when stream refresh recovery is exhausted', () => {
+    const { recording } = createRecording();
+
+    recording.ffmpegRestartAttempts = (Recording as any)
+      .MAX_FFMPEG_RESTART_ATTEMPTS;
+    recording.persistStreamRecoveryState = jest.fn();
+    recording.resolveEndReason = jest.fn();
+
+    recording.scheduleFFmpegRestart(
+      { code: null, signal: null, isNatural: false },
+      'stream_refresh_failed'
+    );
+
+    expect(recording.recordingFailed).toBe(true);
+    expect(recording.failureReason).toContain('Stream URL refresh failed');
+    expect(recording.persistStreamRecoveryState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        streamRecoveryInProgress: false,
+        streamRecoveryReason: 'stream_refresh_failed',
+      })
+    );
+    expect(recording.resolveEndReason).toHaveBeenCalledWith(
+      'stream_refresh_failed'
+    );
+  });
 });

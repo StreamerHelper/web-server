@@ -113,6 +113,12 @@ export interface AppConfig {
     defaultTid: number;
     defaultTitleTemplate: string;
   };
+  platforms: {
+    douyin: {
+      cookie: string;
+      userAgent: string;
+    };
+  };
 }
 
 // 默认配置
@@ -159,6 +165,12 @@ const DEFAULT_CONFIG: AppConfig = {
   upload: {
     defaultTid: 171,
     defaultTitleTemplate: '{主播名}的直播录像 {日期}',
+  },
+  platforms: {
+    douyin: {
+      cookie: '',
+      userAgent: '',
+    },
   },
 };
 
@@ -267,6 +279,17 @@ function getEnvOverrides(): Partial<AppConfig> {
   }
   if (process.env.S3_BUCKET) {
     overrides.s3 = { ...overrides.s3, bucket: process.env.S3_BUCKET };
+  }
+
+  // Platform request options
+  if (process.env.DOUYIN_COOKIE || process.env.DOUYIN_USER_AGENT) {
+    overrides.platforms = {
+      ...overrides.platforms,
+      douyin: {
+        cookie: process.env.DOUYIN_COOKIE || '',
+        userAgent: process.env.DOUYIN_USER_AGENT || '',
+      },
+    };
   }
 
   return overrides;

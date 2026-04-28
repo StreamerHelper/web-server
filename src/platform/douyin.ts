@@ -7,6 +7,7 @@ import {
   ResolvedStream,
   StreamStatus,
 } from '../interface';
+import { getConfig } from '../config/loader';
 
 interface DouyinUser {
   nickname?: string;
@@ -75,6 +76,8 @@ type QualityBucket = 'origin' | 'high' | 'medium' | 'low' | 'unknown';
 
 const DOUYIN_LIVE_STATUS = 2;
 const REQUEST_TIMEOUT_MS = 15_000;
+const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
+const GUEST_COOKIE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * 抖音直播适配器。
@@ -84,6 +87,13 @@ const REQUEST_TIMEOUT_MS = 15_000;
  */
 export class DouyinAdapter implements PlatformAdapter {
   readonly name: Platform = 'douyin';
+
+  private static guestCookieCache:
+    | {
+        value: string;
+        expiresAt: number;
+      }
+    | undefined;
 
   private readonly liveBaseUrl = 'https://live.douyin.com';
   private readonly reflowApis = [
@@ -187,14 +197,21 @@ export class DouyinAdapter implements PlatformAdapter {
   ): Promise<DouyinRoomSnapshot> {
     const webRid = await this.resolveRoomInput(streamerId);
     const pageUrl = `${this.liveBaseUrl}/${encodeURIComponent(webRid)}`;
+    let captchaDetected = false;
 
     try {
+      const cookie = await this.buildDouyinCookie(webRid);
       const html = await this.fetchText(pageUrl, {
-        headers: this.buildPageHeaders(webRid),
+        headers: this.buildPageHeaders(webRid, cookie),
       });
-      const snapshot = this.extractRoomSnapshot(html, webRid);
-      if (snapshot) {
-        return snapshot;
+
+      if (this.isCaptchaPage(html)) {
+        captchaDetected = true;
+      } else {
+        const snapshot = this.extractRoomSnapshot(html, webRid);
+        if (snapshot) {
+          return snapshot;
+        }
       }
     } catch (error) {
       this.logger?.warn('Failed to parse Douyin live page', {
@@ -209,6 +226,14 @@ export class DouyinAdapter implements PlatformAdapter {
       if (fallback) {
         return fallback;
       }
+    }
+
+    if (captchaDetected) {
+      throw new PlatformError(
+        'Douyin captcha verification required. Configure a verified Douyin web Cookie in settings.platforms.douyin.cookie.',
+        'douyin',
+        DOUYIN_CAPTCHA_ERROR_CODE
+      );
     }
 
     throw new PlatformError(
@@ -387,8 +412,9 @@ export class DouyinAdapter implements PlatformAdapter {
           room_id: roomId,
           live_id: '1',
         });
+        const cookie = await this.buildDouyinCookie(roomId);
         const data = await this.fetchJson<any>(`${api}?${params.toString()}`, {
-          headers: this.buildPageHeaders(roomId),
+          headers: this.buildPageHeaders(roomId, cookie),
         });
         const room = data?.data?.room;
         if (room) {
@@ -602,7 +628,13 @@ export class DouyinAdapter implements PlatformAdapter {
       const response = await fetch(url, {
         method: 'GET',
         headers: {
-          ...this.buildStreamHeaders(webRid),
+          ...this.buildStreamHeaders(
+            webRid,
+            this.mergeCookieHeaders(
+              this.buildConfiguredCookie(),
+              `__ac_nonce=${this.generateNonce()}`
+            )
+          ),
           Range: 'bytes=0-0',
         },
         signal: controller.signal,
@@ -666,36 +698,142 @@ export class DouyinAdapter implements PlatformAdapter {
   private async resolveRedirect(url: string): Promise<string> {
     const response = await fetch(url, {
       redirect: 'follow',
-      headers: this.buildPageHeaders(''),
+      headers: this.buildPageHeaders('', await this.buildDouyinCookie('')),
     });
     await response.body?.cancel();
     return response.url || url;
   }
 
-  private buildPageHeaders(webRid: string): Record<string, string> {
-    return {
+  private buildPageHeaders(
+    webRid: string,
+    cookie?: string
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
       'User-Agent': this.getUserAgent(),
       Accept:
         'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
       Referer: `${this.liveBaseUrl}/${webRid}`,
-      Cookie: `__ac_nonce=${this.generateNonce()}`,
     };
+    if (cookie) {
+      headers.Cookie = cookie;
+    }
+    return headers;
   }
 
-  private buildStreamHeaders(webRid: string): Record<string, string> {
-    return {
+  private buildStreamHeaders(
+    webRid: string,
+    cookie?: string
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
       'User-Agent': this.getUserAgent(),
       Referer: `${this.liveBaseUrl}/${webRid}`,
       Origin: this.liveBaseUrl,
-      Cookie: `__ac_nonce=${this.generateNonce()}`,
     };
+    if (cookie) {
+      headers.Cookie = cookie;
+    }
+    return headers;
   }
 
   private getUserAgent(): string {
     return (
+      getConfig().platforms?.douyin?.userAgent?.trim() ||
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+        '(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+    );
+  }
+
+  private async buildDouyinCookie(webRid: string): Promise<string> {
+    return this.mergeCookieHeaders(
+      await this.getGuestCookie(webRid),
+      this.buildConfiguredCookie(),
+      `__ac_nonce=${this.generateNonce()}`
+    );
+  }
+
+  private buildConfiguredCookie(): string {
+    return getConfig().platforms?.douyin?.cookie?.trim() || '';
+  }
+
+  private async getGuestCookie(webRid: string): Promise<string> {
+    const cached = DouyinAdapter.guestCookieCache;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(this.liveBaseUrl, {
+        headers: {
+          'User-Agent': this.getUserAgent(),
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          Referer: `${this.liveBaseUrl}/${webRid}`,
+        },
+        signal: controller.signal,
+      });
+      await response.body?.cancel();
+      const cookie = this.extractSetCookieHeader(response.headers);
+      DouyinAdapter.guestCookieCache = {
+        value: cookie,
+        expiresAt: Date.now() + GUEST_COOKIE_TTL_MS,
+      };
+      return cookie;
+    } catch (error) {
+      this.logger?.debug('Failed to prepare Douyin guest cookie', {
+        webRid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return '';
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private extractSetCookieHeader(headers: Headers): string {
+    const headersWithSetCookie = headers as Headers & {
+      getSetCookie?: () => string[];
+    };
+    const values =
+      headersWithSetCookie.getSetCookie?.() ||
+      [headers.get('set-cookie')].filter(Boolean);
+
+    return values.map(value => value.split(';')[0]).join('; ');
+  }
+
+  private mergeCookieHeaders(...headers: string[]): string {
+    const cookies = new Map<string, string>();
+
+    for (const header of headers) {
+      if (!header) {
+        continue;
+      }
+      for (const part of header.split(';')) {
+        const trimmed = part.trim();
+        const separator = trimmed.indexOf('=');
+        if (separator <= 0) {
+          continue;
+        }
+        cookies.set(trimmed.slice(0, separator), trimmed.slice(separator + 1));
+      }
+    }
+
+    return Array.from(cookies.entries())
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ');
+  }
+
+  private isCaptchaPage(html: string): boolean {
+    const title = html.match(/<title>(.*?)<\/title>/i)?.[1] || '';
+    return (
+      /验证码中间页|安全验证|captcha|verify/i.test(title) ||
+      /captcha\/index\.js|secsdk-captcha|argus-csp-token/i.test(html)
     );
   }
 

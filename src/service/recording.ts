@@ -84,7 +84,13 @@ export type RecordingEndReason =
   | 'cancelled'
   | 'heartbeat_timeout'
   | 'ffmpeg_error'
+  | 'stream_refresh_failed'
   | 'max_duration';
+
+type FFmpegRecoveryReason =
+  | 'ffmpeg_exit'
+  | 'heartbeat_timeout'
+  | 'stream_refresh_failed';
 
 /**
  * Recording 结束事件
@@ -135,9 +141,12 @@ interface UploadSettlementSummary {
 export class Recording extends EventEmitter {
   // 事件类型定义
   static readonly EVENT_END = 'end' as const;
-  private static readonly MAX_FFMPEG_RESTART_ATTEMPTS = 3;
-  private static readonly FFMPEG_RESTART_BASE_DELAY_MS = 2000;
-  private static readonly FFMPEG_RESTART_MAX_DELAY_MS = 15000;
+  private static readonly FFMPEG_RESTART_DELAYS_MS = [
+    2000, 5000, 10000, 30000, 60000, 120000, 180000, 300000, 300000, 300000,
+    300000, 300000,
+  ];
+  private static readonly MAX_FFMPEG_RESTART_ATTEMPTS =
+    Recording.FFMPEG_RESTART_DELAYS_MS.length;
 
   /**
    * 类型化的事件发射
@@ -687,7 +696,8 @@ export class Recording extends EventEmitter {
           signal: event.signal,
           isNatural: false,
         },
-        'stream_refresh_failed'
+        'stream_refresh_failed',
+        error instanceof Error ? error.message : String(error)
       );
       return true;
     }
@@ -739,7 +749,8 @@ export class Recording extends EventEmitter {
 
   private scheduleFFmpegRestart(
     event: FFmpegExitEvent,
-    reason: 'ffmpeg_exit' | 'heartbeat_timeout' | 'stream_refresh_failed'
+    reason: FFmpegRecoveryReason,
+    lastError = ''
   ): void {
     if (this.ffmpegRestartTimer || this.isStopping) {
       return;
@@ -748,30 +759,13 @@ export class Recording extends EventEmitter {
     this.ffmpegRestartAttempts += 1;
 
     if (this.ffmpegRestartAttempts > Recording.MAX_FFMPEG_RESTART_ATTEMPTS) {
-      this.logger.warn('FFmpeg recovery limit reached, completing recording', {
-        id: this.id,
-        attempts: this.ffmpegRestartAttempts - 1,
-        code: event.code,
-        signal: event.signal,
-        reason,
-      });
-      this.persistStreamRecoveryState({
-        streamRecoveryInProgress: false,
-        streamRecoveryAttempt: this.ffmpegRestartAttempts - 1,
-        streamRecoveryReason: reason,
-        streamRecoveryLastAt: new Date().toISOString(),
-        streamRecoveryLastError: `Recovery limit reached after ${
-          this.ffmpegRestartAttempts - 1
-        } attempts`,
-      });
-      this.resolveEndReason?.('completed');
+      this.finishAfterRecoveryLimit(event, reason);
       return;
     }
 
-    const delayMs = Math.min(
-      Recording.FFMPEG_RESTART_BASE_DELAY_MS * this.ffmpegRestartAttempts,
-      Recording.FFMPEG_RESTART_MAX_DELAY_MS
-    );
+    const delayMs =
+      Recording.FFMPEG_RESTART_DELAYS_MS[this.ffmpegRestartAttempts - 1];
+    const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
 
     this.lastFFmpegOutputTime = Date.now();
     this.resetHeartbeatTimer();
@@ -782,7 +776,8 @@ export class Recording extends EventEmitter {
       streamRecoveryAttempt: this.ffmpegRestartAttempts,
       streamRecoveryReason: reason,
       streamRecoveryLastAt: new Date().toISOString(),
-      streamRecoveryLastError: '',
+      streamRecoveryNextRetryAt: nextRetryAt,
+      streamRecoveryLastError: lastError,
       lastFFmpegOutputTime: this.lastFFmpegOutputTime,
     });
 
@@ -794,6 +789,7 @@ export class Recording extends EventEmitter {
       maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
       delayMs,
       reason,
+      lastError,
     });
 
     this.ffmpegRestartTimer = setTimeout(() => {
@@ -803,7 +799,7 @@ export class Recording extends EventEmitter {
   }
 
   private async restartFFmpegProcess(
-    reason: 'ffmpeg_exit' | 'heartbeat_timeout' | 'stream_refresh_failed'
+    reason: FFmpegRecoveryReason
   ): Promise<void> {
     if (this.isStopping) {
       return;
@@ -817,6 +813,7 @@ export class Recording extends EventEmitter {
         streamRecoveryAttempt: this.ffmpegRestartAttempts,
         streamRecoveryReason: reason,
         streamRecoveryLastAt: new Date().toISOString(),
+        streamRecoveryNextRetryAt: '',
         streamRecoveryLastError: '',
         lastFFmpegOutputTime: this.lastFFmpegOutputTime,
       });
@@ -841,6 +838,7 @@ export class Recording extends EventEmitter {
           streamRecoveryAttempt: this.ffmpegRestartAttempts,
           streamRecoveryReason: reason,
           streamRecoveryLastAt: new Date().toISOString(),
+          streamRecoveryNextRetryAt: '',
           streamRecoveryLastError: '',
         });
         this.resolveEndReason?.('completed');
@@ -855,25 +853,72 @@ export class Recording extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
       });
 
-      this.persistStreamRecoveryState({
-        streamRecoveryInProgress: true,
-        streamRecoveryAttempt: this.ffmpegRestartAttempts,
-        streamRecoveryReason: reason,
-        streamRecoveryLastAt: new Date().toISOString(),
-        streamRecoveryLastError:
-          error instanceof Error ? error.message : String(error),
-        lastFFmpegOutputTime: this.lastFFmpegOutputTime,
-      });
-
       this.scheduleFFmpegRestart(
         {
           code: null,
           signal: null,
           isNatural: false,
         },
-        'stream_refresh_failed'
+        'stream_refresh_failed',
+        error instanceof Error ? error.message : String(error)
       );
     }
+  }
+
+  private finishAfterRecoveryLimit(
+    event: FFmpegExitEvent,
+    reason: FFmpegRecoveryReason
+  ): void {
+    const attempts = this.ffmpegRestartAttempts - 1;
+    const endReason = this.getRecoveryLimitEndReason(reason);
+    const failureReason = this.getRecoveryLimitFailureReason(reason, attempts);
+
+    this.recordingFailed = true;
+    this.failureReason = this.failureReason || failureReason;
+
+    this.logger.warn('FFmpeg recovery limit reached, stopping recording', {
+      id: this.id,
+      attempts,
+      code: event.code,
+      signal: event.signal,
+      reason,
+      endReason,
+      failureReason: this.failureReason,
+    });
+    this.persistStreamRecoveryState({
+      streamRecoveryInProgress: false,
+      streamRecoveryAttempt: attempts,
+      streamRecoveryReason: reason,
+      streamRecoveryLastAt: new Date().toISOString(),
+      streamRecoveryNextRetryAt: '',
+      streamRecoveryLastError: failureReason,
+    });
+    this.resolveEndReason?.(endReason);
+  }
+
+  private getRecoveryLimitEndReason(
+    reason: FFmpegRecoveryReason
+  ): RecordingEndReason {
+    if (reason === 'heartbeat_timeout') {
+      return 'heartbeat_timeout';
+    }
+    if (reason === 'stream_refresh_failed') {
+      return 'stream_refresh_failed';
+    }
+    return 'ffmpeg_error';
+  }
+
+  private getRecoveryLimitFailureReason(
+    reason: FFmpegRecoveryReason,
+    attempts: number
+  ): string {
+    if (reason === 'heartbeat_timeout') {
+      return `FFmpeg heartbeat timed out and stream recovery failed after ${attempts} attempts`;
+    }
+    if (reason === 'stream_refresh_failed') {
+      return `Stream URL refresh failed after ${attempts} recovery attempts; live status could not be confirmed`;
+    }
+    return `FFmpeg exited unexpectedly and stream recovery failed after ${attempts} attempts`;
   }
 
   private async refreshStreamUrl(): Promise<void> {
@@ -1277,6 +1322,7 @@ export class Recording extends EventEmitter {
       streamRecoveryAttempt: 0,
       streamRecoveryReason: '',
       streamRecoveryLastAt: new Date().toISOString(),
+      streamRecoveryNextRetryAt: '',
       streamRecoveryLastError: '',
       lastFFmpegOutputTime: this.lastFFmpegOutputTime,
     });
@@ -1610,10 +1656,15 @@ export class Recording extends EventEmitter {
           ? 'FFmpeg heartbeat timed out while recording'
           : 'FFmpeg exited unexpectedly and retry limit was reached';
     }
+    if (!this.failureReason && reason === 'stream_refresh_failed') {
+      this.failureReason =
+        'Stream URL refresh failed and live status could not be confirmed';
+    }
     if (
       reason === 'failed' ||
       reason === 'heartbeat_timeout' ||
       reason === 'ffmpeg_error' ||
+      reason === 'stream_refresh_failed' ||
       this.recordingFailed ||
       uploadSummary?.timedOut ||
       (uploadSummary?.failedVideoSegments || 0) > 0 ||
@@ -1634,6 +1685,7 @@ export class Recording extends EventEmitter {
       reason === 'failed' ||
       reason === 'heartbeat_timeout' ||
       reason === 'ffmpeg_error' ||
+      reason === 'stream_refresh_failed' ||
       reason === 'max_duration' ||
       uploadSummary.timedOut
     );

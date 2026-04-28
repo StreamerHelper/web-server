@@ -120,6 +120,7 @@ export interface JobMetadata {
   streamRecoveryAttempt?: number;
   streamRecoveryReason?: string;
   streamRecoveryLastAt?: string;
+  streamRecoveryNextRetryAt?: string;
   streamRecoveryLastError?: string;
 }
 

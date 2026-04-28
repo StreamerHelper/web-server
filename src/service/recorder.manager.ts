@@ -291,11 +291,15 @@ export class RecorderManager {
     endData: RecordingEndEvent
   ): Promise<void> {
     try {
-      // 1. 用户取消的任务不触发投稿
-      if (endData.reason === 'cancelled') {
-        this.logger.info('Recording cancelled, skipping submission', {
-          jobId: options.jobId,
-        });
+      // 1. 只有确认正常收口的任务才触发整场自动投稿
+      if (endData.reason !== 'completed' && endData.reason !== 'max_duration') {
+        this.logger.info(
+          'Recording did not finish normally, skipping submission',
+          {
+            jobId: options.jobId,
+            reason: endData.reason,
+          }
+        );
         return;
       }
 
@@ -409,9 +413,7 @@ export class RecorderManager {
   ): Promise<void> {
     try {
       const job = await this.jobService.findById(id);
-      const autoDelete = normalizeAutoDeleteSettings(
-        job?.metadata?.autoDelete
-      );
+      const autoDelete = normalizeAutoDeleteSettings(job?.metadata?.autoDelete);
 
       if (!job || !autoDelete?.enabled || job.metadata?.storageDeleted) {
         return;
@@ -455,5 +457,4 @@ export class RecorderManager {
       });
     }
   }
-
 }

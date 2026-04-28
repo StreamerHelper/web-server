@@ -10,7 +10,12 @@ import { InjectEntityModel } from '@midwayjs/typeorm';
 import { nanoid } from 'nanoid';
 import { In, LessThan, Repository } from 'typeorm';
 import { Job, Streamer } from '../entity';
-import { Highlight, JOB_STATUS, JobStatus, JobSubmissionSummary } from '../interface';
+import {
+  Highlight,
+  JOB_STATUS,
+  JobStatus,
+  JobSubmissionSummary,
+} from '../interface';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
 import { StorageService } from './storage.service';
 import { SubmissionTemplateService } from './submission-template.service';
@@ -221,22 +226,33 @@ export class JobService {
       const recoveryElapsed = Number.isFinite(recoveryStartedAt)
         ? now - recoveryStartedAt
         : Number.POSITIVE_INFINITY;
+      const nextRetryAt = job.metadata?.streamRecoveryNextRetryAt
+        ? Date.parse(job.metadata.streamRecoveryNextRetryAt)
+        : Number.NaN;
+      const nextRetryGraceMs = Math.max(heartbeatTimeoutMs * 2, 60000);
+      const isNearNextRetry =
+        Number.isFinite(nextRetryAt) && now - nextRetryAt <= nextRetryGraceMs;
       const recoveryGraceMs = Math.max(heartbeatTimeoutMs * 10, 120000);
 
       if (
         job.metadata?.streamRecoveryInProgress &&
-        recoveryElapsed <= recoveryGraceMs
+        (recoveryElapsed <= recoveryGraceMs || isNearNextRetry)
       ) {
-        this.logger.warn('Job heartbeat timeout while stream recovery is active', {
-          jobId: job.jobId,
-          streamerId,
-          platform,
-          elapsed,
-          heartbeatTimeoutMs,
-          recoveryElapsed,
-          recoveryGraceMs,
-          recoveryAttempt: job.metadata.streamRecoveryAttempt,
-        });
+        this.logger.warn(
+          'Job heartbeat timeout while stream recovery is active',
+          {
+            jobId: job.jobId,
+            streamerId,
+            platform,
+            elapsed,
+            heartbeatTimeoutMs,
+            recoveryElapsed,
+            recoveryGraceMs,
+            nextRetryAt: job.metadata.streamRecoveryNextRetryAt,
+            nextRetryGraceMs,
+            recoveryAttempt: job.metadata.streamRecoveryAttempt,
+          }
+        );
         return job;
       }
 
@@ -405,7 +421,9 @@ export class JobService {
       return [];
     }
 
-    const jobIds = Array.from(new Set(jobs.map(job => job.jobId).filter(Boolean)));
+    const jobIds = Array.from(
+      new Set(jobs.map(job => job.jobId).filter(Boolean))
+    );
     const submissions = this.bilibiliSubmissionRepository?.findByJobIds
       ? await this.bilibiliSubmissionRepository.findByJobIds(jobIds)
       : [];
@@ -467,13 +485,10 @@ export class JobService {
       deletedKeys.push(...batch);
     }
 
-    await this.jobModel.update(
-      { id },
-      {
-        videoPath: null,
-        danmakuPath: null,
-      } as any
-    );
+    await this.jobModel.update({ id }, {
+      videoPath: null,
+      danmakuPath: null,
+    } as any);
     await this.updateMetadata(id, {
       storageDeleted: true,
       storageDeletedAt: new Date().toISOString(),
@@ -777,7 +792,9 @@ export class JobService {
   }
 
   private getJobStoragePrefixes(job: Job): string[] {
-    const identifiers = Array.from(new Set([job.id, job.jobId].filter(Boolean)));
+    const identifiers = Array.from(
+      new Set([job.id, job.jobId].filter(Boolean))
+    );
     return identifiers.flatMap(identifier => [
       `raw/${identifier}/`,
       `danmaku/${identifier}/`,
