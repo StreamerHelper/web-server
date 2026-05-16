@@ -507,6 +507,31 @@ export class BilibiliController {
   }
 
   /**
+   * POST /api/bilibili/submission/:id/regenerate - 使用已上传到 B 站的分 P 文件重新生成稿件
+   */
+  @Post('/submission/:id/regenerate')
+  async regenerateSubmission() {
+    try {
+      const credential = await this.bilibiliCredentialRepository.findValid();
+      if (!credential) {
+        this.ctx.status = 401;
+        return { error: 'Bilibili not authenticated. Please login first.' };
+      }
+
+      const id = this.ctx.params.id;
+      return await this.bilibiliSubmissionService.regenerateSubmission(id);
+    } catch (error) {
+      this.ctx.logger.error('Failed to regenerate submission', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.ctx.status = 500;
+      return {
+        error: error instanceof Error ? error.message : 'Internal server error',
+      };
+    }
+  }
+
+  /**
    * GET /api/bilibili/submission - 获取投稿列表
    */
   @Get('/submission')

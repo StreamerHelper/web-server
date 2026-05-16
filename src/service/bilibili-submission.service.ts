@@ -16,6 +16,7 @@ import {
 } from '../entity/bilibili-submission.entity';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
 import {
+  BilibiliUploadOptions,
   BilibiliUploadedPart,
   BilibiliUploadService,
   VideoPart,
@@ -39,6 +40,7 @@ const PART_DURATION_SECONDS = 3600;
  */
 const SEGMENT_DURATION_SECONDS = 10;
 const BILIBILI_COPYRIGHT_REPRINT = 2;
+const REGENERATE_RESTORE_TIMEOUT_MS = 12000;
 
 interface MergedPartFile {
   filePath: string;
@@ -498,6 +500,84 @@ export class BilibiliSubmissionService {
     }
   }
 
+  async regenerateSubmission(
+    submissionId: string
+  ): Promise<BilibiliSubmissionEntity> {
+    const submission = await this.submissionRepository.findById(submissionId);
+    if (!submission) {
+      throw new Error(`Submission not found: ${submissionId}`);
+    }
+
+    const editableUploadedParts = this.resolveReusableUploadedParts(submission);
+    const uploadedParts = this.resolveReusableUploadedParts(submission, {
+      omitCid: true,
+    });
+    const submitOptions = this.buildSubmitOptions(submission);
+
+    await this.submissionRepository.updateStatus(
+      submissionId,
+      SubmissionStatus.SUBMITTING
+    );
+
+    try {
+      const result =
+        (await this.tryRestoreExistingArchive(
+          submission,
+          editableUploadedParts,
+          submitOptions
+        )) ||
+        (await this.submitRegeneratedParts(
+          uploadedParts,
+          submitOptions,
+          submission
+        ));
+
+      if (!result.bvid || !result.avid) {
+        throw new Error('Bilibili returned success without archive id');
+      }
+
+      await this.submissionRepository.updateUploadedResult(
+        submissionId,
+        result.bvid,
+        result.avid
+      );
+      await this.addSubmissionToCollectionIfNeeded(
+        submission,
+        result.avid,
+        uploadedParts[0]?.cid
+      );
+      await this.submissionRepository.completeSubmission(submissionId);
+
+      const updatedSubmission = await this.submissionRepository.findById(
+        submissionId
+      );
+      if (!updatedSubmission) {
+        throw new Error(`Submission not found after regenerate: ${submissionId}`);
+      }
+
+      this.logger.info('Bilibili submission regenerated', {
+        submissionId,
+        bvid: result.bvid,
+        avid: result.avid,
+      });
+
+      return updatedSubmission;
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      await this.submissionRepository.updateStatus(
+        submissionId,
+        SubmissionStatus.FAILED,
+        errorMessage
+      );
+      this.logger.error('Failed to regenerate bilibili submission', {
+        submissionId,
+        error: errorMessage,
+      });
+      throw error;
+    }
+  }
+
   private resolveCollectionBinding(collection?: BilibiliCollectionBinding): {
     autoAdd: boolean;
     seasonId: number | null;
@@ -568,6 +648,219 @@ export class BilibiliSubmissionService {
       episodeId: collectionResult.episodeId,
       alreadyExists: collectionResult.alreadyExists,
     });
+  }
+
+  private buildSubmitOptions(
+    submission: BilibiliSubmissionEntity
+  ): BilibiliUploadOptions {
+    return {
+      title: submission.title,
+      description: submission.description,
+      tags: submission.tags,
+      tid: submission.tid,
+      humanType2: submission.humanType2,
+      cover: submission.cover,
+      copyright: submission.copyright,
+      source: submission.source,
+      dynamic: submission.dynamic,
+    };
+  }
+
+  private async submitRegeneratedParts(
+    uploadedParts: BilibiliUploadedPart[],
+    submitOptions: BilibiliUploadOptions,
+    submission: BilibiliSubmissionEntity
+  ): Promise<{ bvid: string; avid: number }> {
+    try {
+      return await this.uploadService.submitVideoParts(
+        uploadedParts,
+        submitOptions
+      );
+    } catch (error) {
+      if (!this.isDuplicateSuccessfulSubmissionError(error)) {
+        throw error;
+      }
+
+      const recoveryTitle = this.buildRecoverySubmissionTitle(
+        submission.title,
+        submission.id
+      );
+      this.logger.warn(
+        'Bilibili reported duplicate successful submission, retrying with recovery title',
+        {
+          submissionId: submission.id,
+          originalTitle: submission.title,
+          recoveryTitle,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+
+      let recoveryResult: { bvid: string; avid: number };
+      try {
+        recoveryResult = await this.uploadService.submitVideoParts(
+          uploadedParts,
+          {
+            ...submitOptions,
+            title: recoveryTitle,
+          }
+        );
+      } catch (retryError) {
+        if (this.isDuplicateSuccessfulSubmissionError(retryError)) {
+          throw new Error(
+            'B站已将这个上传文件绑定到已删除稿件，禁止通过投稿接口重复生成。已尝试编辑原稿件、filename-only 提交和临时标题提交，均被 B站拦截；需要重新上传源视频，或联系 B站客服恢复原稿件。'
+          );
+        }
+        throw retryError;
+      }
+
+      try {
+        const editResult = await this.uploadService.editVideoParts(
+          recoveryResult.avid,
+          uploadedParts,
+          submitOptions
+        );
+        return {
+          bvid: editResult.bvid || recoveryResult.bvid,
+          avid: editResult.avid || recoveryResult.avid,
+        };
+      } catch (editError) {
+        this.logger.warn(
+          'Regenerated submission was created but original title restore failed',
+          {
+            submissionId: submission.id,
+            bvid: recoveryResult.bvid,
+            avid: recoveryResult.avid,
+            recoveryTitle,
+            error:
+              editError instanceof Error
+                ? editError.message
+                : String(editError),
+          }
+        );
+        return recoveryResult;
+      }
+    }
+  }
+
+  private async tryRestoreExistingArchive(
+    submission: BilibiliSubmissionEntity,
+    uploadedParts: BilibiliUploadedPart[],
+    submitOptions: BilibiliUploadOptions
+  ): Promise<{ bvid: string; avid: number } | null> {
+    const avid = Number(submission.avid || 0);
+    if (!Number.isFinite(avid) || avid <= 0) {
+      return null;
+    }
+
+    try {
+      this.logger.info('Trying to restore existing bilibili archive by edit', {
+        submissionId: submission.id,
+        avid,
+        bvid: submission.bvid,
+      });
+      const result = await this.withTimeout(
+        this.uploadService.editVideoParts(avid, uploadedParts, submitOptions),
+        REGENERATE_RESTORE_TIMEOUT_MS,
+        `Restore existing bilibili archive timed out after ${REGENERATE_RESTORE_TIMEOUT_MS}ms`
+      );
+      return {
+        bvid: result.bvid || submission.bvid || '',
+        avid: result.avid || avid,
+      };
+    } catch (error) {
+      this.logger.warn('Failed to restore existing bilibili archive by edit', {
+        submissionId: submission.id,
+        avid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    timeoutMessage: string
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+    });
+
+    return Promise.race([promise, timeout]).finally(() => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }) as Promise<T>;
+  }
+
+  private isDuplicateSuccessfulSubmissionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('稿件已成功投稿') &&
+      message.includes('请勿重新提交')
+    );
+  }
+
+  private buildRecoverySubmissionTitle(title: string, submissionId: string): string {
+    const now = new Date();
+    const suffix = ` 恢复${this.formatCompactDateTime(now)}${submissionId.slice(
+      0,
+      4
+    )}`;
+    const maxTitleLength = 80;
+    if (title.length + suffix.length <= maxTitleLength) {
+      return `${title}${suffix}`;
+    }
+
+    return `${title.slice(0, maxTitleLength - suffix.length)}${suffix}`;
+  }
+
+  private formatCompactDateTime(date: Date): string {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(
+      date.getHours()
+    )}${pad(date.getMinutes())}`;
+  }
+
+  private resolveReusableUploadedParts(
+    submission: BilibiliSubmissionEntity,
+    options: {
+      omitCid?: boolean;
+    } = {}
+  ): BilibiliUploadedPart[] {
+    const parts = [...(submission.parts || [])].sort(
+      (a, b) => Number(a.index || 0) - Number(b.index || 0)
+    );
+    if (parts.length === 0) {
+      throw new Error('No reusable Bilibili uploaded parts found');
+    }
+
+    const missingPartIndexes: number[] = [];
+    const uploadedParts = parts.map(part => {
+      const filename = part.filename?.trim();
+      const cid = Number(part.cid || 0);
+      if (!filename || !Number.isFinite(cid) || cid <= 0) {
+        missingPartIndexes.push(part.index);
+      }
+
+      return {
+        title: this.resolvePartTitle(part),
+        filename: filename || '',
+        cid,
+        omitCid: options.omitCid,
+      };
+    });
+
+    if (missingPartIndexes.length > 0) {
+      throw new Error(
+        `Missing reusable Bilibili filename or CID for parts: ${missingPartIndexes
+          .map(index => `P${index}`)
+          .join(', ')}`
+      );
+    }
+
+    return uploadedParts;
   }
 
   private normalizeSource(source?: string): string | undefined {

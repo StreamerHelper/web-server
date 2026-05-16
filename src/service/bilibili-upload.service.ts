@@ -51,6 +51,7 @@ export interface BilibiliUploadedPart {
   title: string;
   filename: string;
   cid: number;
+  omitCid?: boolean;
 }
 
 // 上传线路配置
@@ -797,7 +798,8 @@ export class BilibiliUploadService {
 
     const studio = this.buildStudio(parts, options, coverUrl, tid, humanType2);
 
-    const url = new URL('https://member.bilibili.com/x/vu/web/add/v3');
+    const submitPath = '/x/vu/web/add/v3';
+    const url = new URL(`https://member.bilibili.com${submitPath}`);
     url.searchParams.set('ts', String(Date.now()));
     url.searchParams.set('csrf', cookies.bili_jct || '');
 
@@ -820,6 +822,7 @@ export class BilibiliUploadService {
       data?: { bvid?: string; aid?: number };
     };
     this.logger.info('Submit video response', {
+      endpoint: submitPath,
       code: data.code,
       message: data.message,
     });
@@ -914,12 +917,22 @@ export class BilibiliUploadService {
       dynamic: options.dynamic || '',
       subtitle: { open: 0, lan: '' },
       tag: (options.tags || []).join(','),
-      videos: parts.map(p => ({
-        title: p.title,
-        filename: p.filename,
-        cid: p.cid,
-        desc: '',
-      })),
+      videos: parts.map(p => {
+        const video: {
+          title: string;
+          filename: string;
+          desc: string;
+          cid?: number;
+        } = {
+          title: p.title,
+          filename: p.filename,
+          desc: '',
+        };
+        if (!p.omitCid) {
+          video.cid = p.cid;
+        }
+        return video;
+      }),
       dtime: 0,
       open_subtitle: false,
       interactive: 0,
@@ -944,6 +957,27 @@ export class BilibiliUploadService {
     filename: string,
     title: string,
     fallbackTid?: number
+  ): Promise<number> {
+    if (fallbackTid && Number.isInteger(fallbackTid) && fallbackTid > 0) {
+      try {
+        return await this.fetchPredictedLegacyTid(cookies, filename, title);
+      } catch (error) {
+        this.logger.warn('Failed to predict bilibili partition, using fallback', {
+          filename,
+          fallbackTid,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return fallbackTid;
+      }
+    }
+
+    return this.fetchPredictedLegacyTid(cookies, filename, title);
+  }
+
+  private async fetchPredictedLegacyTid(
+    cookies: Record<string, string>,
+    filename: string,
+    title: string
   ): Promise<number> {
     const url = new URL(
       'https://member.bilibili.com/x/vupre/web/archive/types/predict'
@@ -982,10 +1016,6 @@ export class BilibiliUploadService {
     const predictedTid = result.data?.find(item => item.show !== false)?.id;
     if (predictedTid && Number.isInteger(predictedTid) && predictedTid > 0) {
       return predictedTid;
-    }
-
-    if (fallbackTid && Number.isInteger(fallbackTid) && fallbackTid > 0) {
-      return fallbackTid;
     }
 
     throw new Error('Bilibili partition prediction returned no usable tid');

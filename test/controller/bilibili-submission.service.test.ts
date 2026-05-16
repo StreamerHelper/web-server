@@ -508,4 +508,175 @@ describe('BilibiliSubmissionService title handling', () => {
       }
     );
   });
+
+  it('regenerates a deleted archive from reusable bilibili filenames', async () => {
+    const service = createService();
+    service.submissionRepository.findById
+      .mockResolvedValueOnce({
+        id: 'submission-regenerate',
+        jobId: 'job-regenerate',
+        status: SubmissionStatus.COMPLETED,
+        totalParts: 1,
+        completedParts: 1,
+        parts: [
+          {
+            index: 1,
+            title: '2026-05-09 14:54',
+            s3Keys: ['raw/job-regenerate/video/segment_20260509_145400.mkv'],
+            status: PartStatus.COMPLETED,
+            filename: 'n260509sa1p5pm5tjzhi3s2zvzqlo86x',
+            cid: 38219941091,
+          },
+        ],
+        bvid: 'BV1old',
+        avid: 100001,
+        title: '可恶小乐的直播录像 2026-05-09',
+        description: '简介',
+        tags: ['直播'],
+        tid: 171,
+        humanType2: 2066,
+        cover: null,
+        copyright: 2,
+        source: 'https://live.bilibili.com/1914111820',
+        dynamic: '',
+        collectionAutoAdd: false,
+      })
+      .mockResolvedValueOnce({
+        id: 'submission-regenerate',
+        bvid: 'BV1new',
+        avid: 200002,
+      });
+    service.uploadService.submitVideoParts.mockResolvedValue({
+      bvid: 'BV1new',
+      avid: 200002,
+    });
+
+    const result = await service.regenerateSubmission('submission-regenerate');
+
+    expect(service.submissionRepository.updateStatus).toHaveBeenCalledWith(
+      'submission-regenerate',
+      SubmissionStatus.SUBMITTING
+    );
+    expect(service.uploadService.submitVideoParts).toHaveBeenCalledWith(
+      [
+        {
+          title: '2026-05-09 14:54',
+          filename: 'n260509sa1p5pm5tjzhi3s2zvzqlo86x',
+          cid: 38219941091,
+          omitCid: true,
+        },
+      ],
+      expect.objectContaining({
+        title: '可恶小乐的直播录像 2026-05-09',
+        humanType2: 2066,
+      })
+    );
+    expect(service.submissionRepository.updateUploadedResult).toHaveBeenCalledWith(
+      'submission-regenerate',
+      'BV1new',
+      200002
+    );
+    expect(
+      service.submissionRepository.completeSubmission
+    ).toHaveBeenCalledWith('submission-regenerate');
+    expect(result.bvid).toBe('BV1new');
+  });
+
+  it('rejects regeneration when uploaded filename or cid is missing', async () => {
+    const service = createService();
+    service.submissionRepository.findById.mockResolvedValue({
+      id: 'submission-missing-upload',
+      parts: [
+        {
+          index: 1,
+          title: '2026-05-09 14:54',
+          s3Keys: ['raw/job/video/segment_20260509_145400.mkv'],
+          status: PartStatus.COMPLETED,
+        },
+      ],
+    });
+
+    await expect(
+      service.regenerateSubmission('submission-missing-upload')
+    ).rejects.toThrow('Missing reusable Bilibili filename or CID for parts: P1');
+    expect(service.uploadService.submitVideoParts).not.toHaveBeenCalled();
+  });
+
+  it('retries regeneration with a temporary recovery title when bilibili blocks duplicate title submission', async () => {
+    const service = createService();
+    service.submissionRepository.findById
+      .mockResolvedValueOnce({
+        id: 'submission-duplicate-title',
+        jobId: 'job-duplicate-title',
+        status: SubmissionStatus.FAILED,
+        totalParts: 1,
+        completedParts: 1,
+        parts: [
+          {
+            index: 1,
+            title: '2026-05-09 14:54',
+            s3Keys: ['raw/job/video/segment_20260509_145400.mkv'],
+            status: PartStatus.COMPLETED,
+            filename: 'uploaded-file',
+            cid: 1001,
+          },
+        ],
+        bvid: 'BV1old',
+        avid: 100001,
+        title: '重复标题投稿',
+        description: '简介',
+        tags: ['直播'],
+        tid: 171,
+        humanType2: 2066,
+        cover: null,
+        copyright: 2,
+        source: 'https://live.bilibili.com/1914111820',
+        dynamic: '',
+        collectionAutoAdd: false,
+      })
+      .mockResolvedValueOnce({
+        id: 'submission-duplicate-title',
+        bvid: 'BV1new',
+        avid: 200002,
+      });
+    service.uploadService.submitVideoParts
+      .mockRejectedValueOnce(
+        new Error(
+          'Failed to submit video: 稿件已成功投稿，请勿重新提交哦～\n提交时间：23:06 稿件名《重复标题投稿》'
+        )
+      )
+      .mockResolvedValueOnce({
+        bvid: 'BV1new',
+        avid: 200002,
+      });
+    service.uploadService.editVideoParts
+      .mockRejectedValueOnce(new Error('deleted archive cannot edit directly'))
+      .mockResolvedValueOnce({
+        bvid: 'BV1new',
+        avid: 200002,
+      });
+
+    await service.regenerateSubmission('submission-duplicate-title');
+
+    expect(service.uploadService.submitVideoParts).toHaveBeenCalledTimes(2);
+    expect(service.uploadService.submitVideoParts).toHaveBeenNthCalledWith(
+      2,
+      expect.any(Array),
+      expect.objectContaining({
+        title: expect.stringContaining('重复标题投稿 恢复'),
+      })
+    );
+    expect(service.uploadService.editVideoParts).toHaveBeenCalledWith(
+      200002,
+      expect.any(Array),
+      expect.objectContaining({
+        title: '重复标题投稿',
+      })
+    );
+    expect(service.submissionRepository.updateUploadedResult).toHaveBeenCalledWith(
+      'submission-duplicate-title',
+      'BV1new',
+      200002
+    );
+  });
 });

@@ -51,11 +51,11 @@ describe('DouyinAdapter', () => {
   });
 
   it('extracts live status from Douyin __pace_f page data', async () => {
-    jest.spyOn(global, 'fetch').mockResolvedValue(
-      new Response(buildDouyinHtml(), {
+    jest.spyOn(global, 'fetch').mockImplementation(async () => {
+      return new Response(buildDouyinHtml(), {
         status: 200,
-      })
-    );
+      });
+    });
 
     const adapter = new DouyinAdapter(logger);
     const status = await adapter.getStreamerStatus('douyin-web-rid');
@@ -90,6 +90,30 @@ describe('DouyinAdapter', () => {
     expect(fetchMock).toHaveBeenLastCalledWith(
       'https://pull.example/live_ld.flv',
       expect.objectContaining({ method: 'GET' })
+    );
+  });
+
+  it('validates direct Douyin room URLs without fetching room data', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch');
+
+    const adapter = new DouyinAdapter(logger);
+
+    await expect(
+      adapter.validateStreamerId('https://live.douyin.com/116422730252')
+    ).resolves.toBe(true);
+    await expect(
+      adapter.validateStreamerId(
+        'https://www.douyin.com/root/live/116422730252'
+      )
+    ).resolves.toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed Douyin room identifiers', async () => {
+    const adapter = new DouyinAdapter(logger);
+
+    await expect(adapter.validateStreamerId('../bad-room')).resolves.toBe(
+      false
     );
   });
 });

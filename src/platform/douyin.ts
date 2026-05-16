@@ -185,8 +185,8 @@ export class DouyinAdapter implements PlatformAdapter {
 
   async validateStreamerId(streamerId: string): Promise<boolean> {
     try {
-      await this.fetchRoomSnapshot(streamerId);
-      return true;
+      const webRid = await this.resolveRoomInput(streamerId);
+      return this.isValidRoomIdentifier(webRid);
     } catch {
       return false;
     }
@@ -681,10 +681,6 @@ export class DouyinAdapter implements PlatformAdapter {
     const hostname = url.hostname.toLowerCase();
     const parts = url.pathname.split('/').filter(Boolean);
 
-    if (hostname === 'live.douyin.com' && parts[0]) {
-      return parts[0];
-    }
-
     const rootLiveIndex = parts.findIndex(
       (part, index) => part === 'root' && parts[index + 1] === 'live'
     );
@@ -692,7 +688,15 @@ export class DouyinAdapter implements PlatformAdapter {
       return parts[rootLiveIndex + 2] || null;
     }
 
+    if (hostname === 'live.douyin.com' && parts[0]) {
+      return parts[0];
+    }
+
     return null;
+  }
+
+  private isValidRoomIdentifier(value: string): boolean {
+    return /^[A-Za-z0-9_-]+$/.test(value);
   }
 
   private async resolveRedirect(url: string): Promise<string> {
