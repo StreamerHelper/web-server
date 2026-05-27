@@ -79,6 +79,8 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
 const GUEST_COOKIE_TTL_MS = 10 * 60 * 1000;
 
+export type DouyinCookieProvider = () => Promise<string | undefined>;
+
 /**
  * 抖音直播适配器。
  *
@@ -102,9 +104,11 @@ export class DouyinAdapter implements PlatformAdapter {
   ];
 
   private logger: ILogger;
+  private cookieProvider?: DouyinCookieProvider;
 
-  constructor(logger: ILogger) {
+  constructor(logger: ILogger, cookieProvider?: DouyinCookieProvider) {
     this.logger = logger;
+    this.cookieProvider = cookieProvider;
   }
 
   async getStreamerStatus(streamerId: string): Promise<StreamStatus> {
@@ -631,7 +635,7 @@ export class DouyinAdapter implements PlatformAdapter {
           ...this.buildStreamHeaders(
             webRid,
             this.mergeCookieHeaders(
-              this.buildConfiguredCookie(),
+              await this.buildConfiguredCookie(),
               `__ac_nonce=${this.generateNonce()}`
             )
           ),
@@ -753,12 +757,16 @@ export class DouyinAdapter implements PlatformAdapter {
   private async buildDouyinCookie(webRid: string): Promise<string> {
     return this.mergeCookieHeaders(
       await this.getGuestCookie(webRid),
-      this.buildConfiguredCookie(),
+      await this.buildConfiguredCookie(),
       `__ac_nonce=${this.generateNonce()}`
     );
   }
 
-  private buildConfiguredCookie(): string {
+  private async buildConfiguredCookie(): Promise<string> {
+    const savedCookie = (await this.cookieProvider?.())?.trim();
+    if (savedCookie) {
+      return savedCookie;
+    }
     return getConfig().platforms?.douyin?.cookie?.trim() || '';
   }
 

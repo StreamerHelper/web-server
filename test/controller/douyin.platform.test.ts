@@ -116,4 +116,26 @@ describe('DouyinAdapter', () => {
       false
     );
   });
+
+  it('uses a saved Cookie provider when fetching Douyin pages', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === 'https://live.douyin.com') {
+          return new Response('', { status: 200 });
+        }
+        expect(init?.headers).toEqual(
+          expect.objectContaining({
+            Cookie: expect.stringContaining('sessionid=saved'),
+          })
+        );
+        return new Response(buildDouyinHtml(), { status: 200 });
+      });
+
+    const adapter = new DouyinAdapter(logger, async () => 'sessionid=saved');
+    await adapter.getStreamerStatus('douyin-web-rid');
+
+    expect(fetchMock).toHaveBeenCalled();
+  });
 });

@@ -512,3 +512,16 @@ export interface BilibiliCredential {
   createdAt?: Date;
   updatedAt?: Date;
 }
+
+// ============ 抖音凭证相关 ============
+
+/** 抖音 Web Cookie 凭证 */
+export interface DouyinCredential {
+  id?: string;
+  cookieHeader: string;
+  cookieNames: string[];
+  verifiedAt?: Date | null;
+  lastValidationError?: string | null;
+  createdAt?: Date;
+  updatedAt?: Date;
+}

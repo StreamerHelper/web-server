@@ -1,6 +1,7 @@
 import {
   App,
   ILogger,
+  Inject,
   Logger,
   Provide,
   Scope,
@@ -19,6 +20,7 @@ import { BilibiliAdapter } from '../platform/bilibili';
 import { DouyuAdapter } from '../platform/douyu';
 import { DouyinAdapter } from '../platform/douyin';
 import { HuyaAdapter } from '../platform/huya';
+import { DouyinCredentialRepository } from '../repository/douyin-credential.repository';
 
 /**
  * 平台服务
@@ -32,6 +34,9 @@ export class PlatformService {
   @Logger()
   private logger: ILogger;
 
+  @Inject()
+  private douyinCredentialRepository: DouyinCredentialRepository;
+
   private adapters = new Map<Platform, new (logger: any) => PlatformAdapter>([
     ['bilibili', BilibiliAdapter],
     ['douyu', DouyuAdapter],
@@ -43,6 +48,14 @@ export class PlatformService {
    * 获取平台适配器
    */
   getAdapter(platform: Platform): PlatformAdapter {
+    if (platform === 'douyin') {
+      return new DouyinAdapter(this.logger, async () => {
+        const credential =
+          await this.douyinCredentialRepository?.findLatest?.();
+        return credential?.cookieHeader;
+      });
+    }
+
     const AdapterClass = this.adapters.get(platform);
     if (!AdapterClass) {
       throw new PlatformError(
