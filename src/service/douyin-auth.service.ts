@@ -8,6 +8,8 @@ import {
 } from '@midwayjs/core';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
+import { request as httpRequest } from 'http';
+import { request as httpsRequest } from 'https';
 import type { Browser, BrowserContext, Cookie, Page } from 'puppeteer-core';
 import { DouyinCredentialRepository } from '../repository/douyin-credential.repository';
 import { getConfig } from '../config/loader';
@@ -699,12 +701,10 @@ export class DouyinAuthService {
     let ownsBrowser = false;
 
     if (remoteEndpoint) {
-      browser = await puppeteer.connect(
-        remoteEndpoint.startsWith('http://') ||
-          remoteEndpoint.startsWith('https://')
-          ? { browserURL: remoteEndpoint }
-          : { browserWSEndpoint: remoteEndpoint }
+      const connection = await this.resolveRemoteBrowserConnection(
+        remoteEndpoint
       );
+      browser = await puppeteer.connect(connection);
     } else {
       const executablePath = this.resolveChromiumExecutablePath();
       if (!executablePath) {
@@ -734,6 +734,106 @@ export class DouyinAuthService {
       process.env.BROWSER_WS_ENDPOINT?.trim() ||
       ''
     );
+  }
+
+  private async resolveRemoteBrowserConnection(
+    endpoint: string
+  ): Promise<{
+    browserWSEndpoint: string;
+    headers?: Record<string, string>;
+  }> {
+    if (endpoint.startsWith('ws://') || endpoint.startsWith('wss://')) {
+      const hostHeader = this.getBrowserHostHeader(endpoint);
+      return {
+        browserWSEndpoint: endpoint,
+        headers: hostHeader ? { Host: hostHeader } : undefined,
+      };
+    }
+
+    const endpointUrl = new URL(endpoint);
+    const versionUrl = new URL('/json/version', endpointUrl);
+    const hostHeader = this.getBrowserHostHeader(endpoint);
+    const response = await this.requestText(versionUrl, hostHeader);
+    const version = JSON.parse(response) as { webSocketDebuggerUrl?: string };
+
+    if (!version.webSocketDebuggerUrl) {
+      throw new DouyinCredentialError(
+        'Browser endpoint did not return a WebSocket debugger URL',
+        500
+      );
+    }
+
+    const wsUrl = new URL(version.webSocketDebuggerUrl);
+    wsUrl.protocol = endpointUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl.hostname = endpointUrl.hostname;
+    wsUrl.port = endpointUrl.port;
+
+    return {
+      browserWSEndpoint: wsUrl.toString(),
+      headers: hostHeader ? { Host: hostHeader } : undefined,
+    };
+  }
+
+  private getBrowserHostHeader(endpoint: string): string {
+    const configured = process.env.DOUYIN_BROWSER_HOST_HEADER?.trim();
+    if (configured) {
+      return configured;
+    }
+
+    const endpointUrl = new URL(endpoint);
+    if (
+      endpointUrl.hostname === 'localhost' ||
+      endpointUrl.hostname === '127.0.0.1'
+    ) {
+      return '';
+    }
+
+    const port =
+      endpointUrl.port ||
+      (endpointUrl.protocol === 'https:' || endpointUrl.protocol === 'wss:'
+        ? '443'
+        : '80');
+    return `127.0.0.1:${port}`;
+  }
+
+  private requestText(url: URL, hostHeader: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
+        url,
+        {
+          method: 'GET',
+          headers: hostHeader ? { Host: hostHeader } : undefined,
+        },
+        response => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', chunk => {
+            body += chunk;
+          });
+          response.on('end', () => {
+            if ((response.statusCode || 500) >= 400) {
+              reject(
+                new DouyinCredentialError(
+                  `Browser endpoint returned HTTP ${response.statusCode}: ${body.slice(
+                    0,
+                    120
+                  )}`,
+                  500
+                )
+              );
+              return;
+            }
+            resolve(body);
+          });
+        }
+      );
+
+      request.setTimeout(5000, () => {
+        request.destroy(new Error('Browser endpoint request timed out'));
+      });
+      request.on('error', reject);
+      request.end();
+    });
   }
 
   private async importPuppeteer(): Promise<typeof import('puppeteer-core')> {
