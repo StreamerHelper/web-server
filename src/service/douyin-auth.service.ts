@@ -8,7 +8,7 @@ import {
 } from '@midwayjs/core';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
-import type { Browser, Cookie, Page } from 'puppeteer-core';
+import type { Browser, BrowserContext, Cookie, Page } from 'puppeteer-core';
 import { DouyinCredentialRepository } from '../repository/douyin-credential.repository';
 import { getConfig } from '../config/loader';
 
@@ -49,7 +49,9 @@ interface DouyinBrowserLoginSession {
   expiresAt: Date;
   updatedAt: Date;
   browser?: Browser;
+  browserContext?: BrowserContext;
   page?: Page;
+  ownsBrowser?: boolean;
   pollTimer?: NodeJS.Timeout;
   expireTimer?: NodeJS.Timeout;
   cookieNames?: string[];
@@ -414,43 +416,31 @@ export class DouyinAuthService {
     roomId?: string
   ): Promise<void> {
     try {
-      const executablePath = this.resolveChromiumExecutablePath();
-      if (!executablePath) {
-        throw new DouyinCredentialError(
-          'Chromium executable not found. Install chromium or set CHROMIUM_PATH.',
-          500
-        );
-      }
+      const browserTarget = await this.createBrowserLoginTarget();
+      session.browser = browserTarget.browser;
+      session.browserContext = browserTarget.browserContext;
+      session.page = browserTarget.page;
+      session.ownsBrowser = browserTarget.ownsBrowser;
 
-      const { launch } = await this.importPuppeteer();
-      const browser = await launch({
-        executablePath,
-        headless: true,
-        args: this.buildChromiumLaunchArgs(),
-      });
-      const page = await browser.newPage();
-      session.browser = browser;
-      session.page = page;
-
-      await page.setViewport({
+      await session.page.setViewport({
         width: 390,
         height: 760,
         deviceScaleFactor: 2,
         isMobile: true,
       });
-      await page.setUserAgent(this.getUserAgent());
+      await session.page.setUserAgent(this.getUserAgent());
 
       const webRid = roomId?.trim();
       const url = webRid
         ? `https://live.douyin.com/${encodeURIComponent(webRid)}`
         : 'https://www.douyin.com/';
 
-      await page.goto(url, {
+      await session.page.goto(url, {
         waitUntil: 'domcontentloaded',
         timeout: 60000,
       });
       await this.sleep(2000);
-      await this.openDouyinLoginPanel(page);
+      await this.openDouyinLoginPanel(session.page);
 
       session.status = 'waiting';
       session.updatedAt = new Date();
@@ -489,7 +479,9 @@ export class DouyinAuthService {
     }
 
     try {
-      const cookies = session.browser
+      const cookies = session.browserContext
+        ? await session.browserContext.cookies()
+        : session.browser
         ? await session.browser.cookies()
         : await session.page.cookies();
       if (!this.hasAuthenticatedDouyinCookies(cookies)) {
@@ -634,17 +626,33 @@ export class DouyinAuthService {
       clearTimeout(session.expireTimer);
       session.expireTimer = undefined;
     }
+    if (session.browserContext) {
+      try {
+        await session.browserContext.close();
+      } catch (error) {
+        this.logger?.debug('Failed to close Douyin login browser context', {
+          sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      session.browserContext = undefined;
+    }
     if (session.browser) {
       try {
-        await session.browser.close();
+        if (session.ownsBrowser) {
+          await session.browser.close();
+        } else {
+          await session.browser.disconnect();
+        }
       } catch (error) {
-        this.logger?.debug('Failed to close Douyin login browser', {
+        this.logger?.debug('Failed to release Douyin login browser', {
           sessionId: session.id,
           error: error instanceof Error ? error.message : String(error),
         });
       }
       session.browser = undefined;
       session.page = undefined;
+      session.ownsBrowser = undefined;
     }
   }
 
@@ -677,6 +685,55 @@ export class DouyinAuthService {
     ].filter(Boolean) as string[];
 
     return candidates.find(candidate => existsSync(candidate));
+  }
+
+  private async createBrowserLoginTarget(): Promise<{
+    browser: Browser;
+    browserContext: BrowserContext;
+    page: Page;
+    ownsBrowser: boolean;
+  }> {
+    const puppeteer = await this.importPuppeteer();
+    const remoteEndpoint = this.getBrowserEndpoint();
+    let browser: Browser;
+    let ownsBrowser = false;
+
+    if (remoteEndpoint) {
+      browser = await puppeteer.connect(
+        remoteEndpoint.startsWith('http://') ||
+          remoteEndpoint.startsWith('https://')
+          ? { browserURL: remoteEndpoint }
+          : { browserWSEndpoint: remoteEndpoint }
+      );
+    } else {
+      const executablePath = this.resolveChromiumExecutablePath();
+      if (!executablePath) {
+        throw new DouyinCredentialError(
+          'Browser endpoint is not configured and Chromium executable was not found.',
+          500
+        );
+      }
+
+      browser = await puppeteer.launch({
+        executablePath,
+        headless: true,
+        args: this.buildChromiumLaunchArgs(),
+      });
+      ownsBrowser = true;
+    }
+
+    const browserContext = await browser.createBrowserContext();
+    const page = await browserContext.newPage();
+    return { browser, browserContext, page, ownsBrowser };
+  }
+
+  private getBrowserEndpoint(): string {
+    return (
+      process.env.DOUYIN_BROWSER_ENDPOINT?.trim() ||
+      process.env.DOUYIN_BROWSER_WS_ENDPOINT?.trim() ||
+      process.env.BROWSER_WS_ENDPOINT?.trim() ||
+      ''
+    );
   }
 
   private async importPuppeteer(): Promise<typeof import('puppeteer-core')> {
