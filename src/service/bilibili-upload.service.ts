@@ -6,7 +6,10 @@ import {
   Scope,
   ScopeEnum,
 } from '@midwayjs/core';
+import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as path from 'path';
+import { Readable } from 'stream';
 import { BilibiliCredential } from '../interface';
 import { BilibiliCredentialRepository } from '../repository/bilibili-credential.repository';
 import { StorageService } from './storage.service';
@@ -79,6 +82,8 @@ interface UploadPartInfo {
   partNumber: number;
   eTag: string;
 }
+
+type ChunkBody = Buffer | NodeJS.ReadableStream | Readable;
 
 /**
  * B站视频上传服务
@@ -219,10 +224,8 @@ export class BilibiliUploadService {
       line: line.name,
     });
 
-    // 读取文件
-    const fs = await import('fs/promises');
-    const fileBuffer = await fs.readFile(localPath);
-    const fileSize = fileBuffer.length;
+    const stats = await fsPromises.stat(localPath);
+    const fileSize = stats.size;
 
     // 预上传获取凭证
     const preupload = await this.preupload(part.title, fileSize, line, cookies);
@@ -241,7 +244,12 @@ export class BilibiliUploadService {
     for (let i = 0; i < chunks; i++) {
       const start = i * preupload.chunkSize;
       const end = Math.min(start + preupload.chunkSize, fileSize);
-      const chunkData = fileBuffer.subarray(start, end);
+      const chunkSize = end - start;
+      const chunkStream = fs.createReadStream(localPath, {
+        start,
+        end: end - 1,
+        highWaterMark: Math.min(chunkSize, 1024 * 1024),
+      });
 
       const eTag = await this.uploadChunk(
         preupload.endpoint,
@@ -252,7 +260,8 @@ export class BilibiliUploadService {
         fileSize,
         start,
         end,
-        chunkData,
+        chunkSize,
+        chunkStream,
         preupload.auth
       );
 
@@ -303,9 +312,7 @@ export class BilibiliUploadService {
     line: (typeof UPLOAD_LINES)[0],
     cookies: Record<string, string>
   ): Promise<{ filename: string; cid: number }> {
-    // 从 S3 下载文件
-    const fileBuffer = await this.storageService.download(part.s3Key);
-    const fileSize = fileBuffer.length;
+    const fileSize = await this.resolveS3FileSize(part);
 
     // 预上传获取凭证
     const preupload = await this.preupload(part.title, fileSize, line, cookies);
@@ -324,7 +331,11 @@ export class BilibiliUploadService {
     for (let i = 0; i < chunks; i++) {
       const start = i * preupload.chunkSize;
       const end = Math.min(start + preupload.chunkSize, fileSize);
-      const chunkData = fileBuffer.subarray(start, end);
+      const chunkSize = end - start;
+      const { body } = await this.storageService.getObjectStream(
+        part.s3Key,
+        `bytes=${start}-${end - 1}`
+      );
 
       const eTag = await this.uploadChunk(
         preupload.endpoint,
@@ -335,7 +346,8 @@ export class BilibiliUploadService {
         fileSize,
         start,
         end,
-        chunkData,
+        chunkSize,
+        body,
         preupload.auth
       );
 
@@ -360,6 +372,20 @@ export class BilibiliUploadService {
     const filename = path.parse(filenameWithExt).name;
 
     return { filename, cid: preupload.bizId };
+  }
+
+  private async resolveS3FileSize(part: VideoPart): Promise<number> {
+    if (Number.isFinite(part.size) && part.size > 0) {
+      return part.size;
+    }
+
+    const metadata = await this.storageService.getObjectMetadata(part.s3Key);
+    const fileSize = Number(metadata.contentLength || 0);
+    if (!Number.isFinite(fileSize) || fileSize <= 0) {
+      throw new Error(`Unable to resolve file size for ${part.s3Key}`);
+    }
+
+    return fileSize;
   }
 
   /**
@@ -462,7 +488,8 @@ export class BilibiliUploadService {
     totalSize: number,
     start: number,
     end: number,
-    chunkData: Buffer,
+    chunkSize: number,
+    chunkData: ChunkBody,
     auth: string
   ): Promise<string> {
     // 移除 upos:// 前缀
@@ -472,22 +499,28 @@ export class BilibiliUploadService {
       chunks: totalChunks.toString(),
       total: totalSize.toString(),
       chunk: chunkIndex.toString(),
-      size: chunkData.length.toString(),
+      size: chunkSize.toString(),
       partNumber: (chunkIndex + 1).toString(),
       start: start.toString(),
       end: end.toString(),
     });
 
     const url = `https://${endpoint}/${uposPath}?${params.toString()}`;
-    const response = await fetch(url, {
+    const requestInit: RequestInit & { duplex?: 'half' } = {
       method: 'PUT',
       headers: {
         'X-Upos-Auth': auth,
         'Content-Type': 'application/octet-stream',
-        'Content-Length': chunkData.length.toString(),
+        'Content-Length': chunkSize.toString(),
       },
       body: chunkData as unknown as BodyInit,
-    });
+    };
+
+    if (!Buffer.isBuffer(chunkData)) {
+      requestInit.duplex = 'half';
+    }
+
+    const response = await fetch(url, requestInit);
 
     if (!response.ok) {
       throw new Error(`Failed to upload chunk: HTTP ${response.status}`);
@@ -962,11 +995,14 @@ export class BilibiliUploadService {
       try {
         return await this.fetchPredictedLegacyTid(cookies, filename, title);
       } catch (error) {
-        this.logger.warn('Failed to predict bilibili partition, using fallback', {
-          filename,
-          fallbackTid,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        this.logger.warn(
+          'Failed to predict bilibili partition, using fallback',
+          {
+            filename,
+            fallbackTid,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        );
         return fallbackTid;
       }
     }
@@ -996,7 +1032,9 @@ export class BilibiliUploadService {
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to predict bilibili partition: ${response.status}`);
+      throw new Error(
+        `Failed to predict bilibili partition: ${response.status}`
+      );
     }
 
     const result = (await response.json()) as {
@@ -1007,9 +1045,7 @@ export class BilibiliUploadService {
 
     if (result.code !== 0) {
       throw new Error(
-        `Failed to predict bilibili partition: ${
-          result.message || result.code
-        }`
+        `Failed to predict bilibili partition: ${result.message || result.code}`
       );
     }
 

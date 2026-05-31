@@ -93,9 +93,7 @@ describe('StorageDeleteProcessor current streamer settings', () => {
   });
 
   it('defers scheduled deletion when the streamer extends the delay', async () => {
-    jest
-      .useFakeTimers()
-      .setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
+    jest.useFakeTimers().setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
 
     const { processor, queue } = createProcessor();
     const job = buildJob();
@@ -132,10 +130,101 @@ describe('StorageDeleteProcessor current streamer settings', () => {
     );
   });
 
+  it('defers scheduled deletion when a submission has failed', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
+
+    const { processor, queue } = createProcessor();
+    const job = buildJob();
+
+    processor.jobService.findById.mockResolvedValue(job);
+    processor.streamerService.findByStreamerId.mockResolvedValue({
+      streamerId: 'streamer-1',
+      platform: 'bilibili',
+      recordSettings: {
+        autoDelete: {
+          enabled: true,
+          delayMinutes: 1,
+        },
+      },
+    });
+    processor.submissionRepository.findByJobId.mockResolvedValue([
+      {
+        id: 'submission-failed',
+        status: 'failed',
+        totalParts: 3,
+        completedParts: 0,
+        lastError: 'File size is greater than 2 GiB',
+      },
+    ]);
+
+    const result = await processor.execute({
+      id: 'job-db-id',
+      reason: 'scheduled',
+    });
+
+    expect(result).toEqual({ status: 'deferred', id: 'job-db-id' });
+    expect(queue.addJobToQueue).toHaveBeenCalledWith(
+      { id: 'job-db-id', reason: 'scheduled' },
+      { delay: 15 * 60 * 1000 }
+    );
+    expect(processor.jobService.deleteJobStorage).not.toHaveBeenCalled();
+    expect(processor.jobService.updateMetadata).toHaveBeenCalledWith(
+      'job-db-id',
+      expect.objectContaining({
+        storageDeleteDeferReason: 'submission_failed',
+        storageDeleteBlockingSubmissions: [
+          expect.objectContaining({
+            id: 'submission-failed',
+            status: 'failed',
+          }),
+        ],
+      })
+    );
+  });
+
+  it('defers scheduled deletion when auto upload is enabled but no submission exists yet', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
+
+    const { processor, queue } = createProcessor();
+    const job = buildJob();
+
+    processor.jobService.findById.mockResolvedValue(job);
+    processor.streamerService.findByStreamerId.mockResolvedValue({
+      streamerId: 'streamer-1',
+      platform: 'bilibili',
+      recordSettings: {
+        autoDelete: {
+          enabled: true,
+          delayMinutes: 1,
+        },
+      },
+      uploadSettings: {
+        autoUpload: true,
+      },
+    });
+    processor.submissionRepository.findByJobId.mockResolvedValue([]);
+
+    const result = await processor.execute({
+      id: 'job-db-id',
+      reason: 'scheduled',
+    });
+
+    expect(result).toEqual({ status: 'deferred', id: 'job-db-id' });
+    expect(queue.addJobToQueue).toHaveBeenCalledWith(
+      { id: 'job-db-id', reason: 'scheduled' },
+      { delay: 15 * 60 * 1000 }
+    );
+    expect(processor.jobService.deleteJobStorage).not.toHaveBeenCalled();
+    expect(processor.jobService.updateMetadata).toHaveBeenCalledWith(
+      'job-db-id',
+      expect.objectContaining({
+        storageDeleteDeferReason: 'submission_missing',
+      })
+    );
+  });
+
   it('deletes scheduled storage when current streamer settings still allow it', async () => {
-    jest
-      .useFakeTimers()
-      .setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
+    jest.useFakeTimers().setSystemTime(new Date('2026-05-18T12:00:00.000Z'));
 
     const { processor } = createProcessor();
     const job = buildJob();

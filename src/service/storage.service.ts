@@ -2,6 +2,7 @@ import {
   CreateBucketCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   HeadBucketCommand,
   ListObjectsV2Command,
   PutObjectCommand,
@@ -226,6 +227,38 @@ export class StorageService {
       throw new StorageError(
         `Failed to stream ${key}: ${errorMsg}`,
         'getObjectStream',
+        true
+      );
+    }
+  }
+
+  /**
+   * 获取对象元数据
+   */
+  async getObjectMetadata(key: string): Promise<{
+    contentLength?: number;
+    contentType?: string;
+    etag?: string;
+    lastModified?: Date;
+  }> {
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: this.s3Config.bucket,
+        Key: key,
+      });
+      const response = await this.client.send(command);
+
+      return {
+        contentLength: response.ContentLength,
+        contentType: response.ContentType,
+        etag: response.ETag,
+        lastModified: response.LastModified,
+      };
+    } catch (error) {
+      const errorMsg = getS3ErrorMessage(error);
+      throw new StorageError(
+        `Failed to read metadata for ${key}: ${errorMsg}`,
+        'headObject',
         true
       );
     }

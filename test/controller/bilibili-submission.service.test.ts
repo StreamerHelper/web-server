@@ -44,6 +44,7 @@ describe('BilibiliSubmissionService title handling', () => {
       findById: jest.fn(),
       updateStatus: jest.fn(),
       updatePartStatus: jest.fn(),
+      updateParts: jest.fn(),
       updateUploadedResult: jest.fn(),
       updateCollectionResult: jest.fn(),
       completeSubmission: jest.fn(),
@@ -57,9 +58,7 @@ describe('BilibiliSubmissionService title handling', () => {
       addVideoToSeason: jest.fn(),
     };
     service.bilibiliPartitionService = {
-      resolveHumanType2: jest
-        .fn()
-        .mockImplementation(value => value || 2066),
+      resolveHumanType2: jest.fn().mockImplementation(value => value || 2066),
     };
     service.submissionTemplateService = createTemplateService();
     return service;
@@ -357,13 +356,11 @@ describe('BilibiliSubmissionService title handling', () => {
       dynamic: '',
       collectionAutoAdd: false,
     });
-    service.downloadAndMergeSegments = jest
-      .fn()
-      .mockResolvedValue({
-        filePath: '/tmp/part_2.mkv',
-        duration: 1800000,
-        fileSize: 512000000,
-      });
+    service.downloadAndMergeSegments = jest.fn().mockResolvedValue({
+      filePath: '/tmp/part_2.mkv',
+      duration: 1800000,
+      fileSize: 512000000,
+    });
     service.uploadService.uploadPartFromLocal.mockResolvedValue({
       filename: 'new-file',
       cid: 1002,
@@ -395,11 +392,9 @@ describe('BilibiliSubmissionService title handling', () => {
         humanType2: 2066,
       })
     );
-    expect(service.submissionRepository.updateUploadedResult).toHaveBeenCalledWith(
-      'submission-append',
-      'BV1xx411c7mD',
-      123456
-    );
+    expect(
+      service.submissionRepository.updateUploadedResult
+    ).toHaveBeenCalledWith('submission-append', 'BV1xx411c7mD', 123456);
     expect(service.submissionRepository.updatePartStatus).toHaveBeenCalledWith(
       'submission-append',
       2,
@@ -509,6 +504,110 @@ describe('BilibiliSubmissionService title handling', () => {
     );
   });
 
+  it('splits an oversized merged part into smaller pending parts before uploading', async () => {
+    const service = createService();
+    const s3Keys = [
+      'raw/job-split/video/segment_20260426_120000.mkv',
+      'raw/job-split/video/segment_20260426_120010.mkv',
+      'raw/job-split/video/segment_20260426_120020.mkv',
+      'raw/job-split/video/segment_20260426_120030.mkv',
+    ];
+
+    service.submissionRepository.findById.mockResolvedValue({
+      id: 'submission-split',
+      status: SubmissionStatus.PENDING,
+      totalParts: 1,
+      completedParts: 0,
+      parts: [
+        {
+          index: 1,
+          title: '2026-04-26 12:00',
+          s3Keys,
+          status: PartStatus.PENDING,
+        },
+      ],
+      bvid: null,
+      avid: null,
+      title: '超大分P投稿',
+      description: '简介',
+      tags: ['直播'],
+      tid: 171,
+      humanType2: 2066,
+      cover: null,
+      copyright: 2,
+      source: 'https://live.bilibili.com/12345',
+      dynamic: '',
+      collectionAutoAdd: false,
+    });
+    service.getMaxMergedPartFileSizeBytes = jest.fn(() => 100);
+    service.downloadAndMergeSegments = jest
+      .fn()
+      .mockImplementation(async (keys: string[]) => {
+        if (keys.length === 4) {
+          return {
+            filePath: '/tmp/part_oversized.mkv',
+            duration: 40000,
+            fileSize: 250,
+          };
+        }
+
+        return {
+          filePath: `/tmp/part_${keys[0]}.mkv`,
+          duration: keys.length * 10000,
+          fileSize: 90,
+        };
+      });
+    service.uploadService.uploadPartFromLocal
+      .mockResolvedValueOnce({
+        filename: 'split-file-1',
+        cid: 1001,
+      })
+      .mockResolvedValueOnce({
+        filename: 'split-file-2',
+        cid: 1002,
+      });
+    service.uploadService.submitVideoParts.mockResolvedValue({
+      bvid: 'BV1split',
+      avid: 123456,
+    });
+
+    await service.processSubmission('submission-split');
+
+    expect(service.submissionRepository.updateParts).toHaveBeenCalledWith(
+      'submission-split',
+      [
+        expect.objectContaining({
+          index: 1,
+          s3Keys: s3Keys.slice(0, 2),
+          status: PartStatus.PENDING,
+        }),
+        expect.objectContaining({
+          index: 2,
+          s3Keys: s3Keys.slice(2),
+          status: PartStatus.PENDING,
+        }),
+      ]
+    );
+    expect(service.uploadService.uploadPartFromLocal).toHaveBeenCalledTimes(2);
+    expect(service.uploadService.submitVideoParts).toHaveBeenCalledWith(
+      [
+        {
+          title: '2026-04-26 12:00',
+          filename: 'split-file-1',
+          cid: 1001,
+        },
+        {
+          title: '2026-04-26 12:00',
+          filename: 'split-file-2',
+          cid: 1002,
+        },
+      ],
+      expect.objectContaining({
+        title: '超大分P投稿',
+      })
+    );
+  });
+
   it('regenerates a deleted archive from reusable bilibili filenames', async () => {
     const service = createService();
     service.submissionRepository.findById
@@ -571,11 +670,9 @@ describe('BilibiliSubmissionService title handling', () => {
         humanType2: 2066,
       })
     );
-    expect(service.submissionRepository.updateUploadedResult).toHaveBeenCalledWith(
-      'submission-regenerate',
-      'BV1new',
-      200002
-    );
+    expect(
+      service.submissionRepository.updateUploadedResult
+    ).toHaveBeenCalledWith('submission-regenerate', 'BV1new', 200002);
     expect(
       service.submissionRepository.completeSubmission
     ).toHaveBeenCalledWith('submission-regenerate');
@@ -598,7 +695,9 @@ describe('BilibiliSubmissionService title handling', () => {
 
     await expect(
       service.regenerateSubmission('submission-missing-upload')
-    ).rejects.toThrow('Missing reusable Bilibili filename or CID for parts: P1');
+    ).rejects.toThrow(
+      'Missing reusable Bilibili filename or CID for parts: P1'
+    );
     expect(service.uploadService.submitVideoParts).not.toHaveBeenCalled();
   });
 
@@ -673,10 +772,8 @@ describe('BilibiliSubmissionService title handling', () => {
         title: '重复标题投稿',
       })
     );
-    expect(service.submissionRepository.updateUploadedResult).toHaveBeenCalledWith(
-      'submission-duplicate-title',
-      'BV1new',
-      200002
-    );
+    expect(
+      service.submissionRepository.updateUploadedResult
+    ).toHaveBeenCalledWith('submission-duplicate-title', 'BV1new', 200002);
   });
 });

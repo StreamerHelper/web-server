@@ -41,6 +41,7 @@ const PART_DURATION_SECONDS = 3600;
 const SEGMENT_DURATION_SECONDS = 10;
 const BILIBILI_COPYRIGHT_REPRINT = 2;
 const REGENERATE_RESTORE_TIMEOUT_MS = 12000;
+const DEFAULT_MAX_MERGED_PART_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 
 interface MergedPartFile {
   filePath: string;
@@ -264,7 +265,8 @@ export class BilibiliSubmissionService {
       startedAt: data.startedAt || startedAt?.toISOString(),
       endedAt: data.endedAt || endedAt?.toISOString(),
       duration:
-        data.duration ?? Math.round(sortedKeys.length * SEGMENT_DURATION_SECONDS * 1000),
+        data.duration ??
+        Math.round(sortedKeys.length * SEGMENT_DURATION_SECONDS * 1000),
     };
   }
 
@@ -291,7 +293,7 @@ export class BilibiliSubmissionService {
         bvid: submission.bvid || '',
         avid: Number(submission.avid || 0),
       };
-      const parts = this.normalizeSubmissionParts(submission.parts || []);
+      let parts = this.normalizeSubmissionParts(submission.parts || []);
       const uploadedParts: BilibiliUploadedPart[] = [];
       const hasUnfinishedParts = parts.some(
         part =>
@@ -310,11 +312,17 @@ export class BilibiliSubmissionService {
         await fs.mkdir(tempBaseDir, { recursive: true });
         tempDir = await fs.mkdtemp(path.join(tempBaseDir, 'submission-'));
 
-        for (const part of parts) {
+        let partCursor = 0;
+        while (partCursor < parts.length) {
+          const part = parts[partCursor];
           const partTitle = this.resolvePartTitle(part);
 
           // 跳过已完成的分P
-          if (part.status === PartStatus.COMPLETED && part.filename && part.cid) {
+          if (
+            part.status === PartStatus.COMPLETED &&
+            part.filename &&
+            part.cid
+          ) {
             uploadedParts.push({
               title: partTitle,
               filename: part.filename,
@@ -328,6 +336,7 @@ export class BilibiliSubmissionService {
                 { title: partTitle }
               );
             }
+            partCursor += 1;
             continue;
           }
 
@@ -352,6 +361,30 @@ export class BilibiliSubmissionService {
             part.index
           );
           const mergedFilePath = mergedPart.filePath;
+          const splitParts = this.splitMergedPartIfOversized(part, mergedPart);
+          if (splitParts) {
+            await fs.unlink(mergedFilePath).catch(() => {});
+            parts = this.replacePartWithSplitParts(
+              parts,
+              part.index,
+              splitParts
+            );
+            await this.submissionRepository.updateParts(submissionId, parts);
+            this.logger.warn(
+              'Merged part exceeded size threshold and was split',
+              {
+                submissionId,
+                originalPartIndex: part.index,
+                fileSize: mergedPart.fileSize,
+                maxFileSize: this.getMaxMergedPartFileSizeBytes(),
+                replacementParts: splitParts.length,
+                replacementSegmentCounts: splitParts.map(
+                  item => item.s3Keys.length
+                ),
+              }
+            );
+            continue;
+          }
 
           // 更新分P状态为上传中
           await this.submissionRepository.updatePartStatus(
@@ -407,6 +440,7 @@ export class BilibiliSubmissionService {
             filename: uploadedPart.filename,
             cid: uploadedPart.cid,
           });
+          partCursor += 1;
         }
 
         // 3. 提交稿件
@@ -500,6 +534,87 @@ export class BilibiliSubmissionService {
     }
   }
 
+  private splitMergedPartIfOversized(
+    part: SubmissionPart,
+    mergedPart: MergedPartFile
+  ): SubmissionPart[] | null {
+    const maxFileSize = this.getMaxMergedPartFileSizeBytes();
+    if (mergedPart.fileSize <= maxFileSize) {
+      return null;
+    }
+
+    const s3Keys = [...(part.s3Keys || [])].sort();
+    if (s3Keys.length <= 1) {
+      throw new Error(
+        `Merged part P${part.index} is ${mergedPart.fileSize} bytes, exceeding ${maxFileSize} bytes, but it only contains one source segment and cannot be split further.`
+      );
+    }
+
+    const splitCount = Math.ceil(mergedPart.fileSize / maxFileSize);
+    const segmentsPerSplit = Math.max(1, Math.ceil(s3Keys.length / splitCount));
+    if (segmentsPerSplit >= s3Keys.length) {
+      throw new Error(
+        `Merged part P${part.index} is ${mergedPart.fileSize} bytes, exceeding ${maxFileSize} bytes, but no smaller split can be planned.`
+      );
+    }
+
+    const splitParts: SubmissionPart[] = [];
+    for (let offset = 0; offset < s3Keys.length; offset += segmentsPerSplit) {
+      splitParts.push(
+        this.buildSubmissionPart(
+          s3Keys.slice(offset, offset + segmentsPerSplit),
+          splitParts.length + 1,
+          PartStatus.PENDING,
+          part.rhythmIntervalMinutes
+        )
+      );
+    }
+
+    return splitParts;
+  }
+
+  private replacePartWithSplitParts(
+    parts: SubmissionPart[],
+    partIndex: number,
+    splitParts: SubmissionPart[]
+  ): SubmissionPart[] {
+    const sortedParts = [...parts].sort(
+      (a, b) => Number(a.index || 0) - Number(b.index || 0)
+    );
+    const targetIndex = sortedParts.findIndex(part => part.index === partIndex);
+    if (targetIndex < 0) {
+      return sortedParts;
+    }
+
+    const nextParts = [
+      ...sortedParts.slice(0, targetIndex),
+      ...splitParts,
+      ...sortedParts.slice(targetIndex + 1),
+    ];
+
+    return nextParts.map((part, index) =>
+      this.buildSubmissionPart(
+        part.s3Keys,
+        index + 1,
+        part.status,
+        part.rhythmIntervalMinutes,
+        {
+          ...part,
+          index: index + 1,
+        }
+      )
+    );
+  }
+
+  private getMaxMergedPartFileSizeBytes(): number {
+    const configured = Number(process.env.BILIBILI_MAX_PART_SIZE_BYTES || 0);
+    if (Number.isFinite(configured) && configured > 0) {
+      return configured;
+    }
+
+    return DEFAULT_MAX_MERGED_PART_FILE_SIZE_BYTES;
+  }
+
   async regenerateSubmission(
     submissionId: string
   ): Promise<BilibiliSubmissionEntity> {
@@ -552,7 +667,9 @@ export class BilibiliSubmissionService {
         submissionId
       );
       if (!updatedSubmission) {
-        throw new Error(`Submission not found after regenerate: ${submissionId}`);
+        throw new Error(
+          `Submission not found after regenerate: ${submissionId}`
+        );
       }
 
       this.logger.info('Bilibili submission regenerated', {
@@ -632,8 +749,9 @@ export class BilibiliSubmissionService {
       collectionInput.cid = resolvedCid;
     }
 
-    const collectionResult =
-      await this.bilibiliSeasonService.addVideoToSeason(collectionInput);
+    const collectionResult = await this.bilibiliSeasonService.addVideoToSeason(
+      collectionInput
+    );
 
     await this.submissionRepository.updateCollectionResult(
       submission.id,
@@ -797,12 +915,14 @@ export class BilibiliSubmissionService {
   private isDuplicateSuccessfulSubmissionError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return (
-      message.includes('稿件已成功投稿') &&
-      message.includes('请勿重新提交')
+      message.includes('稿件已成功投稿') && message.includes('请勿重新提交')
     );
   }
 
-  private buildRecoverySubmissionTitle(title: string, submissionId: string): string {
+  private buildRecoverySubmissionTitle(
+    title: string,
+    submissionId: string
+  ): string {
     const now = new Date();
     const suffix = ` 恢复${this.formatCompactDateTime(now)}${submissionId.slice(
       0,
@@ -908,7 +1028,9 @@ export class BilibiliSubmissionService {
       }
     | undefined {
     const basename = s3Key ? path.basename(s3Key) : '';
-    const match = basename.match(/segment_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+    const match = basename.match(
+      /segment_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/
+    );
     if (!match) {
       return undefined;
     }
