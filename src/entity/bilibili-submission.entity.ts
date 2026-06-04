@@ -43,6 +43,8 @@ export interface SubmissionPart {
   status: PartStatus;
   /** 分段投稿间隔，存在时表示该分P来自投稿节奏 */
   rhythmIntervalMinutes?: number;
+  /** 是否在合并后把 ASR 字幕压制到视频内 */
+  burnInSubtitles?: boolean;
   /** 分P起始时间 */
   startedAt?: string;
   /** 分P结束时间 */

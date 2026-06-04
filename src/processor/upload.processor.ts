@@ -1,10 +1,18 @@
 import { Framework, IProcessor, Processor } from '@midwayjs/bullmq';
-import { ILogger, Inject, Logger } from '@midwayjs/core';
+import { Config, ILogger, Inject, Logger } from '@midwayjs/core';
+import * as path from 'path';
 import * as fs from 'fs/promises';
 import { UploadJobData } from '../interface';
+import { TranscriptJobData } from '../interface/data';
 import { StorageService } from '../service/storage.service';
 import { JobService } from '../service/job.service';
 import { BilibiliSubmissionRhythmService } from '../service/bilibili-submission-rhythm.service';
+import { AsrService } from '../service/asr.service';
+
+interface AsrQueueConfig {
+  enabled?: boolean;
+  transcribeRecordings?: boolean;
+}
 
 @Processor('upload')
 export class UploadProcessor implements IProcessor {
@@ -18,7 +26,13 @@ export class UploadProcessor implements IProcessor {
   rhythmService: BilibiliSubmissionRhythmService;
 
   @Inject()
+  asrService: AsrService;
+
+  @Inject()
   bullFramework: Framework;
+
+  @Config('streamerhelper.asr')
+  asrConfig: AsrQueueConfig;
 
   @Logger()
   private logger: ILogger;
@@ -58,6 +72,14 @@ export class UploadProcessor implements IProcessor {
               error: error instanceof Error ? error.message : String(error),
             });
           });
+
+        await this.scheduleTranscriptJob(data).catch(error => {
+          this.logger.error('Failed to schedule transcript job', {
+            id,
+            s3Key,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
       }
 
       this.logger.info('Upload completed', {
@@ -130,5 +152,54 @@ export class UploadProcessor implements IProcessor {
     ];
 
     return retryablePatterns.some(pattern => errorMessage.includes(pattern));
+  }
+
+  private async scheduleTranscriptJob(data: UploadJobData): Promise<void> {
+    const { id, s3Key, startTimeOffsetMs = 0 } = data;
+    if (!this.asrConfig?.enabled || !this.asrConfig?.transcribeRecordings) {
+      return;
+    }
+    if (!this.asrService.isAvailable()) {
+      this.logger.debug('ASR service unavailable, skip transcript scheduling', {
+        id,
+        s3Key,
+      });
+      return;
+    }
+
+    const transcriptQueue = this.bullFramework.getQueue('transcript');
+    if (!transcriptQueue) {
+      this.logger.warn('Transcript queue not found', { id, s3Key });
+      return;
+    }
+
+    const segmentId = this.getSegmentId(s3Key);
+    const outputS3Key = `transcript/${id}/${segmentId}.jsonl`;
+
+    await transcriptQueue.addJobToQueue(
+      {
+        id,
+        segmentId,
+        videoS3Key: s3Key,
+        outputS3Key,
+        startTimeOffsetMs,
+      } as TranscriptJobData,
+      {
+        attempts: 2,
+        jobId: `transcript:${id}:${segmentId}`,
+      }
+    );
+
+    this.logger.info('Transcript job scheduled', {
+      id,
+      segmentId,
+      videoS3Key: s3Key,
+      outputS3Key,
+      startTimeOffsetMs,
+    });
+  }
+
+  private getSegmentId(s3Key: string): string {
+    return path.basename(s3Key).replace(/\.[^.]+$/, '');
   }
 }

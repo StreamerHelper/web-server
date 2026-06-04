@@ -60,6 +60,7 @@ export class Streamer {
     description?: string;
     tags?: string[];
     humanType2?: number;
+    burnInSubtitles?: boolean;
     collection?: BilibiliCollectionBinding;
   };
 

@@ -1,18 +1,41 @@
 import { Framework } from '@midwayjs/bullmq';
-import { App, Controller, Get, Inject, Post, Query } from '@midwayjs/core';
+import {
+  App,
+  Body,
+  Controller,
+  Get,
+  Inject,
+  Post,
+  Query,
+} from '@midwayjs/core';
 import { Application, Context } from '@midwayjs/koa';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getConfig, updateConfig } from '../config/loader';
 import {
-    FailedStreamerInfo,
-    LiveStreamInfo,
-    OfflineStreamerInfo,
-    Platform,
-    StreamerLiveStatus,
+  FailedStreamerInfo,
+  LiveStreamInfo,
+  OfflineStreamerInfo,
+  Platform,
+  StreamerLiveStatus,
 } from '../interface';
+import { AsrService } from '../service/asr.service';
 import { JobService } from '../service/job.service';
 import { PlatformService } from '../service/platform.service';
 import { StreamerService } from '../service/streamer.service';
+
+interface UpdateAsrSettingsBody {
+  enabled?: boolean;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  apiKeyEnv?: string;
+  baseUrl?: string;
+  model?: string;
+  language?: string;
+  chunkSeconds?: number;
+  concurrency?: number;
+  transcribeRecordings?: boolean;
+}
 
 @Controller('/api/system')
 export class SystemController {
@@ -33,6 +56,9 @@ export class SystemController {
 
   @Inject()
   bullFramework: Framework;
+
+  @Inject()
+  asrService: AsrService;
 
   /**
    * GET /api/system/health - 健康检查
@@ -64,6 +90,9 @@ export class SystemController {
       const analyzeQueue = this.bullFramework.getQueue('analyze');
       const cleanupQueue = this.bullFramework.getQueue('cleanup');
       const storageDeleteQueue = this.bullFramework.getQueue('storage-delete');
+      const transcriptQueue = this.bullFramework.getQueue('transcript');
+      const transcriptUploadQueue =
+        this.bullFramework.getQueue('transcript-upload');
 
       const queueStats = {
         recording: {
@@ -85,6 +114,14 @@ export class SystemController {
         storageDelete: {
           waiting: (await storageDeleteQueue?.getWaitingCount()) || 0,
           active: (await storageDeleteQueue?.getActiveCount()) || 0,
+        },
+        transcript: {
+          waiting: (await transcriptQueue?.getWaitingCount()) || 0,
+          active: (await transcriptQueue?.getActiveCount()) || 0,
+        },
+        transcriptUpload: {
+          waiting: (await transcriptUploadQueue?.getWaitingCount()) || 0,
+          active: (await transcriptUploadQueue?.getActiveCount()) || 0,
         },
       };
 
@@ -203,6 +240,96 @@ export class SystemController {
       this.ctx.status = 500;
       return { error: 'Internal server error' };
     }
+  }
+
+  /**
+   * GET /api/system/asr-settings - 获取 ASR 配置状态（不返回明文 AK）
+   */
+  @Get('/asr-settings')
+  async getAsrSettings(): Promise<Record<string, unknown>> {
+    return this.asrService.getPublicStatus();
+  }
+
+  /**
+   * POST /api/system/asr-settings - 保存 ASR 配置
+   */
+  @Post('/asr-settings')
+  async updateAsrSettings(
+    @Body() body: UpdateAsrSettingsBody
+  ): Promise<Record<string, unknown>> {
+    try {
+      const current = getConfig().asr;
+      const nextAsr = {
+        ...current,
+        enabled:
+          body.enabled === undefined ? current.enabled : Boolean(body.enabled),
+        provider: 'aliyun' as const,
+        apiKey:
+          body.clearApiKey === true
+            ? ''
+            : typeof body.apiKey === 'string' && body.apiKey.trim()
+            ? body.apiKey.trim()
+            : current.apiKey,
+        apiKeyEnv:
+          typeof body.apiKeyEnv === 'string' && body.apiKeyEnv.trim()
+            ? body.apiKeyEnv.trim()
+            : current.apiKeyEnv,
+        baseUrl:
+          typeof body.baseUrl === 'string' && body.baseUrl.trim()
+            ? body.baseUrl.trim()
+            : current.baseUrl,
+        model:
+          typeof body.model === 'string' && body.model.trim()
+            ? body.model.trim()
+            : current.model,
+        language:
+          typeof body.language === 'string' && body.language.trim()
+            ? body.language.trim()
+            : current.language,
+        chunkSeconds: this.normalizePositiveInteger(
+          body.chunkSeconds,
+          current.chunkSeconds,
+          30,
+          1800
+        ),
+        concurrency: this.normalizePositiveInteger(
+          body.concurrency,
+          current.concurrency,
+          1,
+          8
+        ),
+        transcribeRecordings:
+          body.transcribeRecordings === undefined
+            ? current.transcribeRecordings
+            : Boolean(body.transcribeRecordings),
+      };
+
+      updateConfig({
+        asr: nextAsr,
+      });
+      this.asrService.updateConfig(nextAsr);
+
+      return this.asrService.getPublicStatus();
+    } catch (error) {
+      this.ctx.logger.error('Failed to update ASR settings', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.ctx.status = 500;
+      return { error: 'Internal server error' };
+    }
+  }
+
+  private normalizePositiveInteger(
+    value: unknown,
+    fallback: number,
+    min: number,
+    max: number
+  ): number {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed)) {
+      return fallback;
+    }
+    return Math.min(max, Math.max(min, parsed));
   }
 
   /**

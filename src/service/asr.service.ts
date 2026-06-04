@@ -1,7 +1,28 @@
-import { ILogger, Logger, Provide, Scope, ScopeEnum } from '@midwayjs/core';
+import {
+  Config,
+  ILogger,
+  Logger,
+  Provide,
+  Scope,
+  ScopeEnum,
+} from '@midwayjs/core';
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { TranscriptMessage } from '../interface/data';
+import { transcribeFileForStreamerHelper } from './asr-transcriber';
+
+interface AsrConfig {
+  enabled: boolean;
+  provider: 'aliyun';
+  apiKey: string;
+  apiKeyEnv: string;
+  baseUrl: string;
+  model: string;
+  language: string;
+  chunkSeconds: number;
+  concurrency: number;
+  transcribeRecordings: boolean;
+}
 
 /**
  * ASR 服务选项
@@ -28,15 +49,11 @@ export interface AsrResult {
 }
 
 /**
- * ASR 服务（占位）
+ * ASR 服务
  *
- * TODO: 集成具体的语音识别大模型
- * 可选方案：
- * - 阿里云语音识别（实时语音识别、录音文件识别）
- * - 火山引擎语音识别
- * - 腾讯云语音识别
- * - OpenAI Whisper API
- * - 本部署 Whisper 模型
+ * 当前实现复用 v2t 的音频切片和阿里云百炼 qwen3-asr-flash
+ * 识别逻辑。输出保持 TranscriptMessage JSONL 结构，供现有
+ * transcript-upload/text 查询链路复用。
  */
 @Provide()
 @Scope(ScopeEnum.Singleton)
@@ -44,19 +61,13 @@ export class AsrService {
   @Logger()
   private logger: ILogger;
 
-  // TODO: 配置项（从配置中心获取）
-  private readonly config = {
-    provider: 'placeholder', // asr provider
-    apiKey: '',
-    apiEndpoint: '',
-    model: 'default',
-    language: 'zh-CN',
-  };
+  @Config('streamerhelper.asr')
+  private config: AsrConfig;
 
   /**
-   * 转录音频文件（占位）
+   * 转录音视频文件
    *
-   * @param audioPath 音频文件路径
+   * @param audioPath 音视频文件路径
    * @param options ASR 选项
    * @returns 转录结果
    */
@@ -64,26 +75,53 @@ export class AsrService {
     audioPath: string,
     options: AsrServiceOptions
   ): Promise<AsrResult> {
-    this.logger.warn('ASR service is not implemented yet', {
+    if (!this.isAvailable()) {
+      throw new Error('ASR service is not available');
+    }
+
+    const config = this.getConfig();
+    const language = options.language || config.language;
+
+    this.logger.info('Starting ASR transcription', {
       audioPath,
-      options,
+      jobId: options.id,
+      provider: config.provider,
+      model: config.model,
+      language,
+      chunkSeconds: config.chunkSeconds,
+      concurrency: config.concurrency,
     });
 
-    // TODO: 实现实际的 ASR 调用
-    // 1. 读取音频文件
-    // 2. 调用 ASR API
-    // 3. 解析结果
-    // 4. 返回 TranscriptMessage[]
+    const result = await transcribeFileForStreamerHelper(
+      audioPath,
+      {
+        id: options.id,
+        outputDir: options.outputDir,
+        language,
+        enableSpeakerDiarization: options.enableSpeakerDiarization,
+        enablePunctuation: options.enablePunctuation,
+        enableInterimResults: options.enableInterimResults,
+        chunkSeconds: config.chunkSeconds,
+        concurrency: config.concurrency,
+      },
+      {
+        apiKey: this.resolveApiKey(true),
+        baseUrl: config.baseUrl,
+        model: config.model,
+        language,
+      }
+    );
 
-    // 占位：返回空结果
-    return {
-      jobId: options.id,
-      segmentId: this.generateSegmentId(audioPath),
-      messages: [],
-      duration: 0,
-      wordCount: 0,
-      language: options.language || this.config.language,
-    };
+    this.logger.info('ASR transcription completed', {
+      audioPath,
+      jobId: result.jobId,
+      segmentId: result.segmentId,
+      messageCount: result.messages.length,
+      duration: result.duration,
+      wordCount: result.wordCount,
+    });
+
+    return result as AsrResult;
   }
 
   /**
@@ -149,19 +187,15 @@ export class AsrService {
   }
 
   /**
-   * 生成分片 ID
-   */
-  private generateSegmentId(audioPath: string): string {
-    const filename = audioPath.split('/').pop() || '';
-    return filename.replace(/\.[^/.]+$/, '');
-  }
-
-  /**
    * 检查服务是否可用
    */
   isAvailable(): boolean {
-    // TODO: 检查 ASR 服务配置和连接状态
-    return false; // 占位：返回 false
+    const config = this.getConfig();
+    return (
+      config.enabled &&
+      config.provider === 'aliyun' &&
+      Boolean(this.resolveApiKey(false))
+    );
   }
 
   /**
@@ -182,10 +216,83 @@ export class AsrService {
     streaming: boolean;
   } {
     return {
-      speakerDiarization: false, // 占位
-      punctuation: false, // 占位
-      interimResults: false, // 占位
-      streaming: false, // 占位
+      speakerDiarization: false,
+      punctuation: true,
+      interimResults: false,
+      streaming: false,
     };
+  }
+
+  getPublicStatus(): Omit<AsrConfig, 'apiKey'> & {
+    available: boolean;
+    apiKeySet: boolean;
+    apiKeyMasked: string;
+  } {
+    const config = this.getConfig();
+    const apiKey = this.resolveApiKey(false) || '';
+
+    return {
+      enabled: config.enabled,
+      provider: config.provider,
+      apiKeyEnv: config.apiKeyEnv,
+      baseUrl: config.baseUrl,
+      model: config.model,
+      language: config.language,
+      chunkSeconds: config.chunkSeconds,
+      concurrency: config.concurrency,
+      transcribeRecordings: config.transcribeRecordings,
+      available: this.isAvailable(),
+      apiKeySet: Boolean(apiKey),
+      apiKeyMasked: this.maskApiKey(apiKey),
+    };
+  }
+
+  updateConfig(patch: Partial<AsrConfig>): void {
+    this.config = {
+      ...this.getConfig(),
+      ...patch,
+    };
+  }
+
+  private getConfig(): AsrConfig {
+    return (
+      this.config || {
+        enabled: true,
+        provider: 'aliyun',
+        apiKey: '',
+        apiKeyEnv: 'DASHSCOPE_API_KEY',
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        model: 'qwen3-asr-flash',
+        language: 'zh-CN',
+        chunkSeconds: 240,
+        concurrency: 1,
+        transcribeRecordings: true,
+      }
+    );
+  }
+
+  private resolveApiKey(throwOnMissing: true): string;
+  private resolveApiKey(throwOnMissing: false): string | undefined;
+  private resolveApiKey(throwOnMissing: boolean): string | undefined {
+    const config = this.getConfig();
+    const apiKey = config.apiKey || process.env[config.apiKeyEnv];
+
+    if (!apiKey && throwOnMissing) {
+      throw new Error(
+        `Missing ASR API key. Set streamerhelper.asr.apiKey or ${config.apiKeyEnv}.`
+      );
+    }
+
+    return apiKey;
+  }
+
+  private maskApiKey(apiKey: string): string {
+    if (!apiKey) {
+      return '';
+    }
+    if (apiKey.length <= 8) {
+      return '********';
+    }
+    return `${apiKey.slice(0, 4)}****${apiKey.slice(-4)}`;
   }
 }

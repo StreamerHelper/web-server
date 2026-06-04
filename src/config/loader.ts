@@ -113,6 +113,18 @@ export interface AppConfig {
     defaultTid: number;
     defaultTitleTemplate: string;
   };
+  asr: {
+    enabled: boolean;
+    provider: 'aliyun';
+    apiKey: string;
+    apiKeyEnv: string;
+    baseUrl: string;
+    model: string;
+    language: string;
+    chunkSeconds: number;
+    concurrency: number;
+    transcribeRecordings: boolean;
+  };
   platforms: {
     douyin: {
       cookie: string;
@@ -165,6 +177,18 @@ const DEFAULT_CONFIG: AppConfig = {
   upload: {
     defaultTid: 171,
     defaultTitleTemplate: '{主播名}的直播录像 {日期}',
+  },
+  asr: {
+    enabled: true,
+    provider: 'aliyun',
+    apiKey: '',
+    apiKeyEnv: 'DASHSCOPE_API_KEY',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen3-asr-flash',
+    language: 'zh-CN',
+    chunkSeconds: 240,
+    concurrency: 1,
+    transcribeRecordings: true,
   },
   platforms: {
     douyin: {
@@ -281,6 +305,68 @@ function getEnvOverrides(): Partial<AppConfig> {
     overrides.s3 = { ...overrides.s3, bucket: process.env.S3_BUCKET };
   }
 
+  // ASR
+  if (process.env.ASR_ENABLED) {
+    overrides.asr = {
+      ...overrides.asr,
+      enabled: process.env.ASR_ENABLED !== 'false',
+    };
+  }
+  if (process.env.ASR_PROVIDER) {
+    overrides.asr = {
+      ...overrides.asr,
+      provider: process.env.ASR_PROVIDER as AppConfig['asr']['provider'],
+    };
+  }
+  if (process.env.ASR_API_KEY) {
+    overrides.asr = {
+      ...overrides.asr,
+      apiKey: process.env.ASR_API_KEY,
+    };
+  }
+  if (process.env.ASR_API_KEY_ENV) {
+    overrides.asr = {
+      ...overrides.asr,
+      apiKeyEnv: process.env.ASR_API_KEY_ENV,
+    };
+  }
+  if (process.env.ASR_BASE_URL) {
+    overrides.asr = {
+      ...overrides.asr,
+      baseUrl: process.env.ASR_BASE_URL,
+    };
+  }
+  if (process.env.ASR_MODEL) {
+    overrides.asr = {
+      ...overrides.asr,
+      model: process.env.ASR_MODEL,
+    };
+  }
+  if (process.env.ASR_LANGUAGE) {
+    overrides.asr = {
+      ...overrides.asr,
+      language: process.env.ASR_LANGUAGE,
+    };
+  }
+  if (process.env.ASR_CHUNK_SECONDS) {
+    overrides.asr = {
+      ...overrides.asr,
+      chunkSeconds: parseInt(process.env.ASR_CHUNK_SECONDS, 10),
+    };
+  }
+  if (process.env.ASR_CONCURRENCY) {
+    overrides.asr = {
+      ...overrides.asr,
+      concurrency: parseInt(process.env.ASR_CONCURRENCY, 10),
+    };
+  }
+  if (process.env.ASR_TRANSCRIBE_RECORDINGS) {
+    overrides.asr = {
+      ...overrides.asr,
+      transcribeRecordings: process.env.ASR_TRANSCRIBE_RECORDINGS !== 'false',
+    };
+  }
+
   // Platform request options
   if (process.env.DOUYIN_COOKIE || process.env.DOUYIN_USER_AGENT) {
     overrides.platforms = {
@@ -372,6 +458,36 @@ export function getConfig(): AppConfig {
   if (!configInstance) {
     configInstance = loadConfig();
   }
+  return configInstance;
+}
+
+export function updateConfig(patch: Partial<AppConfig>): AppConfig {
+  const configPath = getConfigFilePath();
+  if (!fs.existsSync(configPath)) {
+    generateDefaultConfigFile();
+  }
+
+  let fileConfig: Partial<AppConfig> = {};
+  try {
+    fileConfig = readConfigFile(configPath);
+  } catch {
+    fileConfig = {};
+  }
+
+  const nextFileConfig = merge({}, fileConfig, patch);
+  ensureConfigDir();
+  fs.writeFileSync(
+    configPath,
+    `${JSON.stringify(nextFileConfig, null, 2)}\n`,
+    'utf-8'
+  );
+
+  const envOverrides = getEnvOverrides();
+  configInstance = merge({}, DEFAULT_CONFIG, nextFileConfig, envOverrides);
+  if (configInstance.app.nodeEnv) {
+    process.env.NODE_ENV = configInstance.app.nodeEnv;
+  }
+
   return configInstance;
 }
 

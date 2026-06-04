@@ -1,6 +1,7 @@
 import { Framework, IProcessor, Processor } from '@midwayjs/bullmq';
 import { ILogger, Inject, Logger } from '@midwayjs/core';
 import * as fs from 'fs/promises';
+import * as path from 'path';
 import {
   TranscriptIndex,
   TranscriptSegmentInfo,
@@ -69,22 +70,26 @@ export class TranscriptUploadProcessor implements IProcessor {
         languages[lang] = (languages[lang] || 0) + 1;
       }
 
+      const segmentStartTime = messages[0]?.timestamp || 0;
+      const segmentEndTime = this.getSegmentEndTime(messages, segmentStartTime);
+
       // 创建分片信息
       const segmentInfo: TranscriptSegmentInfo = {
         segmentId,
         jobId: id,
-        startTime: messages[0]?.timestamp || 0,
-        endTime: messages[messages.length - 1]?.timestamp || 0,
+        startTime: segmentStartTime,
+        endTime: segmentEndTime,
         messageCount: messages.length,
         wordCount,
         s3Key,
         size: fileContent.length,
-        duration: messages[messages.length - 1]?.timestamp || 0,
+        duration: Math.max(0, segmentEndTime - segmentStartTime),
         createdAt: Date.now(),
       };
 
       // 更新 Job metadata
       await this.updateTranscriptIndex(id, segmentInfo, languages);
+      await this.cleanupLocalFiles(localPath);
 
       this.logger.info('Transcript upload completed', {
         id,
@@ -111,6 +116,31 @@ export class TranscriptUploadProcessor implements IProcessor {
       });
 
       throw error;
+    }
+  }
+
+  private getSegmentEndTime(messages: any[], fallback: number): number {
+    return messages.reduce((endTime, message) => {
+      const timestamp =
+        typeof message.timestamp === 'number' ? message.timestamp : fallback;
+      const rawDuration = message.raw?.chunkDurationMs;
+      const duration =
+        typeof rawDuration === 'number' && Number.isFinite(rawDuration)
+          ? rawDuration
+          : 0;
+      return Math.max(endTime, timestamp + duration);
+    }, fallback);
+  }
+
+  private async cleanupLocalFiles(localPath: string): Promise<void> {
+    const tempDir = path.dirname(localPath);
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      this.logger.warn('Failed to cleanup transcript temp dir', {
+        tempDir,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

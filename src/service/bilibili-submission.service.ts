@@ -29,6 +29,8 @@ import { buildPlatformRoomUrl } from '../utils/platform-room-url';
 import { BilibiliCollectionBinding } from '../interface';
 import { BilibiliSeasonService } from './bilibili-season.service';
 import { BilibiliPartitionService } from './bilibili-partition.service';
+import { TranscriptMessage, TranscriptSegmentInfo } from '../interface/data';
+import { formatTranscriptMessages } from '../utils/transcript-format';
 
 /**
  * 每个分P的目标时长（1小时 = 3600秒）
@@ -59,6 +61,7 @@ export interface CreateSubmissionInput {
   description?: string;
   tags?: string[];
   humanType2?: number;
+  burnInSubtitles?: boolean;
   cover?: string;
   copyright?: number;
   source?: string;
@@ -151,6 +154,9 @@ export class BilibiliSubmissionService {
     const collection = this.resolveCollectionBinding(
       input.collection ?? uploadSettings.collection
     );
+    const burnInSubtitles = Boolean(
+      input.burnInSubtitles ?? uploadSettings.burnInSubtitles
+    );
     const cover =
       input.cover ?? job.coverPath ?? streamer?.coverPath ?? undefined;
     const source =
@@ -159,9 +165,23 @@ export class BilibiliSubmissionService {
       buildPlatformRoomUrl(streamer?.platform, streamer?.roomId);
 
     // 规划分P结构
-    const parts = input.parts
+    const plannedParts = input.parts
       ? this.normalizeSubmissionParts(input.parts)
       : this.planParts(s3Keys);
+    const parts = burnInSubtitles
+      ? plannedParts.map(part =>
+          this.buildSubmissionPart(
+            part.s3Keys,
+            part.index,
+            part.status,
+            part.rhythmIntervalMinutes,
+            {
+              ...part,
+              burnInSubtitles: true,
+            }
+          )
+        )
+      : plannedParts;
 
     this.logger.info('Creating submission', {
       jobId: input.jobId,
@@ -262,6 +282,7 @@ export class BilibiliSubmissionService {
       s3Keys: sortedKeys,
       status,
       rhythmIntervalMinutes,
+      burnInSubtitles: data.burnInSubtitles,
       startedAt: data.startedAt || startedAt?.toISOString(),
       endedAt: data.endedAt || endedAt?.toISOString(),
       duration:
@@ -279,6 +300,7 @@ export class BilibiliSubmissionService {
     if (!submission) {
       throw new Error(`Submission not found: ${submissionId}`);
     }
+    const job = await this.jobService.findByJobId(submission.jobId);
 
     this.logger.info('Processing submission', {
       submissionId,
@@ -355,11 +377,19 @@ export class BilibiliSubmissionService {
           );
 
           // 1. 下载并合并分片
-          const mergedPart = await this.downloadAndMergeSegments(
+          let mergedPart = await this.downloadAndMergeSegments(
             part.s3Keys,
             tempDir,
             part.index
           );
+          if (part.burnInSubtitles) {
+            mergedPart = await this.burnInSubtitlesToMergedPart(
+              part,
+              mergedPart,
+              tempDir,
+              job
+            );
+          }
           const mergedFilePath = mergedPart.filePath;
           const splitParts = this.splitMergedPartIfOversized(part, mergedPart);
           if (splitParts) {
@@ -534,6 +564,162 @@ export class BilibiliSubmissionService {
     }
   }
 
+  private async burnInSubtitlesToMergedPart(
+    part: SubmissionPart,
+    mergedPart: MergedPartFile,
+    tempDir: string,
+    job: any
+  ): Promise<MergedPartFile> {
+    const transcriptIndex = job?.metadata?.transcriptIndex;
+    if (!transcriptIndex?.segments?.length) {
+      throw new Error(
+        `Subtitle burn-in requested for P${part.index}, but no transcript data is available.`
+      );
+    }
+
+    const selectedSegments = this.selectTranscriptSegmentsForPart(
+      transcriptIndex.segments,
+      part.s3Keys
+    );
+    if (selectedSegments.length === 0) {
+      throw new Error(
+        `Subtitle burn-in requested for P${part.index}, but no transcript segments match the video part.`
+      );
+    }
+
+    const messages = await this.collectTranscriptMessages(selectedSegments);
+    if (messages.length === 0) {
+      throw new Error(
+        `Subtitle burn-in requested for P${part.index}, but transcript text is empty.`
+      );
+    }
+
+    const subtitleOffsetMs = Math.min(
+      ...selectedSegments.map(segment => segment.startTime)
+    );
+    const srtContent = formatTranscriptMessages(
+      messages,
+      'srt',
+      subtitleOffsetMs + mergedPart.duration,
+      subtitleOffsetMs
+    );
+    const subtitlePath = path.join(tempDir, `part_${part.index}.srt`);
+    const outputPath = path.join(tempDir, `part_${part.index}_subtitled.mkv`);
+    await fs.writeFile(subtitlePath, srtContent, 'utf-8');
+
+    this.logger.info('Burning transcript subtitles into merged part', {
+      partIndex: part.index,
+      messageCount: messages.length,
+      subtitleOffsetMs,
+      inputPath: mergedPart.filePath,
+      outputPath,
+    });
+
+    const burnResult = await this.burnSubtitles(
+      mergedPart.filePath,
+      subtitlePath,
+      outputPath
+    );
+    await fs.unlink(mergedPart.filePath).catch(() => {});
+    await fs.unlink(subtitlePath).catch(() => {});
+
+    return {
+      filePath: outputPath,
+      duration: burnResult.duration,
+      fileSize: burnResult.fileSize,
+    };
+  }
+
+  private selectTranscriptSegmentsForPart(
+    transcriptSegments: TranscriptSegmentInfo[],
+    videoS3Keys: string[]
+  ): TranscriptSegmentInfo[] {
+    const videoSegmentIds = new Set(
+      videoS3Keys.map(key => path.basename(key).replace(/\.[^.]+$/, ''))
+    );
+
+    return transcriptSegments
+      .filter(segment => videoSegmentIds.has(segment.segmentId))
+      .sort((left, right) => left.startTime - right.startTime);
+  }
+
+  private async collectTranscriptMessages(
+    segments: TranscriptSegmentInfo[]
+  ): Promise<TranscriptMessage[]> {
+    const messages: TranscriptMessage[] = [];
+    for (const segment of segments) {
+      const data = await this.storageService.download(segment.s3Key);
+      const lines = data.toString('utf-8').trim().split('\n');
+      messages.push(
+        ...lines
+          .filter(line => line.length > 0)
+          .map(line => JSON.parse(line) as TranscriptMessage)
+      );
+    }
+
+    return messages.sort((left, right) => left.timestamp - right.timestamp);
+  }
+
+  private async burnSubtitles(
+    inputPath: string,
+    subtitlePath: string,
+    outputPath: string
+  ): Promise<{ duration: number; fileSize: number }> {
+    const { spawn } = await import('child_process');
+    const subtitleFilter = `subtitles=${this.escapeSubtitleFilterPath(
+      subtitlePath
+    )}`;
+
+    return new Promise((resolve, reject) => {
+      const ffmpeg = spawn('ffmpeg', [
+        '-y',
+        '-i',
+        inputPath,
+        '-vf',
+        subtitleFilter,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '23',
+        '-c:a',
+        'copy',
+        outputPath,
+      ]);
+
+      let stderr = '';
+      ffmpeg.stderr?.on('data', data => {
+        stderr += data.toString();
+        this.logger.debug('FFmpeg subtitle burn output', {
+          message: data.toString(),
+        });
+      });
+
+      ffmpeg.on('close', async code => {
+        if (code === 0) {
+          const stats = await fs.stat(outputPath);
+          const duration = await this.getVideoDuration(outputPath);
+          resolve({ duration, fileSize: stats.size });
+          return;
+        }
+
+        reject(
+          new Error(`FFmpeg subtitle burn failed with code ${code}: ${stderr}`)
+        );
+      });
+
+      ffmpeg.on('error', reject);
+    });
+  }
+
+  private escapeSubtitleFilterPath(filePath: string): string {
+    return filePath
+      .replace(/\\/g, '\\\\')
+      .replace(/:/g, '\\:')
+      .replace(/'/g, "\\'");
+  }
+
   private splitMergedPartIfOversized(
     part: SubmissionPart,
     mergedPart: MergedPartFile
@@ -565,7 +751,10 @@ export class BilibiliSubmissionService {
           s3Keys.slice(offset, offset + segmentsPerSplit),
           splitParts.length + 1,
           PartStatus.PENDING,
-          part.rhythmIntervalMinutes
+          part.rhythmIntervalMinutes,
+          {
+            burnInSubtitles: part.burnInSubtitles,
+          }
         )
       );
     }

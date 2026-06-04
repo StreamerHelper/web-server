@@ -1022,6 +1022,7 @@ export class Recording extends EventEmitter {
     try {
       const stats = await fs.stat(localPath);
       const timestamp = this.parseTimestampFromFilename(filename);
+      const startTimeOffsetMs = this.segmentCount * this.segmentTime * 1000;
 
       const segmentInfo: SegmentInfo = {
         id: this.id,
@@ -1047,6 +1048,8 @@ export class Recording extends EventEmitter {
             s3Key: segmentInfo.s3Key,
             localPath: segmentInfo.localPath,
             contentType: 'video/x-matroska',
+            startTimeOffsetMs,
+            durationMs,
           },
           {
             attempts: 2,

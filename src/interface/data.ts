@@ -290,6 +290,7 @@ export interface TranscriptJobData {
   segmentId: string; // 分片 ID
   videoS3Key: string; // 视频分片 S3 路径
   outputS3Key: string; // 输出 S3 路径
+  startTimeOffsetMs?: number; // 分片相对录制开始的时间偏移
 }
 
 export interface TranscriptUploadJobData {

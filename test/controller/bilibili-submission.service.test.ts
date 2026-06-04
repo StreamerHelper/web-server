@@ -193,6 +193,46 @@ describe('BilibiliSubmissionService title handling', () => {
     );
   });
 
+  it('marks planned parts for subtitle burn-in when requested', async () => {
+    const service = createService();
+    service.jobService.findByJobId.mockResolvedValue({
+      jobId: 'job-subtitle',
+      streamerId: 'streamer-subtitle',
+      streamerName: '字幕主播',
+      platform: 'bilibili',
+      roomId: '12345',
+      startTime: new Date('2026-04-18T12:00:00+08:00'),
+      createdAt: new Date('2026-04-18T12:00:00+08:00'),
+      metadata: {
+        uploadedSegments: [
+          'raw/job-subtitle/video/segment_001.mkv',
+          'raw/job-subtitle/video/segment_002.mkv',
+        ],
+      },
+    });
+    service.streamerService.findByStreamerId.mockResolvedValue({
+      name: '字幕主播',
+      uploadSettings: {},
+    });
+
+    await service.createSubmission({
+      jobId: 'job-subtitle',
+      burnInSubtitles: true,
+    });
+
+    const payload = service.submissionRepository.create.mock.calls[0][0];
+    expect(payload.parts).toHaveLength(1);
+    expect(payload.parts[0]).toEqual(
+      expect.objectContaining({
+        burnInSubtitles: true,
+        s3Keys: [
+          'raw/job-subtitle/video/segment_001.mkv',
+          'raw/job-subtitle/video/segment_002.mkv',
+        ],
+      })
+    );
+  });
+
   it('stores the streamer collection binding on created submissions', async () => {
     const service = createService();
     service.jobService.findByJobId.mockResolvedValue({

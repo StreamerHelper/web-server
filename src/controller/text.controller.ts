@@ -19,11 +19,17 @@ import {
   QueryDanmakuResponse,
   QueryTranscriptRequest,
   QueryTranscriptResponse,
+  TranscriptMessage,
+  TranscriptSegmentInfo,
 } from '../interface/data';
 import { DanmakuAssService } from '../service/danmaku-ass.service';
 import { DanmakuXmlService } from '../service/danmaku-xml.service';
 import { JobService } from '../service/job.service';
 import { StorageService } from '../service/storage.service';
+import {
+  formatTranscriptMessages,
+  TranscriptExportFormat,
+} from '../utils/transcript-format';
 
 /**
  * 文本管控 API
@@ -279,11 +285,7 @@ export class TextController {
       return await this.exportDanmaku(job, index, format);
     }
 
-    // 其他格式暂不支持
-    ctx.status = 400;
-    throw new Error(
-      `Export format ${format} for type ${type} is not supported yet`
-    );
+    return await this.exportTranscript(job, index, format);
   }
 
   /**
@@ -305,13 +307,18 @@ export class TextController {
       const exportKey = this.getExportKey(job.id, type, format);
       if (!exportKey) {
         this.ctx.status = 400;
-        return { error: `Export format ${format} for type ${type} is not supported yet` };
+        return {
+          error: `Export format ${format} for type ${type} is not supported yet`,
+        };
       }
 
       const object = await this.storageService.getObjectStream(exportKey);
 
       this.ctx.status = 200;
-      this.ctx.set('Content-Type', object.contentType || 'application/octet-stream');
+      this.ctx.set(
+        'Content-Type',
+        object.contentType || 'application/octet-stream'
+      );
       if (object.contentLength !== undefined) {
         this.ctx.set('Content-Length', String(object.contentLength));
       }
@@ -332,8 +339,9 @@ export class TextController {
       });
 
       if (error instanceof StorageError) {
-        const isNotFound =
-          /NoSuchKey|NotFound|StatusCode:\s*404/i.test(error.message);
+        const isNotFound = /NoSuchKey|NotFound|StatusCode:\s*404/i.test(
+          error.message
+        );
         this.ctx.status = isNotFound ? 404 : 502;
         return { error: error.message };
       }
@@ -421,11 +429,82 @@ export class TextController {
     type: ExportRequest['type'],
     format: ExportRequest['format']
   ): string | null {
-    if (type === 'danmaku' && ['ass', 'xml', 'json', 'jsonl'].includes(format)) {
+    if (
+      type === 'danmaku' &&
+      ['ass', 'xml', 'json', 'jsonl'].includes(format)
+    ) {
       return `danmaku/${jobId}/export.${format}`;
+    }
+    if (
+      type === 'transcript' &&
+      ['txt', 'json', 'jsonl', 'srt', 'vtt'].includes(format)
+    ) {
+      return `transcript/${jobId}/export.${format}`;
     }
 
     return null;
+  }
+
+  private async exportTranscript(
+    job: any,
+    index: any,
+    format: ExportRequest['format']
+  ): Promise<ExportResponse> {
+    if (!['txt', 'json', 'jsonl', 'srt', 'vtt'].includes(format)) {
+      this.ctx.status = 400;
+      throw new Error(
+        `Transcript export format ${format} is not supported yet`
+      );
+    }
+
+    const messages = await this.collectTranscriptMessages(index.segments);
+    if (messages.length === 0) {
+      throw new Error('No transcript messages found');
+    }
+
+    const exportKey = this.getExportKey(job.id, 'transcript', format);
+    if (!exportKey) {
+      this.ctx.status = 400;
+      throw new Error(
+        `Transcript export format ${format} is not supported yet`
+      );
+    }
+
+    const content = formatTranscriptMessages(
+      messages,
+      format as TranscriptExportFormat,
+      index.duration || job.duration || 0
+    );
+    const contentType =
+      format === 'json'
+        ? 'application/json'
+        : format === 'jsonl'
+        ? 'application/x-ndjson'
+        : format === 'vtt'
+        ? 'text/vtt'
+        : 'text/plain';
+
+    await this.storageService.upload(
+      exportKey,
+      Buffer.from(content, 'utf-8'),
+      contentType
+    );
+
+    const downloadUrl = `/api/text/export/download?jobId=${encodeURIComponent(
+      job.jobId || job.id
+    )}&type=transcript&format=${encodeURIComponent(format)}`;
+
+    this.logger.info('Transcript exported', {
+      jobId: job.jobId,
+      messageCount: messages.length,
+      format,
+      exportKey,
+    });
+
+    return {
+      downloadUrl,
+      expiresAt: Date.now() + 3600 * 1000,
+    };
   }
 
   /**
@@ -541,10 +620,7 @@ export class TextController {
         const filteredMessages =
           startTime !== undefined || endTime !== undefined
             ? messages.filter(message => {
-                if (
-                  startTime !== undefined &&
-                  message.timestamp < startTime
-                ) {
+                if (startTime !== undefined && message.timestamp < startTime) {
                   return false;
                 }
                 if (endTime !== undefined && message.timestamp > endTime) {
@@ -564,5 +640,58 @@ export class TextController {
     }
 
     return allMessages;
+  }
+
+  private async collectTranscriptMessages(
+    segments: TranscriptSegmentInfo[],
+    startTime?: number,
+    endTime?: number
+  ): Promise<TranscriptMessage[]> {
+    const selectedSegments =
+      startTime !== undefined || endTime !== undefined
+        ? segments.filter(segment => {
+            if (startTime !== undefined && segment.endTime < startTime) {
+              return false;
+            }
+            if (endTime !== undefined && segment.startTime > endTime) {
+              return false;
+            }
+            return true;
+          })
+        : segments;
+
+    const allMessages: TranscriptMessage[] = [];
+
+    for (const segment of selectedSegments) {
+      try {
+        const data = await this.storageService.download(segment.s3Key);
+        const lines = data.toString('utf-8').trim().split('\n');
+        const messages = lines
+          .filter(line => line.length > 0)
+          .map(line => JSON.parse(line) as TranscriptMessage);
+
+        const filteredMessages =
+          startTime !== undefined || endTime !== undefined
+            ? messages.filter(message => {
+                if (startTime !== undefined && message.timestamp < startTime) {
+                  return false;
+                }
+                if (endTime !== undefined && message.timestamp > endTime) {
+                  return false;
+                }
+                return true;
+              })
+            : messages;
+
+        allMessages.push(...filteredMessages);
+      } catch (error) {
+        this.logger.warn('Failed to download transcript segment', {
+          segmentId: segment.segmentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return allMessages.sort((left, right) => left.timestamp - right.timestamp);
   }
 }

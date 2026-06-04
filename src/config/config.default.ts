@@ -113,6 +113,20 @@ export default {
       concurrency: config.poller.concurrency,
     },
 
+    // ASR 配置
+    asr: {
+      enabled: config.asr.enabled,
+      provider: config.asr.provider,
+      apiKey: config.asr.apiKey,
+      apiKeyEnv: config.asr.apiKeyEnv,
+      baseUrl: config.asr.baseUrl,
+      model: config.asr.model,
+      language: config.asr.language,
+      chunkSeconds: config.asr.chunkSeconds,
+      concurrency: config.asr.concurrency,
+      transcribeRecordings: config.asr.transcribeRecordings,
+    },
+
     // 日志配置
     logging: {
       level: isProduction ? 'info' : 'debug',

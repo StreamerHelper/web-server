@@ -29,6 +29,7 @@ export interface StreamerInfo {
     description?: string;
     tags?: string[];
     humanType2?: number;
+    burnInSubtitles?: boolean;
     collection?: BilibiliCollectionBinding;
   };
 }
@@ -450,6 +451,8 @@ export interface UploadJobData {
   s3Key: string; // S3 存储路径
   localPath: string; // 本地文件路径
   contentType: string; // 内容类型
+  startTimeOffsetMs?: number; // 分片相对录制开始的时间偏移
+  durationMs?: number; // 分片时长
 }
 
 // ============ B站投稿任务数据类型 ============

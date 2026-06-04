@@ -27,7 +27,7 @@ export class TranscriptProcessor implements IProcessor {
   private tempDir: string | null = null;
 
   async execute(data: TranscriptJobData) {
-    const { id, segmentId, videoS3Key, outputS3Key } = data;
+    const { id, segmentId, videoS3Key, outputS3Key, startTimeOffsetMs = 0 } = data;
 
     this.logger.info('Processing transcript job', {
       id,
@@ -79,12 +79,24 @@ export class TranscriptProcessor implements IProcessor {
         localVideoPath,
         asrOptions
       );
+      if (startTimeOffsetMs > 0) {
+        result.messages = result.messages.map(message => ({
+          ...message,
+          timestamp: message.timestamp + startTimeOffsetMs,
+          words: message.words?.map(word => ({
+            ...word,
+            startTime: word.startTime + startTimeOffsetMs,
+            endTime: word.endTime + startTimeOffsetMs,
+          })),
+        }));
+      }
 
       this.logger.info('Transcription completed', {
         id,
         segmentId,
         messageCount: result.messages.length,
         duration: result.duration,
+        startTimeOffsetMs,
       });
 
       // 保存转录结果到本地
@@ -101,10 +113,14 @@ export class TranscriptProcessor implements IProcessor {
           s3Key: outputS3Key,
           localPath: localTranscriptPath,
         } as TranscriptUploadJobData);
+      } else {
+        this.logger.warn('Transcript upload queue not found', {
+          id,
+          segmentId,
+          localTranscriptPath,
+        });
+        await this.cleanup();
       }
-
-      // 清理本地文件
-      await this.cleanup();
 
       return {
         status: 'completed',

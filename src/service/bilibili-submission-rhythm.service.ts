@@ -113,7 +113,10 @@ export class BilibiliSubmissionRhythmService {
     }
 
     const existingSubmission = await this.findRhythmSubmission(job.jobId);
-    if (existingSubmission && this.isSubmissionBusy(existingSubmission.status)) {
+    if (
+      existingSubmission &&
+      this.isSubmissionBusy(existingSubmission.status)
+    ) {
       return;
     }
 
@@ -139,7 +142,10 @@ export class BilibiliSubmissionRhythmService {
           keys,
           existingParts.length + index + 1,
           PartStatus.PENDING,
-          rhythm.intervalMinutes
+          rhythm.intervalMinutes,
+          {
+            burnInSubtitles: uploadSettings.burnInSubtitles,
+          }
         )
       );
 
@@ -167,7 +173,10 @@ export class BilibiliSubmissionRhythmService {
         keys,
         index + 1,
         PartStatus.PENDING,
-        rhythm.intervalMinutes
+        rhythm.intervalMinutes,
+        {
+          burnInSubtitles: uploadSettings.burnInSubtitles,
+        }
       )
     );
     const submission = await this.submissionService.createSubmission({
@@ -178,6 +187,7 @@ export class BilibiliSubmissionRhythmService {
       tags: uploadSettings.tags || [],
       humanType2: uploadSettings.humanType2,
       collection: uploadSettings.collection,
+      burnInSubtitles: uploadSettings.burnInSubtitles,
     });
 
     await this.enqueueSubmission(submission.id);

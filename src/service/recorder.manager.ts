@@ -381,6 +381,7 @@ export class RecorderManager {
         description: uploadSettings.description,
         tags: uploadSettings.tags || [],
         humanType2: uploadSettings.humanType2,
+        burnInSubtitles: uploadSettings.burnInSubtitles,
       });
 
       // 6. 派发投稿任务
