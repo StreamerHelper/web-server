@@ -1,18 +1,11 @@
 import { Framework, IProcessor, Processor } from '@midwayjs/bullmq';
-import { Config, ILogger, Inject, Logger } from '@midwayjs/core';
-import * as path from 'path';
+import { ILogger, Inject, Logger } from '@midwayjs/core';
 import * as fs from 'fs/promises';
 import { UploadJobData } from '../interface';
-import { TranscriptJobData } from '../interface/data';
 import { StorageService } from '../service/storage.service';
 import { JobService } from '../service/job.service';
 import { BilibiliSubmissionRhythmService } from '../service/bilibili-submission-rhythm.service';
-import { AsrService } from '../service/asr.service';
-
-interface AsrQueueConfig {
-  enabled?: boolean;
-  transcribeRecordings?: boolean;
-}
+import { TranscriptSchedulerService } from '../service/transcript-scheduler.service';
 
 @Processor('upload')
 export class UploadProcessor implements IProcessor {
@@ -26,13 +19,10 @@ export class UploadProcessor implements IProcessor {
   rhythmService: BilibiliSubmissionRhythmService;
 
   @Inject()
-  asrService: AsrService;
-
-  @Inject()
   bullFramework: Framework;
 
-  @Config('streamerhelper.asr')
-  asrConfig: AsrQueueConfig;
+  @Inject()
+  transcriptScheduler: TranscriptSchedulerService;
 
   @Logger()
   private logger: ILogger;
@@ -156,50 +146,11 @@ export class UploadProcessor implements IProcessor {
 
   private async scheduleTranscriptJob(data: UploadJobData): Promise<void> {
     const { id, s3Key, startTimeOffsetMs = 0 } = data;
-    if (!this.asrConfig?.enabled || !this.asrConfig?.transcribeRecordings) {
-      return;
-    }
-    if (!this.asrService.isAvailable()) {
-      this.logger.debug('ASR service unavailable, skip transcript scheduling', {
-        id,
-        s3Key,
-      });
-      return;
-    }
-
-    const transcriptQueue = this.bullFramework.getQueue('transcript');
-    if (!transcriptQueue) {
-      this.logger.warn('Transcript queue not found', { id, s3Key });
-      return;
-    }
-
-    const segmentId = this.getSegmentId(s3Key);
-    const outputS3Key = `transcript/${id}/${segmentId}.jsonl`;
-
-    await transcriptQueue.addJobToQueue(
-      {
-        id,
-        segmentId,
-        videoS3Key: s3Key,
-        outputS3Key,
-        startTimeOffsetMs,
-      } as TranscriptJobData,
-      {
-        attempts: 2,
-        jobId: `transcript:${id}:${segmentId}`,
-      }
-    );
-
-    this.logger.info('Transcript job scheduled', {
+    await this.transcriptScheduler.scheduleForVideoSegment({
       id,
-      segmentId,
       videoS3Key: s3Key,
-      outputS3Key,
+      localVideoPath: data.localPath,
       startTimeOffsetMs,
     });
-  }
-
-  private getSegmentId(s3Key: string): string {
-    return path.basename(s3Key).replace(/\.[^.]+$/, '');
   }
 }

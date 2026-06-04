@@ -24,16 +24,24 @@ export class TranscriptProcessor implements IProcessor {
   @Logger()
   private logger: ILogger;
 
-  private tempDir: string | null = null;
-
   async execute(data: TranscriptJobData) {
-    const { id, segmentId, videoS3Key, outputS3Key, startTimeOffsetMs = 0 } = data;
+    const {
+      id,
+      segmentId,
+      videoS3Key,
+      localVideoPath: preferredLocalVideoPath,
+      outputS3Key,
+      startTimeOffsetMs = 0,
+    } = data;
 
     this.logger.info('Processing transcript job', {
       id,
       segmentId,
       videoS3Key,
+      preferredLocalVideoPath,
     });
+
+    let tempDir: string | null = null;
 
     try {
       // TODO: 检查 ASR 服务是否可用
@@ -51,25 +59,22 @@ export class TranscriptProcessor implements IProcessor {
       }
 
       // 创建临时目录
-      this.tempDir = path.join(process.cwd(), 'temp', `${id}-transcript`);
-      await fs.mkdir(this.tempDir, { recursive: true });
+      tempDir = path.join(
+        process.cwd(),
+        'temp',
+        `${id}-transcript-${segmentId}-${Date.now()}`
+      );
+      await fs.mkdir(tempDir, { recursive: true });
 
-      // 下载视频分片
-      const videoFileName = path.basename(videoS3Key);
-      const localVideoPath = path.join(this.tempDir, videoFileName);
-      const videoData = await this.storageService.download(videoS3Key);
-      await fs.writeFile(localVideoPath, videoData);
-
-      this.logger.info('Video segment downloaded for transcript', {
-        id,
-        segmentId,
-        localVideoPath,
-      });
+      const localVideoPath =
+        preferredLocalVideoPath && (await this.fileExists(preferredLocalVideoPath))
+          ? preferredLocalVideoPath
+          : await this.downloadVideoSegment(videoS3Key, tempDir);
 
       // 调用 ASR 服务进行转录
       const asrOptions: AsrServiceOptions = {
         id,
-        outputDir: this.tempDir,
+        outputDir: tempDir,
         language: 'zh-CN',
         enablePunctuation: true,
         enableInterimResults: false,
@@ -100,7 +105,7 @@ export class TranscriptProcessor implements IProcessor {
       });
 
       // 保存转录结果到本地
-      const localTranscriptPath = path.join(this.tempDir, `${segmentId}.jsonl`);
+      const localTranscriptPath = path.join(tempDir, `${segmentId}.jsonl`);
       await this.asrService.saveToFile(result, localTranscriptPath);
 
       // 调度上传任务
@@ -119,7 +124,7 @@ export class TranscriptProcessor implements IProcessor {
           segmentId,
           localTranscriptPath,
         });
-        await this.cleanup();
+        await this.cleanup(tempDir);
       }
 
       return {
@@ -136,7 +141,9 @@ export class TranscriptProcessor implements IProcessor {
         error: error instanceof Error ? error.message : String(error),
       });
 
-      await this.cleanup();
+      if (tempDir) {
+        await this.cleanup(tempDir);
+      }
 
       throw error;
     }
@@ -145,16 +152,43 @@ export class TranscriptProcessor implements IProcessor {
   /**
    * 清理临时文件
    */
-  private async cleanup(): Promise<void> {
-    if (this.tempDir) {
-      try {
-        await fs.rm(this.tempDir, { recursive: true, force: true });
-      } catch (error) {
-        this.logger.warn('Failed to cleanup temp dir', {
-          tempDir: this.tempDir,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+  private async cleanup(tempDir: string): Promise<void> {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      this.logger.warn('Failed to cleanup temp dir', {
+        tempDir,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+  }
+
+  private async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      this.logger.info('Using local video segment for transcript', {
+        localVideoPath: filePath,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async downloadVideoSegment(
+    videoS3Key: string,
+    tempDir: string
+  ): Promise<string> {
+    const videoFileName = path.basename(videoS3Key);
+    const localVideoPath = path.join(tempDir, videoFileName);
+    const videoData = await this.storageService.download(videoS3Key);
+    await fs.writeFile(localVideoPath, videoData);
+
+    this.logger.info('Video segment downloaded for transcript', {
+      videoS3Key,
+      localVideoPath,
+    });
+
+    return localVideoPath;
   }
 }

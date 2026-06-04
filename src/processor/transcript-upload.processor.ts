@@ -7,6 +7,7 @@ import {
   TranscriptSegmentInfo,
   TranscriptUploadJobData,
 } from '../interface/data';
+import { BilibiliSubmissionRhythmService } from '../service/bilibili-submission-rhythm.service';
 import { JobService } from '../service/job.service';
 import { StorageService } from '../service/storage.service';
 
@@ -20,6 +21,9 @@ export class TranscriptUploadProcessor implements IProcessor {
 
   @Inject()
   bullFramework: Framework;
+
+  @Inject()
+  rhythmService: BilibiliSubmissionRhythmService;
 
   @Logger()
   private logger: ILogger;
@@ -89,6 +93,13 @@ export class TranscriptUploadProcessor implements IProcessor {
 
       // 更新 Job metadata
       await this.updateTranscriptIndex(id, segmentInfo, languages);
+      await this.rhythmService.handleTranscriptSegmentReady(id).catch(error => {
+        this.logger.error('Failed to schedule submission after transcript', {
+          id,
+          segmentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       await this.cleanupLocalFiles(localPath);
 
       this.logger.info('Transcript upload completed', {

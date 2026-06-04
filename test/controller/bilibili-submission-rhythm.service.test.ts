@@ -188,4 +188,70 @@ describe('BilibiliSubmissionRhythmService', () => {
       })
     );
   });
+
+  it('waits for matching transcript segments before burn-in subtitle submissions', async () => {
+    const service = createService();
+    const uploadedSegments = createSegmentKeys('job-subtitles', 6);
+    const transcriptSegments = uploadedSegments.slice(0, 5).map(key => ({
+      segmentId: key.split('/').pop()!.replace(/\.[^.]+$/, ''),
+    }));
+
+    service.jobService.findById.mockResolvedValueOnce({
+      id: 'job-entity-subtitles',
+      jobId: 'job-subtitles',
+      streamerId: 'streamer-subtitles',
+      metadata: {
+        uploadedSegments,
+        transcriptIndex: {
+          segments: transcriptSegments,
+        },
+      },
+    });
+    service.streamerService.findByStreamerId.mockResolvedValue({
+      uploadSettings: {
+        autoUpload: true,
+        burnInSubtitles: true,
+        rhythm: { mode: 'segmented', intervalMinutes: 1 },
+      },
+    });
+    service.submissionRepository.findByJobId.mockResolvedValue([]);
+
+    await service.handleUploadedVideoSegment('job-entity-subtitles');
+
+    expect(service.submissionService.createSubmission).not.toHaveBeenCalled();
+    expect(service.queue.addJobToQueue).not.toHaveBeenCalled();
+
+    service.jobService.findById.mockResolvedValueOnce({
+      id: 'job-entity-subtitles',
+      jobId: 'job-subtitles',
+      streamerId: 'streamer-subtitles',
+      metadata: {
+        uploadedSegments,
+        transcriptIndex: {
+          segments: uploadedSegments.map(key => ({
+            segmentId: key.split('/').pop()!.replace(/\.[^.]+$/, ''),
+          })),
+        },
+      },
+    });
+
+    await service.handleTranscriptSegmentReady('job-entity-subtitles');
+
+    expect(service.submissionService.createSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: 'job-subtitles',
+        parts: [
+          expect.objectContaining({
+            burnInSubtitles: true,
+            rhythmIntervalMinutes: 1,
+            s3Keys: uploadedSegments,
+          }),
+        ],
+        burnInSubtitles: true,
+      })
+    );
+    expect(service.queue.addJobToQueue).toHaveBeenCalledWith({
+      submissionId: 'submission-first',
+    });
+  });
 });

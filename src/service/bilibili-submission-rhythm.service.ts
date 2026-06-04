@@ -58,6 +58,17 @@ export class BilibiliSubmissionRhythmService {
     });
   }
 
+  async handleTranscriptSegmentReady(jobEntityId: string): Promise<void> {
+    await this.withJobLock(jobEntityId, async () => {
+      const job = await this.jobService.findById(jobEntityId);
+      if (!job) {
+        return;
+      }
+
+      await this.queueAvailableParts(job, false);
+    });
+  }
+
   async flushJob(jobEntityId: string): Promise<void> {
     await this.withJobLock(jobEntityId, async () => {
       const job = await this.jobService.findById(jobEntityId);
@@ -107,7 +118,10 @@ export class BilibiliSubmissionRhythmService {
       return;
     }
 
-    const uploadedKeys = this.getUploadedVideoKeys(job);
+    const uploadedKeys = this.getUploadedVideoKeys(
+      job,
+      Boolean(uploadSettings.burnInSubtitles)
+    );
     if (uploadedKeys.length === 0) {
       return;
     }
@@ -219,10 +233,39 @@ export class BilibiliSubmissionRhythmService {
     };
   }
 
-  private getUploadedVideoKeys(job: Job): string[] {
-    return (job.metadata?.uploadedSegments || [])
+  private getUploadedVideoKeys(job: Job, requireTranscript: boolean): string[] {
+    const videoKeys = (job.metadata?.uploadedSegments || [])
       .filter(key => key.includes('/video/'))
       .sort();
+    if (!requireTranscript) {
+      return videoKeys;
+    }
+
+    const transcriptSegmentIds = new Set(
+      (job.metadata?.transcriptIndex?.segments || []).map(segment =>
+        String(segment.segmentId)
+      )
+    );
+    const readyKeys = videoKeys.filter(key =>
+      transcriptSegmentIds.has(this.getSegmentId(key))
+    );
+
+    if (readyKeys.length < videoKeys.length) {
+      this.logger.info('Waiting for transcript segments before submission', {
+        jobId: job.jobId,
+        uploadedVideoSegments: videoKeys.length,
+        transcriptReadyVideoSegments: readyKeys.length,
+      });
+    }
+
+    return readyKeys;
+  }
+
+  private getSegmentId(s3Key: string): string {
+    return s3Key
+      .split('/')
+      .pop()!
+      .replace(/\.[^.]+$/, '');
   }
 
   private buildReadyChunks(

@@ -6,19 +6,10 @@ import { UploadProcessor } from '../../src/processor/upload.processor';
 
 describe('UploadProcessor transcript scheduling', () => {
   const createProcessor = () => {
-    const addJobToQueue = jest.fn().mockResolvedValue(undefined);
+    const scheduleForVideoSegment = jest.fn().mockResolvedValue(true);
     const processor = new UploadProcessor() as any;
-    processor.asrConfig = {
-      enabled: true,
-      transcribeRecordings: true,
-    };
-    processor.asrService = {
-      isAvailable: jest.fn().mockReturnValue(true),
-    };
-    processor.bullFramework = {
-      getQueue: jest.fn().mockReturnValue({
-        addJobToQueue,
-      }),
+    processor.transcriptScheduler = {
+      scheduleForVideoSegment,
     };
     processor.logger = {
       info: jest.fn(),
@@ -26,11 +17,11 @@ describe('UploadProcessor transcript scheduling', () => {
       error: jest.fn(),
       debug: jest.fn(),
     };
-    return { processor, addJobToQueue };
+    return { processor, scheduleForVideoSegment };
   };
 
   it('queues a transcript job for uploaded video segments', async () => {
-    const { processor, addJobToQueue } = createProcessor();
+    const { processor, scheduleForVideoSegment } = createProcessor();
 
     await processor.scheduleTranscriptJob({
       id: 'job-db-id',
@@ -40,25 +31,17 @@ describe('UploadProcessor transcript scheduling', () => {
       startTimeOffsetMs: 20000,
     });
 
-    expect(processor.bullFramework.getQueue).toHaveBeenCalledWith('transcript');
-    expect(addJobToQueue).toHaveBeenCalledWith(
-      {
-        id: 'job-db-id',
-        segmentId: 'segment_20260605_010203',
-        videoS3Key: 'raw/job-db-id/video/segment_20260605_010203.mkv',
-        outputS3Key: 'transcript/job-db-id/segment_20260605_010203.jsonl',
-        startTimeOffsetMs: 20000,
-      },
-      {
-        attempts: 2,
-        jobId: 'transcript:job-db-id:segment_20260605_010203',
-      }
-    );
+    expect(scheduleForVideoSegment).toHaveBeenCalledWith({
+      id: 'job-db-id',
+      videoS3Key: 'raw/job-db-id/video/segment_20260605_010203.mkv',
+      localVideoPath: '/tmp/segment.mkv',
+      startTimeOffsetMs: 20000,
+    });
   });
 
-  it('skips transcript scheduling when ASR is unavailable', async () => {
-    const { processor, addJobToQueue } = createProcessor();
-    processor.asrService.isAvailable.mockReturnValue(false);
+  it('delegates ASR availability decisions to the transcript scheduler', async () => {
+    const { processor, scheduleForVideoSegment } = createProcessor();
+    scheduleForVideoSegment.mockResolvedValue(false);
 
     await processor.scheduleTranscriptJob({
       id: 'job-db-id',
@@ -67,6 +50,6 @@ describe('UploadProcessor transcript scheduling', () => {
       contentType: 'video/x-matroska',
     });
 
-    expect(addJobToQueue).not.toHaveBeenCalled();
+    expect(scheduleForVideoSegment).toHaveBeenCalled();
   });
 });

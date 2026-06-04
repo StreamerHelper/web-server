@@ -19,6 +19,7 @@ import { DanmakuManager } from './danmaku.service';
 import { FFmpegExitEvent, FFmpegService } from './ffmpeg.service';
 import { HighlightService } from './highlight.service';
 import { JobService } from './job.service';
+import { TranscriptSchedulerService } from './transcript-scheduler.service';
 
 /**
  * 录制选项（由调用方提供）
@@ -60,6 +61,7 @@ export interface RecordingOptions extends RecordingInputOptions {
     danmakuManager: DanmakuManager;
     bullFramework: Framework;
     app: Application;
+    transcriptScheduler?: TranscriptSchedulerService;
   };
 
   // 日志
@@ -190,6 +192,7 @@ export class Recording extends EventEmitter {
   private highlightService: HighlightService | null = null;
   private bullFramework: Framework;
   private app: Application;
+  private transcriptScheduler?: TranscriptSchedulerService;
 
   // 日志
   private logger: ILogger;
@@ -282,6 +285,7 @@ export class Recording extends EventEmitter {
     this.danmakuManager = options.services.danmakuManager;
     this.bullFramework = options.services.bullFramework;
     this.app = options.services.app;
+    this.transcriptScheduler = options.services.transcriptScheduler;
 
     // 缓存路径配置
     this.pathsConfig = {
@@ -1059,6 +1063,23 @@ export class Recording extends EventEmitter {
           id: this.id,
           s3Key: segmentInfo.s3Key,
         });
+      }
+
+      if (this.transcriptScheduler) {
+        await this.transcriptScheduler
+          .scheduleForVideoSegment({
+            id: this.id,
+            videoS3Key: segmentInfo.s3Key,
+            localVideoPath: segmentInfo.localPath,
+            startTimeOffsetMs,
+          })
+          .catch(error => {
+            this.logger.error('Failed to schedule live transcript job', {
+              id: this.id,
+              s3Key: segmentInfo.s3Key,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
       }
 
       this.videoSegments.push(segmentInfo.s3Key);

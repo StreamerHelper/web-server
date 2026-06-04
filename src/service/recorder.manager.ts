@@ -22,6 +22,7 @@ import {
   RecordingInputOptions,
 } from './recording';
 import { StreamerService } from './streamer.service';
+import { TranscriptSchedulerService } from './transcript-scheduler.service';
 import { normalizeAutoDeleteSettings } from '../utils/record-settings';
 
 /**
@@ -66,6 +67,9 @@ export class RecorderManager {
 
   @Inject()
   bullFramework: Framework;
+
+  @Inject()
+  transcriptScheduler: TranscriptSchedulerService;
 
   @Logger()
   private logger: ILogger;
@@ -123,6 +127,7 @@ export class RecorderManager {
         danmakuManager: this.danmakuManager,
         bullFramework: this.bullFramework,
         app: this.app,
+        transcriptScheduler: this.transcriptScheduler,
       },
       logger: this.logger,
       ffmpegFailureLogger: this.ffmpegExitLogger,

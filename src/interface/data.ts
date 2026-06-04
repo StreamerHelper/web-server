@@ -288,7 +288,8 @@ export interface DanmakuUploadJobData {
 export interface TranscriptJobData {
   id: string; // Job ID
   segmentId: string; // 分片 ID
-  videoS3Key: string; // 视频分片 S3 路径
+  videoS3Key: string; // 视频分片 S3 路径（本地文件不可用时兜底下载）
+  localVideoPath?: string; // 本地视频分片路径（录制时优先使用，降低转写延迟）
   outputS3Key: string; // 输出 S3 路径
   startTimeOffsetMs?: number; // 分片相对录制开始的时间偏移
 }

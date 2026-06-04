@@ -1,3 +1,5 @@
+import type { TranscriptIndex } from './interface/data';
+
 export type Platform = 'bilibili' | 'huya' | 'douyu' | 'douyin';
 export type RecordingQuality = 'low' | 'medium' | 'high';
 
@@ -113,6 +115,7 @@ export interface JobMetadata {
   failedVideoSegments?: string[]; // 最终上传失败的视频分片
   uploadedDanmakuSegments?: string[]; // 已上传的弹幕分片
   failedDanmakuSegments?: string[]; // 最终上传失败的弹幕分片
+  transcriptIndex?: TranscriptIndex; // 音频转写索引
   danmakuUserIds?: string[]; // 内部聚合字段，用于精确统计独立用户数
   lastFFmpegOutputTime?: number; // FFmpeg 最后输出时间（毫秒）
   recordedSegments?: number; // 已录制的分片数
