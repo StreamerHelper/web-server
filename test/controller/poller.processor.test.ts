@@ -13,6 +13,47 @@ jest.mock('chokidar', () => ({
 }));
 
 import { PollerProcessor } from '../../src/processor/poller.processor';
+import { getClassMetadata } from '@midwayjs/core';
+
+describe('PollerProcessor scheduling', () => {
+  it('does not retain timestamp-based poller jobs', () => {
+    const metadata = getClassMetadata('bullmq:processor', PollerProcessor);
+
+    expect(metadata.jobOptions).toEqual(
+      expect.objectContaining({
+        removeOnComplete: true,
+        removeOnFail: true,
+      })
+    );
+  });
+
+  it('recovers interrupted jobs before checking streamers', async () => {
+    const processor = new PollerProcessor() as any;
+    processor.pollerConfig = { concurrency: 1 };
+    processor.jobService = {
+      recoverInterruptedJobsOnStartup: jest.fn().mockResolvedValue(1),
+    };
+    processor.streamerService = {
+      findActive: jest.fn().mockResolvedValue([]),
+    };
+    processor.logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    };
+
+    await expect(processor.execute()).resolves.toEqual({
+      status: 'completed',
+      checked: 0,
+    });
+    expect(
+      processor.jobService.recoverInterruptedJobsOnStartup.mock.invocationCallOrder[0]
+    ).toBeLessThan(
+      processor.streamerService.findActive.mock.invocationCallOrder[0]
+    );
+  });
+});
 
 describe('PollerProcessor heartbeat timeout selection', () => {
   it('uses recorder heartbeat timeout when checking active jobs', async () => {

@@ -29,6 +29,8 @@ export interface JobStorageDeletionResult {
 @Provide()
 @Scope(ScopeEnum.Singleton)
 export class JobService {
+  private interruptedJobsRecovery: Promise<number> | null = null;
+
   private static readonly ARRAY_METADATA_FIELDS = new Set([
     'uploadedSegments',
     'failedVideoSegments',
@@ -60,6 +62,8 @@ export class JobService {
    * 如果未提供 jobId，将自动使用 nanoid 生成 12 位随机字符串
    */
   async create(data: Partial<Job>): Promise<Job> {
+    await this.recoverInterruptedJobsOnStartup();
+
     this.logger.debug('Creating job', { data });
 
     let coverPath = data.coverPath;
@@ -184,6 +188,49 @@ export class JobService {
   }
 
   /**
+   * 进程重启后，旧进程中的录制实例和 FFmpeg 子进程已经不存在。
+   * 在本进程首次处理录制任务前，将非终态录制任务一次性收敛为失败。
+   */
+  async recoverInterruptedJobsOnStartup(): Promise<number> {
+    if (!this.interruptedJobsRecovery) {
+      this.interruptedJobsRecovery = this.markInterruptedJobsAsFailed().catch(
+        error => {
+          this.interruptedJobsRecovery = null;
+          throw error;
+        }
+      );
+    }
+
+    return this.interruptedJobsRecovery;
+  }
+
+  private async markInterruptedJobsAsFailed(): Promise<number> {
+    const interruptedStatuses = [
+      JOB_STATUS.PENDING,
+      JOB_STATUS.RECORDING,
+      JOB_STATUS.STOPPING,
+      JOB_STATUS.PROCESSING,
+    ] as JobStatus[];
+    const result = await this.jobModel.update(
+      { status: In(interruptedStatuses) },
+      {
+        status: JOB_STATUS.FAILED,
+        endTime: new Date(),
+        errorMessage: 'Application restarted before recording completed',
+      }
+    );
+    const affected = result.affected ?? 0;
+
+    if (affected > 0) {
+      this.logger.warn('Recovered interrupted recording jobs on startup', {
+        affected,
+      });
+    }
+
+    return affected;
+  }
+
+  /**
    * 查找特定主播的活跃 Job（RECORDING/STOPPING/PROCESSING 状态）
    * @param streamerId 主播ID
    * @param platform 平台
@@ -195,6 +242,8 @@ export class JobService {
     platform: string,
     heartbeatTimeoutMs = 30000
   ): Promise<Job | null> {
+    await this.recoverInterruptedJobsOnStartup();
+
     // 查找活跃状态的 Job
     const activeStatuses = [
       JOB_STATUS.RECORDING,

@@ -4,6 +4,61 @@ jest.mock('nanoid', () => ({
 
 import { JobService } from '../../src/service/job.service';
 import { SubmissionTemplateService } from '../../src/service/submission-template.service';
+import { JOB_STATUS } from '../../src/interface';
+
+describe('JobService startup recovery', () => {
+  it('atomically fails interrupted recording states once per process', async () => {
+    const service = new JobService() as any;
+    service.jobModel = {
+      update: jest.fn().mockResolvedValue({ affected: 3 }),
+    };
+    service.logger = {
+      warn: jest.fn(),
+    };
+
+    const [first, second] = await Promise.all([
+      service.recoverInterruptedJobsOnStartup(),
+      service.recoverInterruptedJobsOnStartup(),
+    ]);
+
+    expect(first).toBe(3);
+    expect(second).toBe(3);
+    expect(service.jobModel.update).toHaveBeenCalledTimes(1);
+
+    const [criteria, update] = service.jobModel.update.mock.calls[0];
+    expect(criteria.status._type).toBe('in');
+    expect(criteria.status._value).toEqual([
+      JOB_STATUS.PENDING,
+      JOB_STATUS.RECORDING,
+      JOB_STATUS.STOPPING,
+      JOB_STATUS.PROCESSING,
+    ]);
+    expect(update).toEqual({
+      status: JOB_STATUS.FAILED,
+      endTime: expect.any(Date),
+      errorMessage: 'Application restarted before recording completed',
+    });
+  });
+
+  it('retries recovery after a transient database error', async () => {
+    const service = new JobService() as any;
+    service.jobModel = {
+      update: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('database unavailable'))
+        .mockResolvedValueOnce({ affected: 0 }),
+    };
+    service.logger = {
+      warn: jest.fn(),
+    };
+
+    await expect(service.recoverInterruptedJobsOnStartup()).rejects.toThrow(
+      'database unavailable'
+    );
+    await expect(service.recoverInterruptedJobsOnStartup()).resolves.toBe(0);
+    expect(service.jobModel.update).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('JobService browse cover data', () => {
   const createTemplateService = () => {

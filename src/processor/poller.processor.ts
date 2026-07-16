@@ -19,6 +19,10 @@ import {
   repeat: {
     pattern: FORMAT.CRONTAB.EVERY_PER_10_SECOND,
   },
+  // Poller jobs are ephemeral. Keeping timestamp-based job records can make a
+  // restarted scheduler collide with jobs created before a clock rollback.
+  removeOnComplete: true,
+  removeOnFail: true,
 })
 export class PollerProcessor implements IProcessor {
   @Config('streamerhelper.poller')
@@ -50,6 +54,8 @@ export class PollerProcessor implements IProcessor {
 
   async execute() {
     try {
+      await this.jobService.recoverInterruptedJobsOnStartup();
+
       this.logger.debug('Starting poller check');
 
       // 获取所有活跃主播
