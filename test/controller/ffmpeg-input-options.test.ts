@@ -1,6 +1,14 @@
 import { FFmpegService } from '../../src/service/ffmpeg.service';
 
 describe('FFmpeg input option selection', () => {
+  it('pins segment filenames to UTC independently of the process timezone', () => {
+    const service = new FFmpegService() as any;
+
+    expect(service.buildSegmentProcessEnvironment()).toEqual(
+      expect.objectContaining({ TZ: 'UTC' })
+    );
+  });
+
   it('adds anti-leech headers for bilibili FLV streams', () => {
     const service = new FFmpegService() as any;
 

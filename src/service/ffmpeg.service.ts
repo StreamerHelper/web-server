@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import { Platform, RecordingQuality } from '../interface';
+import { VIDEO_SEGMENT_TIME_ZONE } from '../utils/video-segment-time';
 
 /**
  * FFmpeg 启动选项
@@ -135,7 +136,9 @@ export class FFmpegService extends EventEmitter {
 
     this.logger?.debug('FFmpeg args', ffmpegArgs.join(' '));
 
-    this.process = spawn('ffmpeg', ffmpegArgs);
+    this.process = spawn('ffmpeg', ffmpegArgs, {
+      env: this.buildSegmentProcessEnvironment(),
+    });
     const currentProcess = this.process;
 
     // 设置 exitHandler 引用，确保可以正确移除
@@ -284,6 +287,16 @@ export class FFmpegService extends EventEmitter {
       });
       this.logFailureExit('abnormal_exit', { code, signal });
     }
+  }
+
+  /**
+   * 固定视频分片文件名使用 UTC，避免继承宿主机时区。
+   */
+  private buildSegmentProcessEnvironment(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      TZ: VIDEO_SEGMENT_TIME_ZONE,
+    };
   }
 
   /**

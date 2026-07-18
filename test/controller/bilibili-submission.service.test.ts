@@ -10,6 +10,16 @@ import {
 } from '../../src/entity/bilibili-submission.entity';
 
 describe('BilibiliSubmissionService title handling', () => {
+  const originalTimeZone = process.env.TZ;
+
+  beforeAll(() => {
+    process.env.TZ = 'Asia/Shanghai';
+  });
+
+  afterAll(() => {
+    process.env.TZ = originalTimeZone;
+  });
+
   const createTemplateService = () => {
     const service = new SubmissionTemplateService() as any;
     service.submissionConfig = {
@@ -321,11 +331,11 @@ describe('BilibiliSubmissionService title handling', () => {
     );
   });
 
-  it('uses date and time as fixed part titles', async () => {
+  it('uses the configured local date across a UTC day boundary', async () => {
     const service = createService();
     const uploadedSegments = [
-      'raw/job-title/video/segment_20260426_120000.mkv',
-      'raw/job-title/video/segment_20260426_120010.mkv',
+      'raw/job-title/video/segment_20260717_190159.mkv',
+      'raw/job-title/video/segment_20260717_190209.mkv',
     ];
 
     service.jobService.findByJobId.mockResolvedValue({
@@ -334,8 +344,8 @@ describe('BilibiliSubmissionService title handling', () => {
       streamerName: '标题主播',
       platform: 'douyin',
       roomId: '88983834188',
-      startTime: new Date('2026-04-26T12:00:00+08:00'),
-      createdAt: new Date('2026-04-26T12:00:00+08:00'),
+      startTime: new Date('2026-07-18T03:01:32+08:00'),
+      createdAt: new Date('2026-07-18T03:01:32+08:00'),
       metadata: {
         uploadedSegments,
       },
@@ -353,8 +363,10 @@ describe('BilibiliSubmissionService title handling', () => {
       expect.objectContaining({
         parts: [
           expect.objectContaining({
-            title: '2026-04-26 12:00',
+            title: '2026-07-18 03:01',
             s3Keys: uploadedSegments,
+            startedAt: '2026-07-17T19:01:59.000Z',
+            endedAt: '2026-07-17T19:02:09.000Z',
           }),
         ],
       })
@@ -372,14 +384,14 @@ describe('BilibiliSubmissionService title handling', () => {
         {
           index: 1,
           title: '2026-04-26 12:00',
-          s3Keys: ['raw/job-append/video/segment_20260426_120000.mkv'],
+          s3Keys: ['raw/job-append/video/segment_20260426_040000.mkv'],
           status: PartStatus.COMPLETED,
           filename: 'old-file',
           cid: 1001,
         },
         {
           index: 2,
-          s3Keys: ['raw/job-append/video/segment_20260426_123000.mkv'],
+          s3Keys: ['raw/job-append/video/segment_20260426_043000.mkv'],
           status: PartStatus.PENDING,
         },
       ],
@@ -495,7 +507,7 @@ describe('BilibiliSubmissionService title handling', () => {
         {
           index: 1,
           title: '2026-04-26 12:00',
-          s3Keys: ['raw/job-new/video/segment_20260426_120000.mkv'],
+          s3Keys: ['raw/job-new/video/segment_20260426_040000.mkv'],
           status: PartStatus.PENDING,
         },
       ],
@@ -547,10 +559,10 @@ describe('BilibiliSubmissionService title handling', () => {
   it('splits an oversized merged part into smaller pending parts before uploading', async () => {
     const service = createService();
     const s3Keys = [
-      'raw/job-split/video/segment_20260426_120000.mkv',
-      'raw/job-split/video/segment_20260426_120010.mkv',
-      'raw/job-split/video/segment_20260426_120020.mkv',
-      'raw/job-split/video/segment_20260426_120030.mkv',
+      'raw/job-split/video/segment_20260426_040000.mkv',
+      'raw/job-split/video/segment_20260426_040010.mkv',
+      'raw/job-split/video/segment_20260426_040020.mkv',
+      'raw/job-split/video/segment_20260426_040030.mkv',
     ];
 
     service.submissionRepository.findById.mockResolvedValue({

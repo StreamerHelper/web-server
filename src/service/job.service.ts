@@ -17,6 +17,7 @@ import {
   JobSubmissionSummary,
 } from '../interface';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
+import { parseVideoSegmentTimestamp } from '../utils/video-segment-time';
 import { StorageService } from './storage.service';
 import { SubmissionTemplateService } from './submission-template.service';
 import dayjs = require('dayjs');
@@ -868,7 +869,7 @@ export class JobService {
 
     const rawVideos = uploadedSegments.map((s3Key: string, index: number) => {
       const filename = s3Key.split('/').pop() || `segment_${index}.mkv`;
-      const timestamp = this.parseVideoSegmentTimestamp(filename);
+      const timestamp = parseVideoSegmentTimestamp(filename);
 
       return {
         index,
@@ -970,22 +971,5 @@ export class JobService {
       duration: 0,
       size: 0,
     } as any;
-  }
-
-  private parseVideoSegmentTimestamp(filename: string): number | null {
-    const match = filename.match(/segment_(\d{8})_(\d{6})\.mkv$/);
-    if (!match) {
-      return null;
-    }
-
-    const [, date, time] = match;
-    const year = Number(date.slice(0, 4));
-    const month = Number(date.slice(4, 6)) - 1;
-    const day = Number(date.slice(6, 8));
-    const hour = Number(time.slice(0, 2));
-    const minute = Number(time.slice(2, 4));
-    const second = Number(time.slice(4, 6));
-
-    return Date.UTC(year, month, day, hour, minute, second);
   }
 }

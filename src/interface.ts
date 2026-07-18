@@ -209,7 +209,7 @@ export interface TimeBucket {
 
 export interface SegmentInfo {
   id: string; // 内部 UUID
-  timestamp: number;
+  timestamp: number; // UTC epoch milliseconds
   type: 'video' | 'danmaku';
   localPath: string;
   s3Key: string;

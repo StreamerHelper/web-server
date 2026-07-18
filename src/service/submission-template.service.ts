@@ -6,7 +6,7 @@ import {
   Scope,
   ScopeEnum,
 } from '@midwayjs/core';
-import dayjs = require('dayjs');
+import { formatDateTimeInTimeZone } from '../utils/video-segment-time';
 
 export interface SubmissionTemplateContext {
   streamerName?: string | null;
@@ -42,11 +42,17 @@ export class SubmissionTemplateService {
   }
 
   renderTemplate(template: string, context: SubmissionTemplateContext): string {
-    const startedAt = context.startedAt ? dayjs(context.startedAt) : dayjs();
+    const startedAt = context.startedAt
+      ? new Date(
+          context.startedAt instanceof Date
+            ? context.startedAt.getTime()
+            : context.startedAt
+        )
+      : new Date();
     const replacements = this.buildReplacementMap(
       context.streamerName || '',
       context.roomName || '',
-      startedAt.isValid() ? startedAt : dayjs()
+      Number.isNaN(startedAt.getTime()) ? new Date() : startedAt
     );
 
     let renderedTitle = template;
@@ -83,10 +89,9 @@ export class SubmissionTemplateService {
   private buildReplacementMap(
     streamerName: string,
     roomName: string,
-    startedAt: dayjs.Dayjs
+    startedAt: Date
   ): Array<[string, string]> {
-    const date = startedAt.format('YYYY-MM-DD');
-    const time = startedAt.format('HH:mm');
+    const [date, time] = formatDateTimeInTimeZone(startedAt).split(' ');
 
     return [
       ['{主播名}', streamerName],

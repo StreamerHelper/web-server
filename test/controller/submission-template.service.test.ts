@@ -1,6 +1,16 @@
 import { SubmissionTemplateService } from '../../src/service/submission-template.service';
 
 describe('SubmissionTemplateService', () => {
+  const originalTimeZone = process.env.TZ;
+
+  beforeAll(() => {
+    process.env.TZ = 'Asia/Shanghai';
+  });
+
+  afterAll(() => {
+    process.env.TZ = originalTimeZone;
+  });
+
   const createService = () => {
     const service = new SubmissionTemplateService() as any;
     service.submissionConfig = {
@@ -22,9 +32,7 @@ describe('SubmissionTemplateService', () => {
       startedAt: '2026-04-18T12:34:00+08:00',
     });
 
-    expect(title).toContain('主播A');
-    expect(title).toMatch(/^主播A 录制时房间名 \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
-    expect(title).not.toContain('{');
+    expect(title).toBe('主播A 录制时房间名 2026-04-18 12:34');
   });
 
   it('falls back to configured defaults when template and tid are missing', () => {

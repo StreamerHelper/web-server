@@ -31,6 +31,10 @@ import { BilibiliSeasonService } from './bilibili-season.service';
 import { BilibiliPartitionService } from './bilibili-partition.service';
 import { TranscriptMessage, TranscriptSegmentInfo } from '../interface/data';
 import { formatTranscriptMessages } from '../utils/transcript-format';
+import {
+  formatDateTimeInTimeZone,
+  parseVideoSegmentDate,
+} from '../utils/video-segment-time';
 
 /**
  * 每个分P的目标时长（1小时 = 3600秒）
@@ -272,8 +276,8 @@ export class BilibiliSubmissionService {
     const sortedKeys = [...s3Keys].sort();
     const firstKey = sortedKeys[0];
     const lastKey = sortedKeys[sortedKeys.length - 1];
-    const startedAt = this.parseSegmentDate(firstKey);
-    const endedAt = this.parseSegmentDate(lastKey);
+    const startedAt = parseVideoSegmentDate(firstKey);
+    const endedAt = parseVideoSegmentDate(lastKey);
 
     return {
       ...data,
@@ -1182,57 +1186,7 @@ export class BilibiliSubmissionService {
   }
 
   private formatPartTitleFromS3Key(s3Key?: string): string {
-    const dateParts = this.parseSegmentFilename(s3Key);
-    if (!dateParts) {
-      return this.formatPartTitle(new Date());
-    }
-
-    return `${dateParts.year}-${dateParts.month}-${dateParts.day} ${dateParts.hour}:${dateParts.minute}`;
-  }
-
-  private parseSegmentDate(s3Key?: string): Date | undefined {
-    const dateParts = this.parseSegmentFilename(s3Key);
-    if (!dateParts) {
-      return undefined;
-    }
-
-    return new Date(
-      Number(dateParts.year),
-      Number(dateParts.month) - 1,
-      Number(dateParts.day),
-      Number(dateParts.hour),
-      Number(dateParts.minute),
-      Number(dateParts.second)
-    );
-  }
-
-  private parseSegmentFilename(s3Key?: string):
-    | {
-        year: string;
-        month: string;
-        day: string;
-        hour: string;
-        minute: string;
-        second: string;
-      }
-    | undefined {
-    const basename = s3Key ? path.basename(s3Key) : '';
-    const match = basename.match(
-      /segment_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/
-    );
-    if (!match) {
-      return undefined;
-    }
-
-    const [, year, month, day, hour, minute, second] = match;
-    return { year, month, day, hour, minute, second };
-  }
-
-  private formatPartTitle(date: Date): string {
-    const pad = (value: number) => String(value).padStart(2, '0');
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
-      date.getDate()
-    )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    return formatDateTimeInTimeZone(parseVideoSegmentDate(s3Key) || new Date());
   }
 
   /**

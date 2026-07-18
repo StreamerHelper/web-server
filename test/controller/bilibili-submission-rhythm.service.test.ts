@@ -10,12 +10,22 @@ import {
 } from '../../src/entity/bilibili-submission.entity';
 
 describe('BilibiliSubmissionRhythmService', () => {
+  const originalTimeZone = process.env.TZ;
+
+  beforeAll(() => {
+    process.env.TZ = 'Asia/Shanghai';
+  });
+
+  afterAll(() => {
+    process.env.TZ = originalTimeZone;
+  });
+
   const createSegmentKeys = (jobId: string, count: number, startMinute = 0) =>
     Array.from({ length: count }, (_, index) => {
       const totalSeconds = startMinute * 60 + index * 10;
       const minute = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
       const second = String(totalSeconds % 60).padStart(2, '0');
-      return `raw/${jobId}/video/segment_20260426_12${minute}${second}.mkv`;
+      return `raw/${jobId}/video/segment_20260426_04${minute}${second}.mkv`;
     });
 
   const createService = () => {

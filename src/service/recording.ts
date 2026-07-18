@@ -2,7 +2,6 @@ import { Framework } from '@midwayjs/bullmq';
 import { ILogger } from '@midwayjs/core';
 import { Application } from '@midwayjs/koa';
 import chokidar, { FSWatcher } from 'chokidar';
-import * as dayjs from 'dayjs';
 import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import { throttle } from 'lodash';
@@ -20,6 +19,7 @@ import { FFmpegExitEvent, FFmpegService } from './ffmpeg.service';
 import { HighlightService } from './highlight.service';
 import { JobService } from './job.service';
 import { TranscriptSchedulerService } from './transcript-scheduler.service';
+import { parseVideoSegmentTimestamp } from '../utils/video-segment-time';
 
 /**
  * 录制选项（由调用方提供）
@@ -1025,7 +1025,7 @@ export class Recording extends EventEmitter {
 
     try {
       const stats = await fs.stat(localPath);
-      const timestamp = this.parseTimestampFromFilename(filename);
+      const timestamp = parseVideoSegmentTimestamp(filename) ?? Date.now();
       const startTimeOffsetMs = this.segmentCount * this.segmentTime * 1000;
 
       const segmentInfo: SegmentInfo = {
@@ -1101,23 +1101,6 @@ export class Recording extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-  }
-
-  /**
-   * 从文件名解析时间戳
-   */
-  private parseTimestampFromFilename(filename: string): number {
-    const match = filename.match(/segment_(\d{8})_(\d{6})\.mkv/);
-    if (!match) {
-      return Date.now();
-    }
-
-    const [, date, time] = match;
-    const isoStr = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(
-      6,
-      8
-    )}T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4, 6)}Z`;
-    return dayjs(isoStr).valueOf();
   }
 
   /**

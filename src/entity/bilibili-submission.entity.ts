@@ -45,9 +45,9 @@ export interface SubmissionPart {
   rhythmIntervalMinutes?: number;
   /** 是否在合并后把 ASR 字幕压制到视频内 */
   burnInSubtitles?: boolean;
-  /** 分P起始时间 */
+  /** 分P起始时间（ISO 8601 UTC） */
   startedAt?: string;
-  /** 分P结束时间 */
+  /** 分P结束时间（ISO 8601 UTC） */
   endedAt?: string;
   /** B站上传后的文件名 */
   filename?: string;
