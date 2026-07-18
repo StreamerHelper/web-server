@@ -19,7 +19,7 @@ import {
   Platform,
   StreamerLiveStatus,
 } from '../interface';
-import { AsrService } from '../service/asr.service';
+import { AsrModelsResponse, AsrService } from '../service/asr.service';
 import { JobService } from '../service/job.service';
 import { PlatformService } from '../service/platform.service';
 import { StreamerService } from '../service/streamer.service';
@@ -251,6 +251,14 @@ export class SystemController {
   }
 
   /**
+   * GET /api/system/asr-models - 获取阿里云可用模型列表
+   */
+  @Get('/asr-models')
+  async getAsrModels(): Promise<AsrModelsResponse> {
+    return this.asrService.listAvailableModels();
+  }
+
+  /**
    * POST /api/system/asr-settings - 保存 ASR 配置
    */
   @Post('/asr-settings')
@@ -304,10 +312,10 @@ export class SystemController {
             : Boolean(body.transcribeRecordings),
       };
 
-      updateConfig({
+      const updatedConfig = updateConfig({
         asr: nextAsr,
       });
-      this.asrService.updateConfig(nextAsr);
+      this.asrService.updateConfig(updatedConfig.asr);
 
       return this.asrService.getPublicStatus();
     } catch (error) {

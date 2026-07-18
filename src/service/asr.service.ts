@@ -6,6 +6,8 @@ import {
   Scope,
   ScopeEnum,
 } from '@midwayjs/core';
+import * as http from 'http';
+import * as https from 'https';
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { TranscriptMessage } from '../interface/data';
@@ -48,6 +50,20 @@ export interface AsrResult {
   language: string;
 }
 
+export interface AsrAvailableModel {
+  id: string;
+  object?: string;
+  created?: number;
+  ownedBy?: string;
+}
+
+export interface AsrModelsResponse {
+  models: AsrAvailableModel[];
+  fetchedAt: number;
+  source: string;
+  error?: string;
+}
+
 /**
  * ASR 服务
  *
@@ -62,7 +78,9 @@ export class AsrService {
   private logger: ILogger;
 
   @Config('streamerhelper.asr')
-  private config: AsrConfig;
+  private injectedConfig: AsrConfig;
+
+  private runtimeConfig?: AsrConfig;
 
   /**
    * 转录音视频文件
@@ -206,6 +224,63 @@ export class AsrService {
     return ['zh-CN', 'en-US', 'ja-JP', 'ko-KR'];
   }
 
+  async listAvailableModels(): Promise<AsrModelsResponse> {
+    const config = this.getConfig();
+    const source = this.buildModelsEndpoint(config.baseUrl);
+    const fetchedAt = Date.now();
+    const apiKey = this.resolveApiKey(false);
+
+    if (!apiKey) {
+      return {
+        models: [],
+        fetchedAt,
+        source,
+        error: `Missing ASR API key. Set streamerhelper.asr.apiKey or ${config.apiKeyEnv}.`,
+      };
+    }
+
+    try {
+      const payload = await this.getJson<Record<string, unknown>>(
+        source,
+        apiKey,
+        15_000
+      );
+      const rawModels = Array.isArray(payload.data)
+        ? payload.data
+        : Array.isArray(payload.models)
+        ? payload.models
+        : [];
+      const models = this.normalizeModelList(rawModels);
+
+      if (models.length === 0) {
+        return {
+          models,
+          fetchedAt,
+          source,
+          error: 'Aliyun model list response did not contain any models.',
+        };
+      }
+
+      return {
+        models,
+        fetchedAt,
+        source,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn('Failed to fetch Aliyun ASR model list', {
+        source,
+        error: message,
+      });
+      return {
+        models: [],
+        fetchedAt,
+        source,
+        error: message,
+      };
+    }
+  }
+
   /**
    * 获取支持的特性
    */
@@ -248,7 +323,7 @@ export class AsrService {
   }
 
   updateConfig(patch: Partial<AsrConfig>): void {
-    this.config = {
+    this.runtimeConfig = {
       ...this.getConfig(),
       ...patch,
     };
@@ -256,7 +331,8 @@ export class AsrService {
 
   private getConfig(): AsrConfig {
     return (
-      this.config || {
+      this.runtimeConfig ||
+      this.injectedConfig || {
         enabled: true,
         provider: 'aliyun',
         apiKey: '',
@@ -294,5 +370,153 @@ export class AsrService {
       return '********';
     }
     return `${apiKey.slice(0, 4)}****${apiKey.slice(-4)}`;
+  }
+
+  private buildModelsEndpoint(baseUrl: string): string {
+    const normalizedBaseUrl = (
+      baseUrl || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+    ).replace(/\/+$/, '');
+    return `${normalizedBaseUrl}/models`;
+  }
+
+  private normalizeModelList(items: unknown[]): AsrAvailableModel[] {
+    const models = new Map<string, AsrAvailableModel>();
+
+    for (const item of items) {
+      const model = this.normalizeModelItem(item);
+      if (model) {
+        models.set(model.id, model);
+      }
+    }
+
+    return Array.from(models.values()).sort((left, right) => {
+      const priorityDiff =
+        this.getModelPriority(left.id) - this.getModelPriority(right.id);
+      if (priorityDiff !== 0) {
+        return priorityDiff;
+      }
+      return left.id.localeCompare(right.id);
+    });
+  }
+
+  private normalizeModelItem(item: unknown): AsrAvailableModel | undefined {
+    if (typeof item === 'string') {
+      return { id: item };
+    }
+
+    if (!item || typeof item !== 'object') {
+      return undefined;
+    }
+
+    const record = item as Record<string, unknown>;
+    const id =
+      typeof record.id === 'string'
+        ? record.id
+        : typeof record.model === 'string'
+        ? record.model
+        : '';
+
+    if (!id) {
+      return undefined;
+    }
+
+    return {
+      id,
+      object: typeof record.object === 'string' ? record.object : undefined,
+      created: typeof record.created === 'number' ? record.created : undefined,
+      ownedBy:
+        typeof record.owned_by === 'string'
+          ? record.owned_by
+          : typeof record.ownedBy === 'string'
+          ? record.ownedBy
+          : undefined,
+    };
+  }
+
+  private getModelPriority(id: string): number {
+    const value = id.toLowerCase();
+    if (value.includes('asr')) {
+      return 0;
+    }
+    if (value.includes('audio') || value.includes('paraformer')) {
+      return 1;
+    }
+    return 2;
+  }
+
+  private getJson<T>(
+    urlString: string,
+    apiKey: string,
+    timeoutMs: number
+  ): Promise<T> {
+    const url = new URL(urlString);
+    const transport =
+      url.protocol === 'http:'
+        ? http
+        : url.protocol === 'https:'
+        ? https
+        : undefined;
+
+    if (!transport) {
+      throw new Error(`Unsupported ASR model list protocol: ${url.protocol}`);
+    }
+
+    return new Promise((resolve, reject) => {
+      const request = transport.request(
+        {
+          method: 'GET',
+          hostname: url.hostname,
+          port: url.port || undefined,
+          path: `${url.pathname}${url.search}`,
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'application/json',
+          },
+          timeout: timeoutMs,
+        },
+        response => {
+          let data = '';
+          response.setEncoding('utf8');
+          response.on('data', chunk => {
+            data += chunk;
+          });
+          response.on('end', () => {
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              parsed = { message: data };
+            }
+
+            if (
+              response.statusCode &&
+              response.statusCode >= 200 &&
+              response.statusCode < 300
+            ) {
+              resolve(parsed as T);
+              return;
+            }
+
+            const record =
+              parsed && typeof parsed === 'object'
+                ? (parsed as Record<string, unknown>)
+                : {};
+            reject(
+              new Error(
+                `Aliyun model list HTTP ${response.statusCode}: ${
+                  record.code || ''
+                } ${record.message || data}`.trim()
+              )
+            );
+          });
+        }
+      );
+
+      request.on('timeout', () => {
+        request.destroy(new Error('Aliyun model list request timed out'));
+      });
+      request.on('error', reject);
+      request.end();
+    });
   }
 }

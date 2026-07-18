@@ -27,6 +27,9 @@ describe('SystemController ASR settings', () => {
         transcribeRecordings: true,
       },
     });
+    (updateConfig as jest.Mock).mockImplementation(patch => ({
+      asr: patch.asr,
+    }));
   });
 
   const createController = () => {
@@ -44,6 +47,11 @@ describe('SystemController ASR settings', () => {
         available: true,
         apiKeySet: true,
         apiKeyMasked: 'new-****cret',
+      }),
+      listAvailableModels: jest.fn().mockResolvedValue({
+        models: [{ id: 'qwen3-asr-flash' }],
+        fetchedAt: 1710000000000,
+        source: 'https://dashscope.aliyuncs.com/compatible-mode/v1/models',
       }),
       updateConfig: jest.fn(),
     };
@@ -63,6 +71,20 @@ describe('SystemController ASR settings', () => {
       })
     );
     expect(result).not.toHaveProperty('apiKey');
+  });
+
+  it('returns ASR model list from the runtime service', async () => {
+    const controller = createController();
+
+    const result = await controller.getAsrModels();
+
+    expect(controller.asrService.listAvailableModels).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(
+      expect.objectContaining({
+        models: [{ id: 'qwen3-asr-flash' }],
+        source: 'https://dashscope.aliyuncs.com/compatible-mode/v1/models',
+      })
+    );
   });
 
   it('persists sanitized ASR settings and refreshes the runtime service', async () => {
