@@ -295,6 +295,42 @@ export class BilibiliSubmissionService {
     };
   }
 
+  private applyLocalPartStatus(
+    part: SubmissionPart,
+    status: PartStatus,
+    data: Partial<SubmissionPart> = {}
+  ): void {
+    Object.assign(part, data, { status });
+  }
+
+  private cloneSubmissionParts(parts: SubmissionPart[]): SubmissionPart[] {
+    return parts.map(part => ({
+      ...part,
+      s3Keys: [...(part.s3Keys || [])],
+    }));
+  }
+
+  private assertAllPlannedPartsUploaded(
+    submissionId: string,
+    parts: SubmissionPart[]
+  ): void {
+    if (parts.length === 0) {
+      return;
+    }
+
+    const incompleteParts = parts.filter(
+      part =>
+        part.status !== PartStatus.COMPLETED || !part.filename || !part.cid
+    );
+    if (incompleteParts.length > 0) {
+      throw new Error(
+        `Submission ${submissionId} still has unfinished parts before completion: ${incompleteParts
+          .map(part => `P${part.index}:${part.status}`)
+          .join(', ')}`
+      );
+    }
+  }
+
   /**
    * 处理投稿（由 Processor 调用）
    * 支持断点续传
@@ -361,6 +397,9 @@ export class BilibiliSubmissionService {
                 PartStatus.COMPLETED,
                 { title: partTitle }
               );
+              this.applyLocalPartStatus(part, PartStatus.COMPLETED, {
+                title: partTitle,
+              });
             }
             partCursor += 1;
             continue;
@@ -379,6 +418,9 @@ export class BilibiliSubmissionService {
             PartStatus.MERGING,
             { title: partTitle }
           );
+          this.applyLocalPartStatus(part, PartStatus.MERGING, {
+            title: partTitle,
+          });
 
           // 1. 下载并合并分片
           let mergedPart = await this.downloadAndMergeSegments(
@@ -403,7 +445,10 @@ export class BilibiliSubmissionService {
               part.index,
               splitParts
             );
-            await this.submissionRepository.updateParts(submissionId, parts);
+            await this.submissionRepository.updateParts(
+              submissionId,
+              this.cloneSubmissionParts(parts)
+            );
             this.logger.warn(
               'Merged part exceeded size threshold and was split',
               {
@@ -430,6 +475,10 @@ export class BilibiliSubmissionService {
               size: mergedPart.fileSize,
             }
           );
+          this.applyLocalPartStatus(part, PartStatus.UPLOADING, {
+            duration: mergedPart.duration,
+            size: mergedPart.fileSize,
+          });
 
           // 2. 上传到B站
           const videoPart: VideoPart = {
@@ -458,6 +507,13 @@ export class BilibiliSubmissionService {
               size: mergedPart.fileSize,
             }
           );
+          this.applyLocalPartStatus(part, PartStatus.COMPLETED, {
+            filename: uploadedPart.filename,
+            cid: uploadedPart.cid,
+            title: partTitle,
+            duration: mergedPart.duration,
+            size: mergedPart.fileSize,
+          });
 
           uploadedParts.push({
             title: partTitle,
@@ -528,6 +584,7 @@ export class BilibiliSubmissionService {
         submissionId,
         SubmissionStatus.SUBMITTING
       );
+      this.assertAllPlannedPartsUploaded(submissionId, parts);
       await this.addSubmissionToCollectionIfNeeded(
         submission,
         result.avid,
@@ -942,23 +999,35 @@ export class BilibiliSubmissionService {
       collectionInput.cid = resolvedCid;
     }
 
-    const collectionResult = await this.bilibiliSeasonService.addVideoToSeason(
-      collectionInput
-    );
+    try {
+      const collectionResult =
+        await this.bilibiliSeasonService.addVideoToSeason(collectionInput);
 
-    await this.submissionRepository.updateCollectionResult(
-      submission.id,
-      collectionResult.episodeId
-    );
+      await this.submissionRepository.updateCollectionResult(
+        submission.id,
+        collectionResult.episodeId
+      );
 
-    this.logger.info('Submission added to bilibili collection', {
-      submissionId: submission.id,
-      aid: avid,
-      seasonId: submission.collectionSeasonId,
-      sectionId: submission.collectionSectionId,
-      episodeId: collectionResult.episodeId,
-      alreadyExists: collectionResult.alreadyExists,
-    });
+      this.logger.info('Submission added to bilibili collection', {
+        submissionId: submission.id,
+        aid: avid,
+        seasonId: submission.collectionSeasonId,
+        sectionId: submission.collectionSectionId,
+        episodeId: collectionResult.episodeId,
+        alreadyExists: collectionResult.alreadyExists,
+      });
+    } catch (error) {
+      this.logger.warn(
+        'Failed to add submission to bilibili collection; keeping submission completed',
+        {
+          submissionId: submission.id,
+          aid: avid,
+          seasonId: submission.collectionSeasonId,
+          sectionId: submission.collectionSectionId,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+    }
   }
 
   private buildSubmitOptions(

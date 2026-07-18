@@ -61,6 +61,35 @@ export class BilibiliSubmissionRepository {
     });
   }
 
+  async findRecoverableSubmissions(): Promise<BilibiliSubmissionEntity[]> {
+    const unfinishedPartCondition = `EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(submission.parts) AS part
+      WHERE part->>'status' <> :completedPartStatus
+        OR COALESCE(part->>'filename', '') = ''
+        OR COALESCE(part->>'cid', '') IN ('', '0')
+    )`;
+
+    return this.repo
+      .createQueryBuilder('submission')
+      .where('submission.status IN (:...activeStatuses)', {
+        activeStatuses: [
+          SubmissionStatus.PENDING,
+          SubmissionStatus.UPLOADING,
+          SubmissionStatus.SUBMITTING,
+        ],
+      })
+      .orWhere(
+        `(submission.status = :completedStatus AND ${unfinishedPartCondition})`,
+        {
+          completedStatus: SubmissionStatus.COMPLETED,
+          completedPartStatus: PartStatus.COMPLETED,
+        }
+      )
+      .orderBy('submission.createdAt', 'ASC')
+      .getMany();
+  }
+
   /**
    * 更新投稿状态
    */

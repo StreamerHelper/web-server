@@ -458,9 +458,15 @@ export class BilibiliController {
       // 派发任务到队列
       const queue = this.bullFramework.getQueue('bilibili-submission');
       if (queue) {
-        await queue.addJobToQueue({
-          submissionId: submission.id,
-        });
+        await queue.addJobToQueue(
+          {
+            submissionId: submission.id,
+          },
+          {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 60_000 },
+          }
+        );
       }
 
       return {

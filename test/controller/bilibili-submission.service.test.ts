@@ -17,7 +17,11 @@ describe('BilibiliSubmissionService title handling', () => {
   });
 
   afterAll(() => {
-    process.env.TZ = originalTimeZone;
+    if (originalTimeZone === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTimeZone;
+    }
   });
 
   const createTemplateService = () => {
@@ -364,9 +368,9 @@ describe('BilibiliSubmissionService title handling', () => {
         parts: [
           expect.objectContaining({
             title: '2026-07-18 03:01',
-            s3Keys: uploadedSegments,
             startedAt: '2026-07-17T19:01:59.000Z',
             endedAt: '2026-07-17T19:02:09.000Z',
+            s3Keys: uploadedSegments,
           }),
         ],
       })
@@ -656,6 +660,121 @@ describe('BilibiliSubmissionService title handling', () => {
       ],
       expect.objectContaining({
         title: '超大分P投稿',
+      })
+    );
+  });
+
+  it('preserves completed part metadata when a later part is split', async () => {
+    const service = createService();
+    const smallPartKeys = ['raw/job-split/video/segment_20260426_040000.mkv'];
+    const oversizedPartKeys = [
+      'raw/job-split/video/segment_20260426_043000.mkv',
+      'raw/job-split/video/segment_20260426_043010.mkv',
+      'raw/job-split/video/segment_20260426_043020.mkv',
+      'raw/job-split/video/segment_20260426_043030.mkv',
+    ];
+
+    service.submissionRepository.findById.mockResolvedValue({
+      id: 'submission-split-after-complete',
+      status: SubmissionStatus.PENDING,
+      totalParts: 2,
+      completedParts: 0,
+      parts: [
+        {
+          index: 1,
+          title: '2026-04-26 12:00',
+          s3Keys: smallPartKeys,
+          status: PartStatus.PENDING,
+        },
+        {
+          index: 2,
+          title: '2026-04-26 12:30',
+          s3Keys: oversizedPartKeys,
+          status: PartStatus.PENDING,
+        },
+      ],
+      bvid: null,
+      avid: null,
+      title: '后续分P切分投稿',
+      description: '简介',
+      tags: ['直播'],
+      tid: 171,
+      humanType2: 2066,
+      cover: null,
+      copyright: 2,
+      source: 'https://live.bilibili.com/12345',
+      dynamic: '',
+      collectionAutoAdd: false,
+    });
+    service.getMaxMergedPartFileSizeBytes = jest.fn(() => 100);
+    service.downloadAndMergeSegments = jest
+      .fn()
+      .mockImplementation(async (keys: string[], _tempDir: string, partIndex: number) => {
+        if (partIndex === 2 && keys.length === 4) {
+          return {
+            filePath: '/tmp/part_2_oversized.mkv',
+            duration: 40000,
+            fileSize: 250,
+          };
+        }
+
+        return {
+          filePath: `/tmp/part_${partIndex}_${keys.length}.mkv`,
+          duration: keys.length * 10000,
+          fileSize: 90,
+        };
+      });
+    service.uploadService.uploadPartFromLocal
+      .mockResolvedValueOnce({
+        filename: 'completed-before-split',
+        cid: 9001,
+      })
+      .mockResolvedValueOnce({
+        filename: 'split-file-1',
+        cid: 9002,
+      })
+      .mockResolvedValueOnce({
+        filename: 'split-file-2',
+        cid: 9003,
+      });
+    service.uploadService.submitVideoParts.mockResolvedValue({
+      bvid: 'BV1splitLater',
+      avid: 987654,
+    });
+
+    await service.processSubmission('submission-split-after-complete');
+
+    expect(service.submissionRepository.updateParts).toHaveBeenCalledWith(
+      'submission-split-after-complete',
+      expect.arrayContaining([
+        expect.objectContaining({
+          index: 1,
+          status: PartStatus.COMPLETED,
+          filename: 'completed-before-split',
+          cid: 9001,
+        }),
+      ])
+    );
+    expect(service.uploadService.submitVideoParts).toHaveBeenCalledWith(
+      [
+        {
+          title: '2026-04-26 12:00',
+          filename: 'completed-before-split',
+          cid: 9001,
+        },
+        {
+          title: '2026-04-26 12:30',
+          filename: 'split-file-1',
+          cid: 9002,
+        },
+        {
+          title: '2026-04-26 12:30',
+          filename: 'split-file-2',
+          cid: 9003,
+        },
+      ],
+      expect.objectContaining({
+        title: '后续分P切分投稿',
       })
     );
   });

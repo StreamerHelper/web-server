@@ -394,9 +394,15 @@ export class RecorderManager {
         'bilibili-submission'
       );
       if (submissionQueue) {
-        await submissionQueue.addJobToQueue({
-          submissionId: submission.id,
-        });
+        await submissionQueue.addJobToQueue(
+          {
+            submissionId: submission.id,
+          },
+          {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 60_000 },
+          }
+        );
       }
 
       this.logger.info('Auto submission triggered', {

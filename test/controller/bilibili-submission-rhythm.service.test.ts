@@ -17,7 +17,11 @@ describe('BilibiliSubmissionRhythmService', () => {
   });
 
   afterAll(() => {
-    process.env.TZ = originalTimeZone;
+    if (originalTimeZone === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTimeZone;
+    }
   });
 
   const createSegmentKeys = (jobId: string, count: number, startMinute = 0) =>
@@ -102,9 +106,13 @@ describe('BilibiliSubmissionRhythmService', () => {
         ],
       })
     );
-    expect(service.queue.addJobToQueue).toHaveBeenCalledWith({
-      submissionId: 'submission-first',
-    });
+    expect(service.queue.addJobToQueue).toHaveBeenCalledWith(
+      { submissionId: 'submission-first' },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }
+    );
   });
 
   it('appends ready parts to the existing segmented submission', async () => {
@@ -161,9 +169,13 @@ describe('BilibiliSubmissionRhythmService', () => {
         ],
       })
     );
-    expect(service.queue.addJobToQueue).toHaveBeenCalledWith({
-      submissionId: 'submission-existing',
-    });
+    expect(service.queue.addJobToQueue).toHaveBeenCalledWith(
+      { submissionId: 'submission-existing' },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }
+    );
   });
 
   it('flushes the remaining tail segment when recording ends', async () => {
@@ -203,7 +215,10 @@ describe('BilibiliSubmissionRhythmService', () => {
     const service = createService();
     const uploadedSegments = createSegmentKeys('job-subtitles', 6);
     const transcriptSegments = uploadedSegments.slice(0, 5).map(key => ({
-      segmentId: key.split('/').pop()!.replace(/\.[^.]+$/, ''),
+      segmentId: key
+        .split('/')
+        .pop()!
+        .replace(/\.[^.]+$/, ''),
     }));
 
     service.jobService.findById.mockResolvedValueOnce({
@@ -239,7 +254,10 @@ describe('BilibiliSubmissionRhythmService', () => {
         uploadedSegments,
         transcriptIndex: {
           segments: uploadedSegments.map(key => ({
-            segmentId: key.split('/').pop()!.replace(/\.[^.]+$/, ''),
+            segmentId: key
+              .split('/')
+              .pop()!
+              .replace(/\.[^.]+$/, ''),
           })),
         },
       },
@@ -260,8 +278,12 @@ describe('BilibiliSubmissionRhythmService', () => {
         burnInSubtitles: true,
       })
     );
-    expect(service.queue.addJobToQueue).toHaveBeenCalledWith({
-      submissionId: 'submission-first',
-    });
+    expect(service.queue.addJobToQueue).toHaveBeenCalledWith(
+      { submissionId: 'submission-first' },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }
+    );
   });
 });

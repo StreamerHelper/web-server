@@ -65,6 +65,10 @@ const UPLOAD_LINES = [
   { name: 'alia', query: 'zone=cs&upcdn=alia&probe_version=20221109' },
 ];
 
+const BILIBILI_API_TIMEOUT_MS = 30_000;
+const BILIBILI_LINE_PROBE_TIMEOUT_MS = 8_000;
+const BILIBILI_UPLOAD_CHUNK_TIMEOUT_MS = 5 * 60_000;
+
 interface PreuploadResult {
   chunkSize: number;
   auth: string;
@@ -100,6 +104,42 @@ export class BilibiliUploadService {
 
   @Inject()
   private storageService: StorageService;
+
+  private async fetchWithTimeout(
+    input: Parameters<typeof fetch>[0],
+    init: RequestInit & { duplex?: 'half' } = {},
+    timeoutMs = BILIBILI_API_TIMEOUT_MS,
+    label = typeof input === 'string' ? input : input.toString()
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      this.destroyRequestBody(init.body);
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      } as RequestInit & { duplex?: 'half' });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(
+          `Bilibili request timed out after ${timeoutMs}ms: ${label}`
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private destroyRequestBody(body: BodyInit | null | undefined): void {
+    const maybeStream = body as unknown as { destroy?: (error: Error) => void };
+    if (maybeStream?.destroy) {
+      maybeStream.destroy(new Error('Bilibili upload request timed out'));
+    }
+  }
 
   /**
    * 上传视频到 B站
@@ -180,7 +220,12 @@ export class BilibiliUploadService {
       const url = `https://upos-cs-upcdn${line.name}.bilivideo.com/OK`;
       try {
         const startTime = Date.now();
-        await fetch(url, { method: 'GET' });
+        await this.fetchWithTimeout(
+          url,
+          { method: 'GET' },
+          BILIBILI_LINE_PROBE_TIMEOUT_MS,
+          `probe upload line ${line.name}`
+        );
         const responseTime = Date.now() - startTime;
         lines.push({ name: line.name, query: line.query, responseTime });
       } catch (error) {
@@ -410,7 +455,7 @@ export class BilibiliUploadService {
     const url = `https://member.bilibili.com/preupload?${
       line.query
     }&${params.toString()}`;
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
         Cookie: Object.entries(cookies)
@@ -457,7 +502,7 @@ export class BilibiliUploadService {
     const uposPath = uposUri.replace('upos://', '');
     // endpoint 不包含协议，需要添加 https://
     const url = `https://${endpoint}/${uposPath}?uploads&output=json`;
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'X-Upos-Auth': auth,
@@ -520,7 +565,12 @@ export class BilibiliUploadService {
       requestInit.duplex = 'half';
     }
 
-    const response = await fetch(url, requestInit);
+    const response = await this.fetchWithTimeout(
+      url,
+      requestInit,
+      BILIBILI_UPLOAD_CHUNK_TIMEOUT_MS,
+      `upload chunk ${chunkIndex + 1}/${totalChunks}`
+    );
 
     if (!response.ok) {
       throw new Error(`Failed to upload chunk: HTTP ${response.status}`);
@@ -553,7 +603,7 @@ export class BilibiliUploadService {
     });
 
     const url = `https://${endpoint}/${uposPath}?${params.toString()}`;
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'X-Upos-Auth': auth,
@@ -614,7 +664,7 @@ export class BilibiliUploadService {
     });
 
     const url = `https://member.bilibili.com/x/vu/web/cover/up?ts=${Date.now()}`;
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -836,7 +886,7 @@ export class BilibiliUploadService {
     url.searchParams.set('ts', String(Date.now()));
     url.searchParams.set('csrf', cookies.bili_jct || '');
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -897,7 +947,7 @@ export class BilibiliUploadService {
     url.searchParams.set('t', String(Date.now()));
     url.searchParams.set('csrf', cookies.bili_jct || '');
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1025,7 +1075,7 @@ export class BilibiliUploadService {
     form.set('filename', filename);
     form.set('title', title);
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: this.buildBrowserHeaders(cookies),
       body: form,

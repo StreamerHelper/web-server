@@ -321,7 +321,13 @@ export class BilibiliSubmissionRhythmService {
       return;
     }
 
-    await queue.addJobToQueue({ submissionId });
+    await queue.addJobToQueue(
+      { submissionId },
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }
+    );
   }
 
   private async withJobLock<T>(

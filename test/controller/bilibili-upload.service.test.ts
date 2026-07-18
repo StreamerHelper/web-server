@@ -112,4 +112,40 @@ describe('BilibiliUploadService streaming uploads', () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('aborts stalled upload requests and destroys their streams', async () => {
+    jest.useFakeTimers();
+    const service = createService();
+    const body = { destroy: jest.fn() };
+    jest.spyOn(global, 'fetch').mockImplementation(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const error = new Error('aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        })
+    );
+
+    try {
+      const request = service.fetchWithTimeout(
+        'https://upload.example.com/chunk',
+        { method: 'POST', body } as any,
+        1000,
+        'upload test chunk'
+      );
+      const rejection = expect(request).rejects.toThrow(
+        'Bilibili request timed out after 1000ms: upload test chunk'
+      );
+
+      await jest.advanceTimersByTimeAsync(1000);
+      await rejection;
+
+      expect(body.destroy).toHaveBeenCalledWith(expect.any(Error));
+    } finally {
+      jest.useRealTimers();
+      jest.restoreAllMocks();
+    }
+  });
 });
