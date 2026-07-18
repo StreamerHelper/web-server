@@ -16,10 +16,8 @@ describe('video segment time contract', () => {
     );
   });
 
-  it('formats the same instant in an explicit display timezone', () => {
-    const date = parseVideoSegmentDate(
-      'segment_20260717_190159.mkv'
-    ) as Date;
+  it('formats the same instant in the configured application timezone', () => {
+    const date = parseVideoSegmentDate('segment_20260717_190159.mkv') as Date;
 
     expect(formatDateTimeInTimeZone(date, 'UTC')).toBe('2026-07-17 19:01');
     expect(formatDateTimeInTimeZone(date, 'Asia/Shanghai')).toBe(
@@ -27,12 +25,10 @@ describe('video segment time contract', () => {
     );
   });
 
-  it('rejects invalid dates and unrelated filenames', () => {
+  it('rejects invalid or ambiguous segment filenames', () => {
     expect(
       parseVideoSegmentDate('segment_20260230_120000.mkv')
     ).toBeUndefined();
-    expect(
-      parseVideoSegmentDate('part_20260717_190159.mkv')
-    ).toBeUndefined();
+    expect(parseVideoSegmentDate('part_20260717_190159.mkv')).toBeUndefined();
   });
 });

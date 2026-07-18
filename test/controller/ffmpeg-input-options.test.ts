@@ -1,7 +1,7 @@
 import { FFmpegService } from '../../src/service/ffmpeg.service';
 
 describe('FFmpeg input option selection', () => {
-  it('pins segment filenames to UTC independently of the process timezone', () => {
+  it('pins segment filenames to UTC independently of the application timezone', () => {
     const service = new FFmpegService() as any;
 
     expect(service.buildSegmentProcessEnvironment()).toEqual(

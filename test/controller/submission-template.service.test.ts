@@ -8,7 +8,11 @@ describe('SubmissionTemplateService', () => {
   });
 
   afterAll(() => {
-    process.env.TZ = originalTimeZone;
+    if (originalTimeZone === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTimeZone;
+    }
   });
 
   const createService = () => {
