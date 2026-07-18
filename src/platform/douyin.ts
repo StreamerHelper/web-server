@@ -78,6 +78,7 @@ const DOUYIN_LIVE_STATUS = 2;
 const REQUEST_TIMEOUT_MS = 15_000;
 const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
 const GUEST_COOKIE_TTL_MS = 10 * 60 * 1000;
+const IGNORED_DOUYIN_COOKIE_NAMES = new Set(['s_v_web_id']);
 
 export type DouyinCookieProvider = () => Promise<string | undefined>;
 
@@ -832,7 +833,11 @@ export class DouyinAdapter implements PlatformAdapter {
         if (separator <= 0) {
           continue;
         }
-        cookies.set(trimmed.slice(0, separator), trimmed.slice(separator + 1));
+        const name = trimmed.slice(0, separator);
+        if (IGNORED_DOUYIN_COOKIE_NAMES.has(name)) {
+          continue;
+        }
+        cookies.set(name, trimmed.slice(separator + 1));
       }
     }
 

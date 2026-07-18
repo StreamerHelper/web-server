@@ -26,6 +26,7 @@ const COOKIE_ATTRIBUTE_NAMES = new Set([
   'httponly',
   'samesite',
 ]);
+const IGNORED_DOUYIN_COOKIE_NAMES = new Set(['s_v_web_id']);
 const AUTHENTICATED_COOKIE_NAMES = new Set([
   'sessionid',
   'sid_guard',
@@ -35,6 +36,19 @@ const AUTHENTICATED_COOKIE_NAMES = new Set([
 ]);
 const BYTE_DANCE_COOKIE_DOMAIN_PATTERN =
   /(^|\.)((douyin|iesdouyin|amemv|bytedance|snssdk|toutiao)\.com)$/i;
+
+function hasInvalidCookieNameCharacter(value: string): boolean {
+  return Array.from(value).some(character => {
+    const codePoint = character.charCodeAt(0);
+    return (
+      character.trim() === '' ||
+      character === ';' ||
+      character === ',' ||
+      codePoint <= 0x1f ||
+      codePoint === 0x7f
+    );
+  });
+}
 
 export type DouyinBrowserLoginState =
   | 'initializing'
@@ -320,7 +334,10 @@ export class DouyinAuthService {
       if (!name || COOKIE_ATTRIBUTE_NAMES.has(name.toLowerCase())) {
         continue;
       }
-      if (/[\s;,\u0000-\u001f\u007f]/.test(name)) {
+      if (IGNORED_DOUYIN_COOKIE_NAMES.has(name)) {
+        continue;
+      }
+      if (hasInvalidCookieNameCharacter(name)) {
         continue;
       }
 
@@ -385,6 +402,26 @@ export class DouyinAuthService {
           statusCode: response.status,
           captchaDetected: true,
           error: 'Douyin returned a captcha page',
+        };
+      }
+
+      if (!text.trim()) {
+        return {
+          ok: false,
+          cookieNames,
+          statusCode: response.status,
+          captchaDetected: false,
+          error: 'Douyin returned an empty verification response',
+        };
+      }
+
+      if (webRid && !this.hasRoomInfoMarker(text)) {
+        return {
+          ok: false,
+          cookieNames,
+          statusCode: response.status,
+          captchaDetected: false,
+          error: 'Douyin room info was not found in verification response',
         };
       }
 
@@ -568,16 +605,16 @@ export class DouyinAuthService {
   private hasAuthenticatedDouyinCookies(browserCookies: Cookie[]): boolean {
     return browserCookies
       .filter(cookie => this.isByteDanceCookieDomain(cookie.domain))
-      .some(cookie => AUTHENTICATED_COOKIE_NAMES.has(cookie.name.toLowerCase()));
+      .some(cookie =>
+        AUTHENTICATED_COOKIE_NAMES.has(cookie.name.toLowerCase())
+      );
   }
 
   private isByteDanceCookieDomain(domain: string): boolean {
     return BYTE_DANCE_COOKIE_DOMAIN_PATTERN.test(domain.replace(/^\./, ''));
   }
 
-  private getBrowserLoginSession(
-    sessionId: string
-  ): DouyinBrowserLoginSession {
+  private getBrowserLoginSession(sessionId: string): DouyinBrowserLoginSession {
     const session = this.browserLoginSessions.get(sessionId);
     if (!session) {
       throw new DouyinCredentialError('Douyin login session not found', 404);
@@ -736,9 +773,7 @@ export class DouyinAuthService {
     );
   }
 
-  private async resolveRemoteBrowserConnection(
-    endpoint: string
-  ): Promise<{
+  private async resolveRemoteBrowserConnection(endpoint: string): Promise<{
     browserWSEndpoint: string;
     headers?: Record<string, string>;
   }> {
@@ -814,10 +849,9 @@ export class DouyinAuthService {
             if ((response.statusCode || 500) >= 400) {
               reject(
                 new DouyinCredentialError(
-                  `Browser endpoint returned HTTP ${response.statusCode}: ${body.slice(
-                    0,
-                    120
-                  )}`,
+                  `Browser endpoint returned HTTP ${
+                    response.statusCode
+                  }: ${body.slice(0, 120)}`,
                   500
                 )
               );
@@ -901,6 +935,15 @@ export class DouyinAuthService {
     return (
       /验证码中间页|安全验证|captcha|verify/i.test(title) ||
       /captcha\/index\.js|secsdk-captcha|argus-csp-token/i.test(html)
+    );
+  }
+
+  private hasRoomInfoMarker(html: string): boolean {
+    return (
+      html.includes('__pace_f') &&
+      (html.includes('roomInfo') ||
+        html.includes('"room"') ||
+        html.includes('roomStore'))
     );
   }
 

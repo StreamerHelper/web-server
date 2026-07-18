@@ -30,7 +30,7 @@ describe('DouyinAuthService', () => {
     const service = createService();
 
     const normalized = service.normalizeCookieHeader(`
-      Cookie: sessionid=abc; Path=/; ttwid=tw; HttpOnly; passport_csrf_token=csrf
+      Cookie: sessionid=abc; Path=/; s_v_web_id=verify_guest; ttwid=tw; HttpOnly; passport_csrf_token=csrf
     `);
 
     expect(normalized).toEqual({
@@ -40,9 +40,11 @@ describe('DouyinAuthService', () => {
   });
 
   it('saves a verified Douyin Cookie without returning the secret value', async () => {
-    jest.spyOn(global, 'fetch').mockResolvedValue(
-      new Response('<html><title>抖音直播</title></html>', { status: 200 })
-    );
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(
+        new Response('<html><title>抖音直播</title></html>', { status: 200 })
+      );
     const service = createService();
 
     const result = await service.saveCookie('sessionid=abc; ttwid=tw', {
@@ -67,14 +69,47 @@ describe('DouyinAuthService', () => {
   });
 
   it('rejects Cookie values that still hit Douyin captcha', async () => {
-    jest.spyOn(global, 'fetch').mockResolvedValue(
-      new Response('<html><title>安全验证</title></html>', { status: 200 })
-    );
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(
+        new Response('<html><title>安全验证</title></html>', { status: 200 })
+      );
     const service = createService();
 
     await expect(
       service.saveCookie('sessionid=abc; ttwid=tw', { verify: true })
     ).rejects.toThrow('Douyin returned a captcha page');
+    expect(service.credentialRepository.saveCredential).not.toHaveBeenCalled();
+  });
+
+  it('rejects empty verification responses', async () => {
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response('', { status: 200 }));
+    const service = createService();
+
+    await expect(
+      service.saveCookie('sessionid=abc; ttwid=tw', { verify: true })
+    ).rejects.toThrow('Douyin returned an empty verification response');
+    expect(service.credentialRepository.saveCredential).not.toHaveBeenCalled();
+  });
+
+  it('requires room data when verifying a specific live room', async () => {
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(
+        new Response('<html><title>抖音直播</title></html>', { status: 200 })
+      );
+    const service = createService();
+
+    await expect(
+      service.saveCookie('sessionid=abc; ttwid=tw', {
+        verify: true,
+        roomId: '123456',
+      })
+    ).rejects.toThrow(
+      'Douyin room info was not found in verification response'
+    );
     expect(service.credentialRepository.saveCredential).not.toHaveBeenCalled();
   });
 
