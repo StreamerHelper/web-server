@@ -783,12 +783,44 @@ export class DouyinAuthService {
   ): Promise<boolean> {
     for (const label of labels) {
       try {
-        await page
-          .locator(`::-p-text(${label})`)
-          .setTimeout(1500)
-          .setVisibility('visible')
-          .click();
-        return true;
+        const clicked = await page.evaluate(value => {
+          const doc = (globalThis as any).document;
+          const normalize = (text: unknown) =>
+            String(text || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+          const matches = Array.from(
+            doc.querySelectorAll(
+              'button, a, [role="button"], [tabindex], div, span'
+            )
+          ).filter(element => {
+            const node = element as any;
+            const rect = node.getBoundingClientRect();
+            const style = (globalThis as any).getComputedStyle(node);
+            return (
+              normalize(node.innerText || node.textContent) === value &&
+              rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none'
+            );
+          }) as any[];
+          const labelElement =
+            matches.find(
+              element =>
+                !matches.some(
+                  other => other !== element && element.contains(other)
+                )
+            ) || matches[0];
+          const target =
+            labelElement?.closest('button, a, [role="button"], [tabindex]') ||
+            labelElement;
+          target?.click();
+          return Boolean(target);
+        }, label);
+        if (clicked) {
+          return true;
+        }
       } catch {
         // Try the next semantic label.
       }
