@@ -640,11 +640,7 @@ export class DouyinAuthService {
         ? `https://live.douyin.com/${encodeURIComponent(webRid)}`
         : 'https://www.douyin.com/';
 
-      await session.page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-      });
-      await this.sleep(2000);
+      await this.navigateToDouyinLoginPage(session.page, url);
       await this.openDouyinLoginPanel(session.page);
 
       session.status = 'waiting';
@@ -732,6 +728,13 @@ export class DouyinAuthService {
       session.updatedAt = new Date();
       await this.closeBrowserLoginSession(session);
     } catch (error) {
+      if (this.isTransientBrowserNavigationError(error)) {
+        session.updatedAt = new Date();
+        this.logger?.debug('Douyin login page is still navigating', {
+          sessionId: session.id,
+        });
+        return;
+      }
       session.status = 'failed';
       session.error =
         error instanceof Error
@@ -828,37 +831,46 @@ export class DouyinAuthService {
   }
 
   private async openDouyinLoginPanel(page: Page): Promise<void> {
-    await page.evaluate(() => {
-      const doc = (globalThis as any).document;
-      const selectors = [
-        '[data-e2e="login-button"]',
-        '[data-e2e*="login"]',
-        '[class*="login"]',
-        'button',
-        'a',
-        'div',
-        'span',
-      ];
-      const elements = selectors.flatMap(selector =>
-        Array.from(doc.querySelectorAll(selector))
-      );
-      const uniqueElements = Array.from(new Set(elements));
-      const loginElement = uniqueElements.find(element => {
-        const node = element as any;
-        const text = (node.innerText || node.textContent || '').trim();
-        const rect = node.getBoundingClientRect();
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          text.length > 0 &&
-          text.length <= 20 &&
-          /登录|扫码登录|立即登录/.test(text)
-        );
-      });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await this.sleep(attempt === 0 ? 2000 : 1000);
+      if (
+        await this.clickVisibleElementByText(page, [
+          '扫码登录',
+          '立即登录',
+          '登录',
+        ])
+      ) {
+        await this.sleep(2000);
+        return;
+      }
+    }
+  }
 
-      (loginElement as any)?.click();
-    });
-    await this.sleep(2000);
+  private async navigateToDouyinLoginPage(
+    page: Page,
+    url: string
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        return;
+      } catch (error) {
+        if (attempt === 1 || !this.isTransientBrowserNavigationError(error)) {
+          throw error;
+        }
+        await this.sleep(1000);
+      }
+    }
+  }
+
+  private isTransientBrowserNavigationError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /execution context was destroyed|navigating frame was detached|frame was detached|cannot find context with specified id/i.test(
+      message
+    );
   }
 
   private buildCookieHeaderFromBrowserCookies(

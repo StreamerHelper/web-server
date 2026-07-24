@@ -219,6 +219,54 @@ describe('DouyinAuthService', () => {
     expect(session.status).toBe('verification_required');
   });
 
+  it('keeps polling while Douyin replaces the page execution context', async () => {
+    const service = createService() as any;
+    const session: any = {
+      id: 'session-id',
+      status: 'waiting',
+      createdAt: new Date('2026-07-24T00:00:00.000Z'),
+      updatedAt: new Date('2026-07-24T00:00:00.000Z'),
+      expiresAt: new Date(Date.now() + 60_000),
+      page: {
+        evaluate: jest
+          .fn()
+          .mockRejectedValue(
+            new Error(
+              'Execution context was destroyed, most likely because of a navigation.'
+            )
+          ),
+      },
+      browserContext: {
+        cookies: jest.fn().mockResolvedValue([]),
+      },
+    };
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('waiting');
+    expect(session.error).toBeUndefined();
+    expect(service.logger.debug).toHaveBeenCalledWith(
+      'Douyin login page is still navigating',
+      { sessionId: session.id }
+    );
+  });
+
+  it('retries a detached-frame navigation once', async () => {
+    const service = createService() as any;
+    service.sleep = jest.fn().mockResolvedValue(undefined);
+    const page = {
+      goto: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('Navigating frame was detached'))
+        .mockResolvedValueOnce(undefined),
+    };
+
+    await service.navigateToDouyinLoginPage(page, 'https://www.douyin.com/');
+
+    expect(page.goto).toHaveBeenCalledTimes(2);
+    expect(service.sleep).toHaveBeenCalledWith(1000);
+  });
+
   it('selects the default SMS method through visible Douyin text', async () => {
     const service = createService() as any;
     service.sleep = jest.fn().mockResolvedValue(undefined);
