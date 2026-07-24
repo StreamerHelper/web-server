@@ -36,6 +36,20 @@ const AUTHENTICATED_COOKIE_NAMES = new Set([
 ]);
 const BYTE_DANCE_COOKIE_DOMAIN_PATTERN =
   /(^|\.)((douyin|iesdouyin|amemv|bytedance|snssdk|toutiao)\.com)$/i;
+const DOUYIN_VERIFICATION_METHOD_LABELS = {
+  receive_sms: '接收短信验证码',
+  face: '手机刷脸验证',
+  send_sms: '发送短信验证',
+} as const;
+const DOUYIN_VERIFICATION_SUBMIT_LABELS = [
+  '确定',
+  '确认',
+  '提交',
+  '验证',
+  '下一步',
+  '完成',
+  '登录',
+];
 
 function hasInvalidCookieNameCharacter(value: string): boolean {
   return Array.from(value).some(character => {
@@ -59,15 +73,29 @@ export type DouyinBrowserLoginState =
   | 'failed'
   | 'cancelled';
 
+export type DouyinVerificationMethod = 'receive_sms' | 'face' | 'send_sms';
+
+export type DouyinVerificationStage =
+  | 'choose_method'
+  | 'processing'
+  | 'awaiting_code'
+  | 'awaiting_external';
+
+export interface DouyinBrowserLoginVerification {
+  stage: DouyinVerificationStage;
+  method?: DouyinVerificationMethod;
+  availableMethods: DouyinVerificationMethod[];
+  prompt?: string;
+}
+
 export type DouyinBrowserLoginInteraction =
   | {
-      type: 'click';
-      xRatio: number;
-      yRatio: number;
+      type: 'select_verification_method';
+      method: DouyinVerificationMethod;
     }
   | {
-      type: 'type';
-      text: string;
+      type: 'submit_verification_code';
+      code: string;
     };
 
 interface DouyinBrowserLoginSession {
@@ -85,6 +113,7 @@ interface DouyinBrowserLoginSession {
   cookieNames?: string[];
   verifiedAt?: Date;
   error?: string;
+  verification?: DouyinBrowserLoginVerification;
 }
 
 export class DouyinCredentialError extends Error {
@@ -126,6 +155,7 @@ export interface DouyinBrowserLoginStatus {
   cookieNames?: string[];
   verifiedAt?: Date;
   error?: string;
+  verification?: DouyinBrowserLoginVerification;
 }
 
 @Provide()
@@ -323,63 +353,114 @@ export class DouyinAuthService {
   ): Promise<DouyinBrowserLoginStatus> {
     if (
       !interaction ||
-      (interaction.type !== 'click' && interaction.type !== 'type')
+      !['select_verification_method', 'submit_verification_code'].includes(
+        interaction.type
+      )
     ) {
       throw new DouyinCredentialError(
-        'Browser interaction type must be click or type'
+        'Douyin verification interaction type is invalid'
       );
     }
 
     const session = this.getBrowserLoginSession(sessionId);
-    if (
-      !session.page ||
-      !['waiting', 'verification_required'].includes(session.status)
-    ) {
-      throw new DouyinCredentialError(
-        'Douyin login page is not interactive',
-        409
-      );
+    if (!session.page || session.status !== 'verification_required') {
+      throw new DouyinCredentialError('Douyin verification is not ready', 409);
     }
 
     this.assertDouyinLoginPage(session.page.url());
 
-    if (interaction.type === 'click') {
-      const { xRatio, yRatio } = interaction;
-      if (
-        !Number.isFinite(xRatio) ||
-        !Number.isFinite(yRatio) ||
-        xRatio < 0 ||
-        xRatio > 1 ||
-        yRatio < 0 ||
-        yRatio > 1
-      ) {
+    if (interaction.type === 'select_verification_method') {
+      const label = DOUYIN_VERIFICATION_METHOD_LABELS[interaction.method];
+      if (!label) {
         throw new DouyinCredentialError(
-          'Browser click coordinates are invalid'
+          'Douyin verification method is invalid'
         );
       }
 
-      const viewport = session.page.viewport();
-      if (!viewport) {
+      const selected = await this.clickVisibleElementByText(session.page, [
+        label,
+      ]);
+      if (!selected) {
         throw new DouyinCredentialError(
-          'Douyin login viewport is not available',
+          'Selected Douyin verification method is not available',
           409
         );
       }
-      await session.page.mouse.click(
-        Math.min(viewport.width - 1, xRatio * viewport.width),
-        Math.min(viewport.height - 1, yRatio * viewport.height)
-      );
-    } else {
-      if (
-        !interaction.text ||
-        interaction.text.length > 128 ||
-        /[\r\n]/.test(interaction.text)
-      ) {
+
+      session.verification = {
+        stage: 'processing',
+        method: interaction.method,
+        availableMethods:
+          session.verification?.availableMethods ||
+          (Object.keys(
+            DOUYIN_VERIFICATION_METHOD_LABELS
+          ) as DouyinVerificationMethod[]),
+      };
+      await this.sleep(500);
+      session.verification = {
+        ...session.verification,
+        stage:
+          interaction.method === 'receive_sms'
+            ? 'awaiting_code'
+            : 'awaiting_external',
+        prompt:
+          interaction.method === 'receive_sms'
+            ? '验证码已发送到绑定手机，请在前端输入。'
+            : (await this.getBrowserLoginVerificationPrompt(session.page)) ||
+              (interaction.method === 'face'
+                ? '请在手机上完成刷脸验证，完成后系统会自动继续。'
+                : '请使用绑定手机按抖音提示发送短信，完成后系统会自动继续。'),
+      };
+    } else if (interaction.type === 'submit_verification_code') {
+      if (!/^\d{4,8}$/.test(interaction.code || '')) {
         throw new DouyinCredentialError(
-          'Browser input must contain 1 to 128 characters on one line'
+          'Douyin verification code must contain 4 to 8 digits'
         );
       }
-      await session.page.keyboard.type(interaction.text, { delay: 50 });
+
+      if (session.verification?.method !== 'receive_sms') {
+        throw new DouyinCredentialError(
+          'SMS verification has not been selected',
+          409
+        );
+      }
+
+      const filled = await this.fillVisibleVerificationCode(
+        session.page,
+        interaction.code
+      );
+      if (!filled) {
+        throw new DouyinCredentialError(
+          'Douyin verification code input is not available',
+          409
+        );
+      }
+
+      const submitted = await this.clickVisibleElementByText(
+        session.page,
+        DOUYIN_VERIFICATION_SUBMIT_LABELS
+      );
+      if (!submitted) {
+        await session.page.keyboard.press('Enter');
+      }
+      session.verification = {
+        ...session.verification,
+        stage: 'processing',
+      };
+      await this.sleep(500);
+      await this.checkBrowserLoginSession(session);
+      if (
+        session.status === 'verification_required' &&
+        session.verification?.method === 'receive_sms'
+      ) {
+        session.verification = {
+          ...session.verification,
+          stage: 'awaiting_code',
+          prompt:
+            (await this.getBrowserLoginVerificationPrompt(session.page)) ||
+            session.verification.prompt,
+        };
+      }
     }
 
     session.updatedAt = new Date();
@@ -615,6 +696,23 @@ export class DouyinAuthService {
         session.status = verificationRequired
           ? 'verification_required'
           : 'waiting';
+        if (verificationRequired && !session.verification) {
+          session.verification = {
+            stage: 'choose_method',
+            availableMethods: Object.keys(
+              DOUYIN_VERIFICATION_METHOD_LABELS
+            ) as DouyinVerificationMethod[],
+          };
+        } else if (
+          verificationRequired &&
+          session.verification?.stage === 'awaiting_external'
+        ) {
+          session.verification.prompt =
+            (await this.getBrowserLoginVerificationPrompt(session.page)) ||
+            session.verification.prompt;
+        } else if (!verificationRequired) {
+          session.verification = undefined;
+        }
         session.updatedAt = new Date();
         return;
       }
@@ -630,6 +728,7 @@ export class DouyinAuthService {
       session.status = 'authenticated';
       session.cookieNames = saved.cookieNames;
       session.verifiedAt = saved.verifiedAt || new Date();
+      session.verification = undefined;
       session.updatedAt = new Date();
       await this.closeBrowserLoginSession(session);
     } catch (error) {
@@ -653,6 +752,63 @@ export class DouyinAuthService {
       return (doc.body?.innerText || doc.body?.textContent || '').trim();
     });
     return isDouyinIdentityVerificationText(text);
+  }
+
+  private async getBrowserLoginVerificationPrompt(
+    page: Page
+  ): Promise<string | undefined> {
+    const prompt = await page.evaluate(() => {
+      const doc = (globalThis as any).document;
+      const normalize = (value: unknown) =>
+        String(value || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      const bodyText = normalize(
+        doc.body?.innerText || doc.body?.textContent || ''
+      );
+      const identityIndex = bodyText.search(/身份验证|安全验证/);
+      return identityIndex >= 0
+        ? bodyText.slice(identityIndex, identityIndex + 600)
+        : '';
+    });
+    return prompt || undefined;
+  }
+
+  private async clickVisibleElementByText(
+    page: Page,
+    labels: readonly string[]
+  ): Promise<boolean> {
+    for (const label of labels) {
+      try {
+        await page
+          .locator(`::-p-text(${label})`)
+          .setTimeout(1500)
+          .setVisibility('visible')
+          .click();
+        return true;
+      } catch {
+        // Try the next semantic label.
+      }
+    }
+    return false;
+  }
+
+  private async fillVisibleVerificationCode(
+    page: Page,
+    code: string
+  ): Promise<boolean> {
+    try {
+      await page
+        .locator(
+          '::-p-xpath((//input[contains(@placeholder,"验证码") or contains(@aria-label,"验证码")])[last()])'
+        )
+        .setTimeout(3000)
+        .setVisibility('visible')
+        .fill(code);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private assertDouyinLoginPage(pageUrl: string): void {
@@ -756,6 +912,7 @@ export class DouyinAuthService {
       cookieNames: session.cookieNames,
       verifiedAt: session.verifiedAt,
       error: session.error,
+      verification: session.verification,
     };
   }
 

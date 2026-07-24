@@ -193,10 +193,9 @@ describe('DouyinAuthService', () => {
         .fn()
         .mockResolvedValueOnce(
           '身份验证 为保障账号安全 接收短信验证码 手机刷脸验证'
-        )
-        .mockResolvedValueOnce('请输入收到的验证码'),
+        ),
     };
-    const session = {
+    const session: any = {
       id: 'session-id',
       status: 'waiting',
       createdAt: new Date('2026-07-24T00:00:00.000Z'),
@@ -210,68 +209,112 @@ describe('DouyinAuthService', () => {
 
     await service.checkBrowserLoginSession(session);
     expect(session.status).toBe('verification_required');
+    expect(session.verification).toEqual(
+      expect.objectContaining({
+        stage: 'choose_method',
+        availableMethods: ['receive_sms', 'face', 'send_sms'],
+      })
+    );
     await service.checkBrowserLoginSession(session);
     expect(session.status).toBe('verification_required');
   });
 
-  it('maps normalized screenshot clicks to the browser viewport', async () => {
+  it('selects the default SMS method through visible Douyin text', async () => {
     const service = createService() as any;
-    const click = jest.fn().mockResolvedValue(undefined);
+    service.sleep = jest.fn().mockResolvedValue(undefined);
+    service.clickVisibleElementByText = jest.fn().mockResolvedValue(true);
+    const evaluate = jest
+      .fn()
+      .mockResolvedValueOnce('身份验证 请输入短信验证码');
     const session = {
       id: 'session-id',
       status: 'verification_required',
       createdAt: new Date('2026-07-24T00:00:00.000Z'),
       updatedAt: new Date('2026-07-24T00:00:00.000Z'),
-      expiresAt: new Date('2026-07-24T00:10:00.000Z'),
+      expiresAt: new Date(Date.now() + 60_000),
       page: {
         url: () => 'https://www.douyin.com/jingxuan',
-        viewport: () => ({ width: 390, height: 760 }),
-        mouse: { click },
-        keyboard: { type: jest.fn() },
+        evaluate,
+        keyboard: { press: jest.fn() },
+      },
+      verification: {
+        stage: 'choose_method',
+        availableMethods: ['receive_sms', 'face', 'send_sms'],
       },
     };
     service.browserLoginSessions.set(session.id, session);
 
     const status = await service.interactWithBrowserLogin(session.id, {
-      type: 'click',
-      xRatio: 0.5,
-      yRatio: 0.25,
+      type: 'select_verification_method',
+      method: 'receive_sms',
     });
 
-    expect(click).toHaveBeenCalledWith(195, 190);
+    expect(service.clickVisibleElementByText).toHaveBeenCalledWith(
+      session.page,
+      ['接收短信验证码']
+    );
+    expect(status.verification).toEqual(
+      expect.objectContaining({
+        stage: 'awaiting_code',
+        method: 'receive_sms',
+      })
+    );
     expect(status.status).toBe('verification_required');
     expect(status.screenshotUpdatedAt).toBeInstanceOf(Date);
   });
 
-  it('types into the focused Douyin verification field only', async () => {
+  it('submits an SMS code through the structured verification proxy', async () => {
     const service = createService() as any;
-    const type = jest.fn().mockResolvedValue(undefined);
+    service.sleep = jest.fn().mockResolvedValue(undefined);
+    service.fillVisibleVerificationCode = jest.fn().mockResolvedValue(true);
+    service.clickVisibleElementByText = jest.fn().mockResolvedValue(true);
+    const press = jest.fn().mockResolvedValue(undefined);
+    const evaluate = jest.fn().mockResolvedValueOnce('身份验证 验证码错误');
     const session = {
       id: 'session-id',
       status: 'verification_required',
       createdAt: new Date('2026-07-24T00:00:00.000Z'),
       updatedAt: new Date('2026-07-24T00:00:00.000Z'),
-      expiresAt: new Date('2026-07-24T00:10:00.000Z'),
+      expiresAt: new Date(Date.now() + 60_000),
       page: {
         url: () => 'https://www.douyin.com/',
-        viewport: () => ({ width: 390, height: 760 }),
-        mouse: { click: jest.fn() },
-        keyboard: { type },
+        evaluate,
+        keyboard: { press },
+      },
+      browserContext: {
+        cookies: jest.fn().mockResolvedValue([]),
+      },
+      verification: {
+        stage: 'awaiting_code',
+        method: 'receive_sms',
+        availableMethods: [],
       },
     };
     service.browserLoginSessions.set(session.id, session);
 
     await service.interactWithBrowserLogin(session.id, {
-      type: 'type',
-      text: '123456',
+      type: 'submit_verification_code',
+      code: '123456',
     });
 
-    expect(type).toHaveBeenCalledWith('123456', { delay: 50 });
+    expect(service.fillVisibleVerificationCode).toHaveBeenCalledWith(
+      session.page,
+      '123456'
+    );
+    expect(press).not.toHaveBeenCalled();
+    expect(session.verification.stage).toBe('awaiting_code');
+    await expect(
+      service.interactWithBrowserLogin(session.id, {
+        type: 'submit_verification_code',
+        code: 'not-a-code',
+      })
+    ).rejects.toThrow('must contain 4 to 8 digits');
+
     session.page.url = () => 'https://example.com/';
     await expect(
       service.interactWithBrowserLogin(session.id, {
-        type: 'type',
-        text: '654321',
+        type: 'submit_verification_code',
+        code: '654321',
       })
     ).rejects.toThrow('restricted to Douyin pages');
   });
