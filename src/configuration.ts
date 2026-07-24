@@ -7,6 +7,7 @@ import * as orm from '@midwayjs/typeorm';
 import * as validate from '@midwayjs/validate';
 import { join } from 'path';
 import { BilibiliSubmissionRecoveryService } from './service/bilibili-submission-recovery.service';
+import { NoticeService } from './service/notice/notice.service';
 
 @Configuration({
   imports: [koa, validate, bullmq, bullBoard, orm],
@@ -19,10 +20,14 @@ export class MainConfiguration {
   @Inject()
   bilibiliSubmissionRecoveryService: BilibiliSubmissionRecoveryService;
 
+  @Inject()
+  noticeService: NoticeService;
+
   @Logger()
   logger: ILogger;
 
   async onServerReady() {
+    this.noticeService.start();
     this.setupGlobalErrorHandlers();
 
     const pollerQueue = this.bullFramework.getQueue('poller');
@@ -37,18 +42,22 @@ export class MainConfiguration {
       });
   }
 
+  async onStop() {
+    await this.noticeService.stop();
+  }
+
   private setupGlobalErrorHandlers(): void {
     process.on('unhandledRejection', (reason: unknown) => {
-      console.error('[Unhandled Promise Rejection]', reason);
+      this.logger.error('Unhandled Promise Rejection', { reason });
     });
 
     process.on('uncaughtException', (error: Error) => {
-      console.error('[Uncaught Exception]', error.message, error.stack);
+      this.logger.error('Uncaught Exception', { error });
       // process.exit(1);
     });
 
     process.on('warning', warning => {
-      console.warn('[Process Warning]', warning);
+      this.logger.warn('Process Warning', { warning });
     });
   }
 }

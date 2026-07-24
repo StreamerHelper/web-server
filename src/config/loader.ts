@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import { merge } from 'lodash';
 import * as os from 'os';
 import * as path from 'path';
+import { NoticeConfig } from '../service/notice/notice.types';
 
 // 配置文件名
 const CONFIG_FILENAME = 'settings.json';
@@ -131,6 +132,7 @@ export interface AppConfig {
       userAgent: string;
     };
   };
+  notice: NoticeConfig;
 }
 
 // 默认配置
@@ -194,6 +196,24 @@ const DEFAULT_CONFIG: AppConfig = {
     douyin: {
       cookie: '',
       userAgent: '',
+    },
+  },
+  notice: {
+    enabled: false,
+    appName: 'StreamerHelper',
+    maxContentLength: 4000,
+    logger: {
+      enabled: true,
+      level: 'error',
+      cooldownSeconds: 300,
+    },
+    channels: {
+      serverChan: {
+        enabled: false,
+        sendKey: '',
+        endpoint: '',
+        timeoutMs: 10000,
+      },
     },
   },
 };
@@ -376,6 +396,43 @@ function getEnvOverrides(): Partial<AppConfig> {
         userAgent: process.env.DOUYIN_USER_AGENT || '',
       },
     };
+  }
+
+  const noticeOverrides: Record<string, any> = {};
+  if (process.env.NOTICE_ENABLED) {
+    noticeOverrides.enabled = process.env.NOTICE_ENABLED !== 'false';
+  }
+  if (process.env.NOTICE_APP_NAME) {
+    noticeOverrides.appName = process.env.NOTICE_APP_NAME;
+  }
+  if (process.env.NOTICE_LOGGER_ENABLED) {
+    noticeOverrides.logger = {
+      ...noticeOverrides.logger,
+      enabled: process.env.NOTICE_LOGGER_ENABLED !== 'false',
+    };
+  }
+  if (process.env.NOTICE_LOGGER_LEVEL) {
+    noticeOverrides.logger = {
+      ...noticeOverrides.logger,
+      level: process.env.NOTICE_LOGGER_LEVEL,
+    };
+  }
+  if (process.env.NOTICE_LOGGER_COOLDOWN_SECONDS) {
+    noticeOverrides.logger = {
+      ...noticeOverrides.logger,
+      cooldownSeconds: parseInt(process.env.NOTICE_LOGGER_COOLDOWN_SECONDS, 10),
+    };
+  }
+  if (process.env.SERVERCHAN_SENDKEY) {
+    noticeOverrides.channels = {
+      serverChan: {
+        enabled: true,
+        sendKey: process.env.SERVERCHAN_SENDKEY,
+      },
+    };
+  }
+  if (Object.keys(noticeOverrides).length > 0) {
+    overrides.notice = noticeOverrides as AppConfig['notice'];
   }
 
   return overrides;

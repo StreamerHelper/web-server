@@ -132,6 +132,9 @@ export default {
       level: isProduction ? 'info' : 'debug',
       pretty: !isProduction,
     },
+
+    // 统一通知服务
+    notice: config.notice,
   },
 
   // 投稿配置
@@ -157,6 +160,10 @@ export default {
       coreLogger: {
         level: 'warn',
         fileLogName: 'midway-core.log',
+      },
+      noticeInternalLogger: {
+        level: 'warn',
+        fileLogName: 'streamerhelper-notice.log',
       },
     },
   },

@@ -10,6 +10,7 @@ StreamerHelper 后端服务，基于 Midway.js 框架的直播录制与内容管
 - **B站集成** - 投稿管理、视频上传、认证授权
 - **ASR 字幕** - 自动语音识别生成字幕
 - **任务队列** - 基于 BullMQ 的异步任务处理
+- **统一通知** - 支持主动通知、日志级别捕获、通道扩展与重复告警抑制
 
 ## 技术栈
 
@@ -78,6 +79,57 @@ npm run dev
 | PostgreSQL | postgres | postgres |
 | MinIO | minioadmin | minioadmin |
 | pgAdmin | admin@streamerhelper.dev | admin |
+
+### 统一通知
+
+`NoticeService` 支持业务代码主动发送通知，也会通过 Midway logger
+Transport 捕获指定级别的日志。通知失败只会写入独立内部日志，不会中断业务。
+
+```json
+{
+  "notice": {
+    "enabled": true,
+    "appName": "StreamerHelper",
+    "maxContentLength": 4000,
+    "logger": {
+      "enabled": true,
+      "level": "error",
+      "cooldownSeconds": 300
+    },
+    "channels": {
+      "serverChan": {
+        "enabled": true,
+        "sendKey": "",
+        "endpoint": "",
+        "timeoutMs": 10000
+      }
+    }
+  }
+}
+```
+
+生产环境推荐用 `SERVERCHAN_SENDKEY` 环境变量保存 SendKey。Server酱 Turbo
+与 Server酱³ 的 API 地址会根据 SendKey 自动选择。还可以使用
+`NOTICE_ENABLED`、`NOTICE_LOGGER_ENABLED`、`NOTICE_LOGGER_LEVEL` 和
+`NOTICE_LOGGER_COOLDOWN_SECONDS` 覆盖对应配置。
+
+业务代码可以直接注入服务：
+
+```ts
+@Inject()
+noticeService: NoticeService;
+
+await this.noticeService.send({
+  title: '录制完成',
+  content: '主播 feel 的录制和投稿处理已完成',
+  level: 'info',
+  dedupeKey: 'recording-completed:job-id',
+  cooldownSeconds: 300,
+});
+```
+
+邮件、短信等新渠道只需实现 `NoticeChannel` 的 `send()` 方法，再通过
+`noticeService.registerChannel()` 注册，不需要修改 logger 接入层。
 
 ## 常用命令
 
