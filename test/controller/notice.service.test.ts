@@ -18,7 +18,7 @@ const createConfig = (): NoticeConfig => ({
   logger: {
     enabled: true,
     level: 'error',
-    cooldownSeconds: 300,
+    fatigueSeconds: 300,
   },
   channels: {
     serverChan: {
@@ -68,7 +68,7 @@ describe('NoticeService', () => {
     ]);
   });
 
-  it('suppresses duplicate notices during the cooldown window', async () => {
+  it('suppresses duplicate notices during the fatigue window', async () => {
     const service = createNoticeService();
     const channel: NoticeChannel = {
       name: 'test',
@@ -79,15 +79,20 @@ describe('NoticeService', () => {
       title: 'Repeated error',
       content: 'same error',
       dedupeKey: 'same-error',
-      cooldownSeconds: 300,
+      fatigueSeconds: 300,
     };
 
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
     const first = await service.send(notice);
-    const second = await service.send(notice);
+    const suppressed = await service.send(notice);
+    now.mockReturnValue(1_300_001);
+    const afterFatigue = await service.send(notice);
 
     expect(first.suppressed).toBe(false);
-    expect(second.suppressed).toBe(true);
-    expect(channel.send).toHaveBeenCalledTimes(1);
+    expect(suppressed.suppressed).toBe(true);
+    expect(afterFatigue.suppressed).toBe(false);
+    expect(channel.send).toHaveBeenCalledTimes(2);
+    now.mockRestore();
   });
 
   it('redacts secrets captured from structured logger arguments', async () => {

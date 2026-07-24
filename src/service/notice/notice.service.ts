@@ -129,7 +129,7 @@ export class NoticeService {
       level: toNoticeLevel(event.level),
       source: event.loggerName || 'logger',
       dedupeKey: `logger:${event.level}:${content}`,
-      cooldownSeconds: this.config.logger.cooldownSeconds,
+      fatigueSeconds: this.config.logger.fatigueSeconds,
     });
   }
 
@@ -208,17 +208,17 @@ export class NoticeService {
   }
 
   private shouldSuppress(notice: NormalizedNotice): boolean {
-    if (!notice.dedupeKey || !notice.cooldownSeconds) {
+    if (!notice.dedupeKey || !notice.fatigueSeconds) {
       return false;
     }
 
     const now = Date.now();
-    const cooldownMs = Math.max(notice.cooldownSeconds, 0) * 1000;
+    const fatigueMs = Math.max(notice.fatigueSeconds, 0) * 1000;
     const key = createHash('sha256').update(notice.dedupeKey).digest('hex');
     const lastSentAt = this.recentNotices.get(key);
 
     this.pruneRecentNotices(now);
-    if (lastSentAt !== undefined && now - lastSentAt < cooldownMs) {
+    if (lastSentAt !== undefined && now - lastSentAt < fatigueMs) {
       return true;
     }
 
@@ -232,7 +232,7 @@ export class NoticeService {
     }
 
     const retentionMs =
-      Math.max(this.config.logger.cooldownSeconds || 300, 60) * 2000;
+      Math.max(this.config.logger.fatigueSeconds || 300, 60) * 2000;
     for (const [key, timestamp] of this.recentNotices) {
       if (now - timestamp >= retentionMs) {
         this.recentNotices.delete(key);

@@ -9,7 +9,7 @@ export interface Notice {
   source?: string;
   timestamp?: Date;
   dedupeKey?: string;
-  cooldownSeconds?: number;
+  fatigueSeconds?: number;
 }
 
 export interface NormalizedNotice extends Omit<Notice, 'level' | 'timestamp'> {
@@ -48,7 +48,7 @@ export interface NoticeConfig {
   logger: {
     enabled: boolean;
     level: LoggerLevel;
-    cooldownSeconds: number;
+    fatigueSeconds: number;
   };
   channels: {
     serverChan: {

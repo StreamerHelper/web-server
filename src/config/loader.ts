@@ -205,7 +205,7 @@ const DEFAULT_CONFIG: AppConfig = {
     logger: {
       enabled: true,
       level: 'error',
-      cooldownSeconds: 300,
+      fatigueSeconds: 300,
     },
     channels: {
       serverChan: {
@@ -417,10 +417,13 @@ function getEnvOverrides(): Partial<AppConfig> {
       level: process.env.NOTICE_LOGGER_LEVEL,
     };
   }
-  if (process.env.NOTICE_LOGGER_COOLDOWN_SECONDS) {
+  const noticeFatigueSeconds =
+    process.env.NOTICE_LOGGER_FATIGUE_SECONDS ||
+    process.env.NOTICE_LOGGER_COOLDOWN_SECONDS;
+  if (noticeFatigueSeconds) {
     noticeOverrides.logger = {
       ...noticeOverrides.logger,
-      cooldownSeconds: parseInt(process.env.NOTICE_LOGGER_COOLDOWN_SECONDS, 10),
+      fatigueSeconds: parseInt(noticeFatigueSeconds, 10),
     };
   }
   if (process.env.SERVERCHAN_SENDKEY) {
@@ -474,7 +477,20 @@ function generateRandomKey(): string {
  */
 function readConfigFile(filePath: string): Partial<AppConfig> {
   const content = fs.readFileSync(filePath, 'utf-8');
-  return JSON.parse(content) as Partial<AppConfig>;
+  const config = JSON.parse(content) as Partial<AppConfig>;
+  const loggerConfig = (config.notice as any)?.logger;
+
+  if (loggerConfig) {
+    if (
+      loggerConfig.fatigueSeconds === undefined &&
+      loggerConfig.cooldownSeconds !== undefined
+    ) {
+      loggerConfig.fatigueSeconds = loggerConfig.cooldownSeconds;
+    }
+    delete loggerConfig.cooldownSeconds;
+  }
+
+  return config;
 }
 
 /**

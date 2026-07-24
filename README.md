@@ -94,7 +94,7 @@ Transport 捕获指定级别的日志。通知失败只会写入独立内部日�
     "logger": {
       "enabled": true,
       "level": "error",
-      "cooldownSeconds": 300
+      "fatigueSeconds": 300
     },
     "channels": {
       "serverChan": {
@@ -111,7 +111,8 @@ Transport 捕获指定级别的日志。通知失败只会写入独立内部日�
 生产环境推荐用 `SERVERCHAN_SENDKEY` 环境变量保存 SendKey。Server酱 Turbo
 与 Server酱³ 的 API 地址会根据 SendKey 自动选择。还可以使用
 `NOTICE_ENABLED`、`NOTICE_LOGGER_ENABLED`、`NOTICE_LOGGER_LEVEL` 和
-`NOTICE_LOGGER_COOLDOWN_SECONDS` 覆盖对应配置。
+`NOTICE_LOGGER_FATIGUE_SECONDS` 覆盖对应配置。旧的
+`NOTICE_LOGGER_COOLDOWN_SECONDS` 仍可兼容读取。
 
 业务代码可以直接注入服务：
 
@@ -124,7 +125,7 @@ await this.noticeService.send({
   content: '主播 feel 的录制和投稿处理已完成',
   level: 'info',
   dedupeKey: 'recording-completed:job-id',
-  cooldownSeconds: 300,
+  fatigueSeconds: 300,
 });
 ```
 
