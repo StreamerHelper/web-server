@@ -2,6 +2,7 @@ import { Body, Controller, Get, Inject, Param, Post } from '@midwayjs/core';
 import { Context } from '@midwayjs/koa';
 import {
   DouyinAuthService,
+  DouyinBrowserLoginInteraction,
   DouyinCredentialError,
 } from '../service/douyin-auth.service';
 
@@ -50,7 +51,9 @@ export class DouyinController {
       }
       return {
         error:
-          error instanceof Error ? error.message : 'Failed to save Douyin Cookie',
+          error instanceof Error
+            ? error.message
+            : 'Failed to save Douyin Cookie',
       };
     }
   }
@@ -106,8 +109,9 @@ export class DouyinController {
   @Get('/auth/browser-login/:sessionId/screenshot')
   async getBrowserLoginScreenshot(@Param('sessionId') sessionId: string) {
     try {
-      const screenshot =
-        await this.douyinAuthService.getBrowserLoginScreenshot(sessionId);
+      const screenshot = await this.douyinAuthService.getBrowserLoginScreenshot(
+        sessionId
+      );
       this.ctx.status = 200;
       this.ctx.set('Content-Type', 'image/png');
       this.ctx.set('Cache-Control', 'no-store');
@@ -127,6 +131,34 @@ export class DouyinController {
           error instanceof Error
             ? error.message
             : 'Failed to get Douyin browser login screenshot',
+      };
+    }
+  }
+
+  @Post('/auth/browser-login/:sessionId/interact')
+  async interactWithBrowserLogin(
+    @Param('sessionId') sessionId: string,
+    @Body() interaction: DouyinBrowserLoginInteraction
+  ) {
+    try {
+      return await this.douyinAuthService.interactWithBrowserLogin(
+        sessionId,
+        interaction
+      );
+    } catch (error) {
+      this.ctx.status =
+        error instanceof DouyinCredentialError ? error.status : 500;
+      if (!(error instanceof DouyinCredentialError)) {
+        this.ctx.logger.error('Failed to interact with Douyin browser login', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to interact with Douyin browser login',
       };
     }
   }

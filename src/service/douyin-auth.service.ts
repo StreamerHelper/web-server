@@ -15,7 +15,7 @@ import { DouyinCredentialRepository } from '../repository/douyin-credential.repo
 import { getConfig } from '../config/loader';
 
 const VERIFY_TIMEOUT_MS = 15000;
-const BROWSER_LOGIN_TTL_MS = 5 * 60 * 1000;
+const BROWSER_LOGIN_TTL_MS = 10 * 60 * 1000;
 const BROWSER_LOGIN_POLL_MS = 2000;
 const COOKIE_ATTRIBUTE_NAMES = new Set([
   'domain',
@@ -53,10 +53,22 @@ function hasInvalidCookieNameCharacter(value: string): boolean {
 export type DouyinBrowserLoginState =
   | 'initializing'
   | 'waiting'
+  | 'verification_required'
   | 'authenticated'
   | 'expired'
   | 'failed'
   | 'cancelled';
+
+export type DouyinBrowserLoginInteraction =
+  | {
+      type: 'click';
+      xRatio: number;
+      yRatio: number;
+    }
+  | {
+      type: 'type';
+      text: string;
+    };
 
 interface DouyinBrowserLoginSession {
   id: string;
@@ -281,7 +293,11 @@ export class DouyinAuthService {
     sessionId: string
   ): Promise<DouyinBrowserLoginStatus> {
     const session = this.getBrowserLoginSession(sessionId);
-    if (session.status === 'waiting' || session.status === 'initializing') {
+    if (
+      session.status === 'waiting' ||
+      session.status === 'verification_required' ||
+      session.status === 'initializing'
+    ) {
       await this.checkBrowserLoginSession(session);
     }
     return this.serializeBrowserLoginSession(session);
@@ -299,6 +315,75 @@ export class DouyinAuthService {
     });
     session.updatedAt = new Date();
     return Buffer.from(screenshot);
+  }
+
+  async interactWithBrowserLogin(
+    sessionId: string,
+    interaction: DouyinBrowserLoginInteraction
+  ): Promise<DouyinBrowserLoginStatus> {
+    if (
+      !interaction ||
+      (interaction.type !== 'click' && interaction.type !== 'type')
+    ) {
+      throw new DouyinCredentialError(
+        'Browser interaction type must be click or type'
+      );
+    }
+
+    const session = this.getBrowserLoginSession(sessionId);
+    if (
+      !session.page ||
+      !['waiting', 'verification_required'].includes(session.status)
+    ) {
+      throw new DouyinCredentialError(
+        'Douyin login page is not interactive',
+        409
+      );
+    }
+
+    this.assertDouyinLoginPage(session.page.url());
+
+    if (interaction.type === 'click') {
+      const { xRatio, yRatio } = interaction;
+      if (
+        !Number.isFinite(xRatio) ||
+        !Number.isFinite(yRatio) ||
+        xRatio < 0 ||
+        xRatio > 1 ||
+        yRatio < 0 ||
+        yRatio > 1
+      ) {
+        throw new DouyinCredentialError(
+          'Browser click coordinates are invalid'
+        );
+      }
+
+      const viewport = session.page.viewport();
+      if (!viewport) {
+        throw new DouyinCredentialError(
+          'Douyin login viewport is not available',
+          409
+        );
+      }
+      await session.page.mouse.click(
+        Math.min(viewport.width - 1, xRatio * viewport.width),
+        Math.min(viewport.height - 1, yRatio * viewport.height)
+      );
+    } else {
+      if (
+        !interaction.text ||
+        interaction.text.length > 128 ||
+        /[\r\n]/.test(interaction.text)
+      ) {
+        throw new DouyinCredentialError(
+          'Browser input must contain 1 to 128 characters on one line'
+        );
+      }
+      await session.page.keyboard.type(interaction.text, { delay: 50 });
+    }
+
+    session.updatedAt = new Date();
+    return this.serializeBrowserLoginSession(session);
   }
 
   async cancelBrowserLogin(sessionId: string): Promise<void> {
@@ -524,6 +609,12 @@ export class DouyinAuthService {
         ? await session.browser.cookies()
         : await session.page.cookies();
       if (!this.hasAuthenticatedDouyinCookies(cookies)) {
+        const verificationRequired =
+          session.status === 'verification_required' ||
+          (await this.isIdentityVerificationPage(session.page));
+        session.status = verificationRequired
+          ? 'verification_required'
+          : 'waiting';
         session.updatedAt = new Date();
         return;
       }
@@ -553,6 +644,30 @@ export class DouyinAuthService {
         error: session.error,
       });
       await this.closeBrowserLoginSession(session);
+    }
+  }
+
+  private async isIdentityVerificationPage(page: Page): Promise<boolean> {
+    const text = await page.evaluate(() => {
+      const doc = (globalThis as any).document;
+      return (doc.body?.innerText || doc.body?.textContent || '').trim();
+    });
+    return isDouyinIdentityVerificationText(text);
+  }
+
+  private assertDouyinLoginPage(pageUrl: string): void {
+    let hostname = '';
+    try {
+      hostname = new URL(pageUrl).hostname.toLowerCase();
+    } catch {
+      throw new DouyinCredentialError('Douyin login page URL is invalid', 409);
+    }
+
+    if (hostname !== 'douyin.com' && !hostname.endsWith('.douyin.com')) {
+      throw new DouyinCredentialError(
+        'Browser interaction is restricted to Douyin pages',
+        409
+      );
     }
   }
 
@@ -633,7 +748,9 @@ export class DouyinAuthService {
       updatedAt: session.updatedAt,
       screenshotUpdatedAt:
         session.page &&
-        (session.status === 'initializing' || session.status === 'waiting')
+        (session.status === 'initializing' ||
+          session.status === 'waiting' ||
+          session.status === 'verification_required')
           ? new Date()
           : undefined,
       cookieNames: session.cookieNames,
@@ -647,7 +764,11 @@ export class DouyinAuthService {
     if (!session) {
       return;
     }
-    if (session.status === 'initializing' || session.status === 'waiting') {
+    if (
+      session.status === 'initializing' ||
+      session.status === 'waiting' ||
+      session.status === 'verification_required'
+    ) {
       session.status = 'expired';
       session.updatedAt = new Date();
     }
@@ -950,4 +1071,11 @@ export class DouyinAuthService {
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
+}
+
+export function isDouyinIdentityVerificationText(text: string): boolean {
+  return (
+    /身份验证|安全验证/.test(text) &&
+    /短信验证码|刷脸验证|本人操作|验证方式/.test(text)
+  );
 }
