@@ -128,7 +128,6 @@ export interface AppConfig {
   };
   platforms: {
     douyin: {
-      cookie: string;
       userAgent: string;
     };
   };
@@ -194,7 +193,6 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   platforms: {
     douyin: {
-      cookie: '',
       userAgent: '',
     },
   },
@@ -388,11 +386,10 @@ function getEnvOverrides(): Partial<AppConfig> {
   }
 
   // Platform request options
-  if (process.env.DOUYIN_COOKIE || process.env.DOUYIN_USER_AGENT) {
+  if (process.env.DOUYIN_USER_AGENT) {
     overrides.platforms = {
       ...overrides.platforms,
       douyin: {
-        cookie: process.env.DOUYIN_COOKIE || '',
         userAgent: process.env.DOUYIN_USER_AGENT || '',
       },
     };

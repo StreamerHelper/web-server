@@ -187,7 +187,7 @@ export class DouyinController {
   }
 
   @Post('/auth/verify')
-  async verifyCookie(
+  async verifyProfile(
     @Body()
     body: {
       cookie?: string;
@@ -203,7 +203,7 @@ export class DouyinController {
       this.ctx.status =
         error instanceof DouyinCredentialError ? error.status : 500;
       if (!(error instanceof DouyinCredentialError)) {
-        this.ctx.logger.error('Failed to verify Douyin Cookie', {
+        this.ctx.logger.error('Failed to verify Douyin browser profile', {
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -213,7 +213,7 @@ export class DouyinController {
         error:
           error instanceof Error
             ? error.message
-            : 'Failed to verify Douyin Cookie',
+            : 'Failed to verify Douyin browser profile',
       };
     }
   }
@@ -224,7 +224,7 @@ export class DouyinController {
       await this.douyinAuthService.clear();
       return { success: true };
     } catch (error) {
-      this.ctx.logger.error('Failed to clear Douyin Cookie', {
+      this.ctx.logger.error('Failed to clear Douyin browser profile', {
         error: error instanceof Error ? error.message : String(error),
       });
       this.ctx.status = 500;

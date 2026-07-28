@@ -4,6 +4,10 @@ import { EventEmitter } from 'events';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import { Platform, RecordingQuality } from '../interface';
+import {
+  sanitizeStreamUrl,
+  sanitizeUrlQueriesInText,
+} from '../utils/sensitive-url';
 import { VIDEO_SEGMENT_TIME_ZONE } from '../utils/video-segment-time';
 
 /**
@@ -11,6 +15,8 @@ import { VIDEO_SEGMENT_TIME_ZONE } from '../utils/video-segment-time';
  */
 export interface FFmpegStartOptions {
   streamUrl: string;
+  /** Ephemeral platform request headers. Values can contain credentials. */
+  headers?: Record<string, string>;
   outputDir: string;
   segmentTime: number;
   listFilePath: string;
@@ -89,6 +95,7 @@ export class FFmpegService extends EventEmitter {
   async start(options: FFmpegStartOptions): Promise<void> {
     const {
       streamUrl,
+      headers,
       outputDir,
       segmentTime,
       listFilePath,
@@ -130,11 +137,16 @@ export class FFmpegService extends EventEmitter {
       outputPattern,
       listFilePath,
       requestedQuality,
-      effectiveQuality
+      effectiveQuality,
+      headers
     );
-    this.ffmpegArgs = [...ffmpegArgs];
+    this.ffmpegArgs = this.redactSensitiveArgs(ffmpegArgs);
 
-    this.logger?.debug('FFmpeg args', ffmpegArgs.join(' '));
+    this.logger?.debug('FFmpeg command prepared', {
+      id: this.id,
+      platform,
+      hasPlatformHeaders: Boolean(headers && Object.keys(headers).length),
+    });
 
     this.process = spawn('ffmpeg', ffmpegArgs, {
       env: this.buildSegmentProcessEnvironment(),
@@ -164,10 +176,10 @@ export class FFmpegService extends EventEmitter {
         cleanup();
         this.logger?.error('Failed to start FFmpeg process', {
           id: this.id,
-          error: err.message,
+          error: sanitizeUrlQueriesInText(err.message),
         });
         this.logFailureExit('spawn_error', {
-          error: err.message,
+          error: sanitizeUrlQueriesInText(err.message),
         });
 
         if (this.exitHandler) {
@@ -308,12 +320,14 @@ export class FFmpegService extends EventEmitter {
     outputPattern: string,
     listPath: string,
     requestedQuality?: RecordingQuality,
-    effectiveQuality?: RecordingQuality
+    effectiveQuality?: RecordingQuality,
+    platformHeaders?: Record<string, string>
   ): string[] {
     const headers = this.buildHttpHeaders(
       streamUrl,
       this.platform,
-      this.roomId
+      this.roomId,
+      platformHeaders
     );
     const metadataComment = this.buildMetadataComment(
       requestedQuality,
@@ -371,22 +385,27 @@ export class FFmpegService extends EventEmitter {
   private buildHttpHeaders(
     streamUrl: string,
     platform?: Platform,
-    roomId?: string
+    roomId?: string,
+    platformHeaders?: Record<string, string>
   ): string {
-    const headerObj: Record<string, string> = {
-      'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${
-        100 + Math.floor(Math.random() * 20)
-      }.0.0.0 Safari/537.36`,
-      Connection: 'keep-alive',
-    };
+    const headerObj = this.normalizePlatformHeaders(platformHeaders);
+    if (!headerObj['User-Agent']) {
+      headerObj['User-Agent'] =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+        'Chrome/142.0.0.0 Safari/537.36';
+    }
+    if (!headerObj.Connection) {
+      headerObj.Connection = 'keep-alive';
+    }
 
     const referer = this.buildReferer(streamUrl, platform, roomId);
     const origin = this.buildOrigin(streamUrl, platform);
 
-    if (referer) {
+    if (referer && !headerObj.Referer) {
       headerObj['Referer'] = referer;
     }
-    if (origin) {
+    if (origin && !headerObj.Origin) {
       headerObj['Origin'] = origin;
     }
 
@@ -395,6 +414,34 @@ export class FFmpegService extends EventEmitter {
         .map(([k, v]) => `${k}: ${v}`)
         .join('\r\n') + '\r\n'
     );
+  }
+
+  private normalizePlatformHeaders(
+    headers?: Record<string, string>
+  ): Record<string, string> {
+    const normalized: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers || {})) {
+      if (
+        /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) &&
+        typeof value === 'string' &&
+        !/[\r\n]/.test(value) &&
+        !/^(host|content-length)$/i.test(name)
+      ) {
+        const lowerName = name.toLowerCase();
+        const canonicalName =
+          lowerName === 'user-agent'
+            ? 'User-Agent'
+            : lowerName === 'cookie'
+            ? 'Cookie'
+            : lowerName === 'referer'
+            ? 'Referer'
+            : lowerName === 'origin'
+            ? 'Origin'
+            : name;
+        normalized[canonicalName] = value;
+      }
+    }
+    return normalized;
   }
 
   private buildInputOptions(streamUrl: string, headers: string): string[] {
@@ -489,7 +536,7 @@ export class FFmpegService extends EventEmitter {
 
   private handleStderrOutput(message: string): void {
     for (const rawLine of message.split(/\r?\n/)) {
-      const line = rawLine.trim();
+      const line = sanitizeUrlQueriesInText(rawLine.trim());
       if (!line) {
         continue;
       }
@@ -607,8 +654,12 @@ export class FFmpegService extends EventEmitter {
       reason,
       code: details.code ?? null,
       signal: details.signal ?? null,
-      error: details.error,
-      streamUrl: this.streamUrl,
+      error: details.error
+        ? sanitizeUrlQueriesInText(details.error)
+        : details.error,
+      streamUrl: this.streamUrl
+        ? sanitizeStreamUrl(this.streamUrl)
+        : this.streamUrl,
       platform: this.platform,
       roomId: this.roomId,
       requestedQuality: this.requestedQuality,
@@ -616,9 +667,18 @@ export class FFmpegService extends EventEmitter {
       outputDir: this.outputDir,
       listFilePath: this.listFilePath,
       segmentTime: this.segmentTime,
-      ffmpegArgs: this.ffmpegArgs,
+      ffmpegArgs: this.redactSensitiveArgs(this.ffmpegArgs),
       recentStderrLines: [...this.recentStderrLines],
     });
+  }
+
+  private redactSensitiveArgs(args: string[]): string[] {
+    const redacted = args.map(arg => sanitizeUrlQueriesInText(arg));
+    const headerIndex = redacted.indexOf('-headers');
+    if (headerIndex !== -1 && headerIndex + 1 < redacted.length) {
+      redacted[headerIndex + 1] = '[REDACTED HTTP HEADERS]';
+    }
+    return redacted;
   }
 
   /**

@@ -7,67 +7,31 @@ import {
   ScopeEnum,
 } from '@midwayjs/core';
 import { randomUUID } from 'crypto';
-import { existsSync } from 'fs';
-import { request as httpRequest } from 'http';
-import { request as httpsRequest } from 'https';
-import type { Browser, BrowserContext, Cookie, Page } from 'puppeteer-core';
-import { DouyinCredentialRepository } from '../repository/douyin-credential.repository';
-import { getConfig } from '../config/loader';
+import { DouyinAuthState } from '../interface';
+import {
+  DouyinCredentialOperation,
+  DouyinCredentialRepository,
+  DouyinCredentialTransition,
+} from '../repository/douyin-credential.repository';
+import {
+  DouyinBrowserLoginTarget,
+  DouyinBrowserProfileService,
+  DouyinProfileProbeResult,
+} from './douyin-browser-profile.service';
 
-const VERIFY_TIMEOUT_MS = 15000;
 const BROWSER_LOGIN_TTL_MS = 10 * 60 * 1000;
-const BROWSER_LOGIN_POLL_MS = 2000;
-const COOKIE_ATTRIBUTE_NAMES = new Set([
-  'domain',
-  'path',
-  'expires',
-  'max-age',
-  'secure',
-  'httponly',
-  'samesite',
-]);
-const IGNORED_DOUYIN_COOKIE_NAMES = new Set(['s_v_web_id']);
-const AUTHENTICATED_COOKIE_NAMES = new Set([
-  'sessionid',
-  'sid_guard',
-  'sid_tt',
-  'uid_tt',
-  'passport_auth_status',
-]);
-const BYTE_DANCE_COOKIE_DOMAIN_PATTERN =
-  /(^|\.)((douyin|iesdouyin|amemv|bytedance|snssdk|toutiao)\.com)$/i;
-const DOUYIN_VERIFICATION_METHOD_LABELS = {
-  receive_sms: '接收短信验证码',
-  face: '手机刷脸验证',
-  send_sms: '发送短信验证',
-} as const;
-const DOUYIN_VERIFICATION_SUBMIT_LABELS = [
-  '确定',
-  '确认',
-  '提交',
-  '验证',
-  '下一步',
-  '完成',
-  '登录',
+const BROWSER_LOGIN_POLL_MS = 2_000;
+const VERIFICATION_METHODS: DouyinVerificationMethod[] = [
+  'receive_sms',
+  'face',
+  'send_sms',
 ];
-
-function hasInvalidCookieNameCharacter(value: string): boolean {
-  return Array.from(value).some(character => {
-    const codePoint = character.charCodeAt(0);
-    return (
-      character.trim() === '' ||
-      character === ';' ||
-      character === ',' ||
-      codePoint <= 0x1f ||
-      codePoint === 0x7f
-    );
-  });
-}
 
 export type DouyinBrowserLoginState =
   | 'initializing'
   | 'waiting'
   | 'verification_required'
+  | 'validating'
   | 'authenticated'
   | 'expired'
   | 'failed'
@@ -104,35 +68,40 @@ interface DouyinBrowserLoginSession {
   createdAt: Date;
   expiresAt: Date;
   updatedAt: Date;
-  browser?: Browser;
-  browserContext?: BrowserContext;
-  page?: Page;
-  ownsBrowser?: boolean;
+  roomId?: string;
+  target?: DouyinBrowserLoginTarget;
   pollTimer?: NodeJS.Timeout;
   expireTimer?: NodeJS.Timeout;
+  preparePromise?: Promise<void>;
+  checkPromise?: Promise<void>;
   cookieNames?: string[];
   verifiedAt?: Date;
   error?: string;
   verification?: DouyinBrowserLoginVerification;
+  operation?: DouyinCredentialOperation;
 }
 
 export class DouyinCredentialError extends Error {
   constructor(message: string, readonly status = 400) {
     super(message);
+    this.name = 'DouyinCredentialError';
   }
 }
 
-export interface NormalizedDouyinCookie {
-  cookieHeader: string;
-  cookieNames: string[];
-}
-
 export interface DouyinAuthStatus {
+  state: DouyinAuthState;
   isAuthenticated: boolean;
-  source?: 'database' | 'config';
+  source?: 'browser_profile';
+  browserHealthy?: boolean;
+  profilePersistent?: boolean;
   cookieNames?: string[];
+  validatedAt?: Date | null;
+  lastValidatedAt?: Date | null;
   verifiedAt?: Date | null;
+  stateChangedAt?: Date | null;
   updatedAt?: Date;
+  authExpiresAt?: Date | null;
+  lastValidationCode?: string | null;
   lastValidationError?: string | null;
 }
 
@@ -164,87 +133,91 @@ export class DouyinAuthService {
   @Inject()
   private credentialRepository: DouyinCredentialRepository;
 
+  @Inject()
+  private browserProfileService: DouyinBrowserProfileService;
+
   @Logger()
   private logger: ILogger;
 
   private browserLoginSessions = new Map<string, DouyinBrowserLoginSession>();
+  private activeOperations = new Set<string>();
+  private reconciliationPromise?: Promise<void>;
+  private logoutInProgress = false;
 
   async getStatus(): Promise<DouyinAuthStatus> {
-    const credential = await this.credentialRepository.findLatest();
-    if (credential) {
+    let credential = await this.credentialRepository.findLatest();
+    if (!credential) {
       return {
-        isAuthenticated: true,
-        source: 'database',
-        cookieNames: credential.cookieNames,
-        verifiedAt: credential.verifiedAt,
-        updatedAt: credential.updatedAt,
-        lastValidationError: credential.lastValidationError,
-      };
-    }
-
-    const configuredCookie = this.getConfiguredCookie();
-    if (!configuredCookie) {
-      return { isAuthenticated: false };
-    }
-
-    try {
-      const normalized = this.normalizeCookieHeader(configuredCookie);
-      return {
-        isAuthenticated: true,
-        source: 'config',
-        cookieNames: normalized.cookieNames,
-      };
-    } catch (error) {
-      return {
+        state: 'unconfigured',
         isAuthenticated: false,
-        source: 'config',
-        lastValidationError:
-          error instanceof Error ? error.message : 'Invalid configured cookie',
+        browserHealthy: true,
+        profilePersistent: true,
       };
     }
+
+    if (
+      credential.state === 'validating' &&
+      !this.isOperationActive({
+        id: credential.operationId || '',
+        generation: credential.generation || 0,
+      })
+    ) {
+      await this.reconcileProfileState();
+      credential = await this.credentialRepository.findLatest();
+    } else if (
+      credential.state === 'valid' &&
+      credential.authExpiresAt &&
+      credential.authExpiresAt.getTime() <= Date.now()
+    ) {
+      // This is the earliest persistent expiry across several authentication-
+      // related cookies, including auxiliary passport cookies. Treat it as a
+      // revalidation hint; only the account endpoint may expire the session.
+      await this.reconcileProfileState();
+      credential = await this.credentialRepository.findLatest();
+    }
+
+    if (!credential) {
+      return {
+        state: 'unconfigured',
+        isAuthenticated: false,
+        browserHealthy: true,
+        profilePersistent: true,
+      };
+    }
+
+    const state = credential.state || 'unknown';
+    return {
+      state,
+      isAuthenticated: state === 'valid',
+      source: 'browser_profile',
+      browserHealthy: credential.lastValidationCode !== 'BROWSER_UNAVAILABLE',
+      profilePersistent: true,
+      cookieNames: credential.cookieNames,
+      validatedAt: credential.verifiedAt,
+      lastValidatedAt: credential.verifiedAt,
+      verifiedAt: credential.verifiedAt,
+      stateChangedAt: credential.stateChangedAt,
+      updatedAt: credential.updatedAt,
+      authExpiresAt: credential.authExpiresAt,
+      lastValidationCode: credential.lastValidationCode,
+      lastValidationError: credential.lastValidationError,
+    };
   }
 
+  /**
+   * Raw Cookie import is intentionally retired. A flattened header cannot
+   * preserve the browser storage and fingerprint that Douyin binds to a login.
+   */
   async saveCookie(
-    rawCookie: string,
-    options?: { verify?: boolean; roomId?: string }
-  ): Promise<{
-    status: DouyinAuthStatus;
-    verification?: DouyinCookieVerification;
-  }> {
-    const normalized = this.normalizeCookieHeader(rawCookie);
-    let verification: DouyinCookieVerification | undefined;
-
-    if (options?.verify !== false) {
-      verification = await this.verifyNormalizedCookie(
-        normalized.cookieHeader,
-        normalized.cookieNames,
-        options?.roomId
-      );
-      if (!verification.ok) {
-        throw new DouyinCredentialError(
-          verification.error || 'Douyin Cookie verification failed'
-        );
-      }
-    }
-
-    const saved = await this.credentialRepository.saveCredential({
-      cookieHeader: normalized.cookieHeader,
-      cookieNames: normalized.cookieNames,
-      verifiedAt: verification?.verifiedAt || null,
-      lastValidationError: null,
-    });
-
-    return {
-      status: {
-        isAuthenticated: true,
-        source: 'database',
-        cookieNames: saved.cookieNames,
-        verifiedAt: saved.verifiedAt,
-        updatedAt: saved.updatedAt,
-        lastValidationError: saved.lastValidationError,
-      },
-      verification,
-    };
+    _rawCookie?: string,
+    _options?: { verify?: boolean; roomId?: string }
+  ): Promise<never> {
+    void _rawCookie;
+    void _options;
+    throw new DouyinCredentialError(
+      'Manual Douyin Cookie import has been retired. Use browser login so the complete browser profile can be persisted.',
+      410
+    );
   }
 
   async verifyCookie(
@@ -252,53 +225,131 @@ export class DouyinAuthService {
     roomId?: string
   ): Promise<DouyinCookieVerification> {
     if (rawCookie?.trim()) {
-      const normalized = this.normalizeCookieHeader(rawCookie);
-      return this.verifyNormalizedCookie(
-        normalized.cookieHeader,
-        normalized.cookieNames,
-        roomId
+      throw new DouyinCredentialError(
+        'Manual Douyin Cookie verification has been retired. Verify the persisted browser profile instead.',
+        410
       );
     }
 
-    const credential = await this.credentialRepository.findLatest();
-    if (credential) {
-      const verification = await this.verifyNormalizedCookie(
-        credential.cookieHeader,
-        credential.cookieNames,
-        roomId
-      );
-      await this.credentialRepository.saveCredential({
-        cookieHeader: credential.cookieHeader,
-        cookieNames: credential.cookieNames,
-        verifiedAt: verification.ok
-          ? verification.verifiedAt || new Date()
-          : credential.verifiedAt || null,
-        lastValidationError: verification.ok
-          ? null
-          : verification.error || 'Douyin Cookie verification failed',
-      });
-      return verification;
+    if (this.logoutInProgress) {
+      throw new DouyinCredentialError('Douyin logout is in progress', 409);
     }
 
-    const configuredCookie = this.getConfiguredCookie();
-    if (configuredCookie) {
-      const normalized = this.normalizeCookieHeader(configuredCookie);
-      return this.verifyNormalizedCookie(
-        normalized.cookieHeader,
-        normalized.cookieNames,
-        roomId
-      );
-    }
+    const operation = await this.beginOperation({
+      lastValidationCode: null,
+      lastValidationError: null,
+    });
 
-    throw new DouyinCredentialError('No Douyin Cookie has been saved');
+    let target: DouyinBrowserLoginTarget | undefined;
+    try {
+      target = await this.browserProfileService.createLoginTarget(roomId);
+      const probe = await this.browserProfileService.probe(target.page, roomId);
+      const persisted = await this.persistProbe(probe, operation, true);
+      return persisted
+        ? this.toVerification(probe)
+        : {
+            ok: false,
+            cookieNames: [],
+            error: 'Douyin account validation was superseded',
+          };
+    } catch (error) {
+      const message = this.errorMessage(error);
+      await this.transitionForOperation(
+        operation,
+        'unknown',
+        {
+          lastValidationCode: 'BROWSER_UNAVAILABLE',
+          lastValidationError: message,
+        },
+        true
+      );
+      return {
+        ok: false,
+        cookieNames: [],
+        error: message,
+      };
+    } finally {
+      this.releaseOperation(operation);
+      if (target) {
+        await this.browserProfileService.closeTarget(target);
+      }
+    }
   }
 
   async clear(): Promise<void> {
-    await this.credentialRepository.clear();
+    if (this.logoutInProgress) {
+      throw new DouyinCredentialError(
+        'Douyin logout is already in progress',
+        409
+      );
+    }
+    this.logoutInProgress = true;
+    let operation: DouyinCredentialOperation | undefined;
+
+    try {
+      operation = await this.beginOperation({
+        lastValidationCode: null,
+        lastValidationError: null,
+      });
+      const sessions = Array.from(this.browserLoginSessions.values());
+      for (const session of sessions) {
+        session.status = 'cancelled';
+        session.updatedAt = new Date();
+        this.releaseOperation(session.operation);
+        await this.closeBrowserLoginSession(session, true);
+      }
+      this.browserLoginSessions.clear();
+
+      await this.browserProfileService.logout();
+      await this.transitionForOperation(
+        operation,
+        'expired',
+        {
+          cookieNames: [],
+          verifiedAt: null,
+          authExpiresAt: null,
+          lastValidationCode: 'SESSION_EXPIRED',
+          lastValidationError: 'Signed out by user',
+        },
+        true
+      );
+    } catch (error) {
+      const message = this.errorMessage(error);
+      if (operation) {
+        await this.transitionForOperation(
+          operation,
+          'unknown',
+          {
+            cookieNames: [],
+            verifiedAt: null,
+            authExpiresAt: null,
+            lastValidationCode: 'BROWSER_UNAVAILABLE',
+            lastValidationError: message,
+          },
+          true
+        );
+      }
+      throw error;
+    } finally {
+      this.releaseOperation(operation);
+      this.logoutInProgress = false;
+    }
   }
 
   async startBrowserLogin(roomId?: string): Promise<DouyinBrowserLoginStatus> {
+    if (this.logoutInProgress) {
+      throw new DouyinCredentialError('Douyin logout is in progress', 409);
+    }
     this.pruneBrowserLoginSessions();
+    const activeSession = Array.from(this.browserLoginSessions.values()).find(
+      session => this.isActiveSession(session.status)
+    );
+    if (activeSession) {
+      throw new DouyinCredentialError(
+        'A Douyin browser login is already in progress',
+        409
+      );
+    }
 
     const now = new Date();
     const session: DouyinBrowserLoginSession = {
@@ -307,15 +358,38 @@ export class DouyinAuthService {
       createdAt: now,
       updatedAt: now,
       expiresAt: new Date(now.getTime() + BROWSER_LOGIN_TTL_MS),
+      roomId: roomId?.trim() || undefined,
     };
-
     session.expireTimer = setTimeout(() => {
-      void this.expireBrowserLoginSession(session.id);
+      void this.expireBrowserLoginSession(session.id).catch(error => {
+        this.logger?.warn('Failed to expire Douyin browser login', {
+          sessionId: session.id,
+          error: this.errorMessage(error),
+        });
+      });
     }, BROWSER_LOGIN_TTL_MS);
-
     this.browserLoginSessions.set(session.id, session);
-    void this.prepareBrowserLoginSession(session, roomId);
 
+    try {
+      session.operation = await this.beginOperation({
+        lastValidationCode: null,
+        lastValidationError: null,
+      });
+    } catch (error) {
+      if (session.expireTimer) {
+        clearTimeout(session.expireTimer);
+      }
+      this.browserLoginSessions.delete(session.id);
+      throw error;
+    }
+    const preparePromise = this.prepareBrowserLoginSession(session);
+    session.preparePromise = preparePromise;
+    const clearPreparePromise = () => {
+      if (session.preparePromise === preparePromise) {
+        session.preparePromise = undefined;
+      }
+    };
+    void preparePromise.then(clearPreparePromise, clearPreparePromise);
     return this.serializeBrowserLoginSession(session);
   }
 
@@ -323,11 +397,7 @@ export class DouyinAuthService {
     sessionId: string
   ): Promise<DouyinBrowserLoginStatus> {
     const session = this.getBrowserLoginSession(sessionId);
-    if (
-      session.status === 'waiting' ||
-      session.status === 'verification_required' ||
-      session.status === 'initializing'
-    ) {
+    if (this.isActiveSession(session.status)) {
       await this.checkBrowserLoginSession(session);
     }
     return this.serializeBrowserLoginSession(session);
@@ -335,11 +405,11 @@ export class DouyinAuthService {
 
   async getBrowserLoginScreenshot(sessionId: string): Promise<Buffer> {
     const session = this.getBrowserLoginSession(sessionId);
-    if (!session.page || session.status === 'failed') {
+    const page = session.target?.page;
+    if (!page || page.isClosed() || session.status === 'failed') {
       throw new DouyinCredentialError('Douyin login page is not ready', 409);
     }
-
-    const screenshot = await session.page.screenshot({
+    const screenshot = await page.screenshot({
       type: 'png',
       fullPage: false,
     });
@@ -351,97 +421,63 @@ export class DouyinAuthService {
     sessionId: string,
     interaction: DouyinBrowserLoginInteraction
   ): Promise<DouyinBrowserLoginStatus> {
-    if (
-      !interaction ||
-      !['select_verification_method', 'submit_verification_code'].includes(
-        interaction.type
-      )
-    ) {
-      throw new DouyinCredentialError(
-        'Douyin verification interaction type is invalid'
-      );
-    }
-
     const session = this.getBrowserLoginSession(sessionId);
-    if (!session.page || session.status !== 'verification_required') {
+    const page = session.target?.page;
+    if (
+      !page ||
+      page.isClosed() ||
+      session.status !== 'verification_required'
+    ) {
       throw new DouyinCredentialError('Douyin verification is not ready', 409);
     }
 
-    this.assertDouyinLoginPage(session.page.url());
-
-    if (interaction.type === 'select_verification_method') {
-      const label = DOUYIN_VERIFICATION_METHOD_LABELS[interaction.method];
-      if (!label) {
+    if (interaction?.type === 'select_verification_method') {
+      if (!VERIFICATION_METHODS.includes(interaction.method)) {
         throw new DouyinCredentialError(
           'Douyin verification method is invalid'
         );
       }
-
-      const selected = await this.clickVisibleElementByText(session.page, [
-        label,
-      ]);
+      const selected =
+        await this.browserProfileService.selectVerificationMethod(
+          page,
+          interaction.method
+        );
       if (!selected) {
         throw new DouyinCredentialError(
           'Selected Douyin verification method is not available',
           409
         );
       }
-
       session.verification = {
-        stage: 'processing',
-        method: interaction.method,
-        availableMethods:
-          session.verification?.availableMethods ||
-          (Object.keys(
-            DOUYIN_VERIFICATION_METHOD_LABELS
-          ) as DouyinVerificationMethod[]),
-      };
-      await this.sleep(500);
-      session.verification = {
-        ...session.verification,
         stage:
           interaction.method === 'receive_sms'
             ? 'awaiting_code'
             : 'awaiting_external',
+        method: interaction.method,
+        availableMethods: VERIFICATION_METHODS,
         prompt:
           interaction.method === 'receive_sms'
-            ? '验证码已发送到绑定手机，请在前端输入。'
-            : (await this.getBrowserLoginVerificationPrompt(session.page)) ||
-              (interaction.method === 'face'
-                ? '请在手机上完成刷脸验证，完成后系统会自动继续。'
-                : '请使用绑定手机按抖音提示发送短信，完成后系统会自动继续。'),
+            ? '验证码已发送到绑定手机，请在这里输入。'
+            : interaction.method === 'face'
+            ? '请在手机端完成刷脸验证，系统会自动继续。'
+            : '请按抖音提示使用绑定手机发送短信，系统会自动继续。',
       };
-    } else if (interaction.type === 'submit_verification_code') {
-      if (!/^\d{4,8}$/.test(interaction.code || '')) {
-        throw new DouyinCredentialError(
-          'Douyin verification code must contain 4 to 8 digits'
-        );
-      }
-
+    } else if (interaction?.type === 'submit_verification_code') {
       if (session.verification?.method !== 'receive_sms') {
         throw new DouyinCredentialError(
           'SMS verification has not been selected',
           409
         );
       }
-
-      const filled = await this.fillVisibleVerificationCode(
-        session.page,
+      const submitted = await this.browserProfileService.submitVerificationCode(
+        page,
         interaction.code
       );
-      if (!filled) {
+      if (!submitted) {
         throw new DouyinCredentialError(
           'Douyin verification code input is not available',
           409
         );
-      }
-
-      const submitted = await this.clickVisibleElementByText(
-        session.page,
-        DOUYIN_VERIFICATION_SUBMIT_LABELS
-      );
-      if (!submitted) {
-        await session.page.keyboard.press('Enter');
       }
       session.verification = {
         ...session.verification,
@@ -449,18 +485,10 @@ export class DouyinAuthService {
       };
       await this.sleep(500);
       await this.checkBrowserLoginSession(session);
-      if (
-        session.status === 'verification_required' &&
-        session.verification?.method === 'receive_sms'
-      ) {
-        session.verification = {
-          ...session.verification,
-          stage: 'awaiting_code',
-          prompt:
-            (await this.getBrowserLoginVerificationPrompt(session.page)) ||
-            session.verification.prompt,
-        };
-      }
+    } else {
+      throw new DouyinCredentialError(
+        'Douyin verification interaction type is invalid'
+      );
     }
 
     session.updatedAt = new Date();
@@ -471,178 +499,60 @@ export class DouyinAuthService {
     const session = this.getBrowserLoginSession(sessionId);
     session.status = 'cancelled';
     session.updatedAt = new Date();
-    await this.closeBrowserLoginSession(session);
+    await this.invalidateOperation('unknown', {
+      lastValidationCode: 'TRANSIENT_ERROR',
+      lastValidationError: 'Douyin browser login was cancelled',
+    });
+    this.releaseOperation(session.operation);
+    await this.closeBrowserLoginSession(session, true);
     this.browserLoginSessions.delete(sessionId);
+    await this.reconcileProfileState();
   }
 
-  async getCookieHeader(): Promise<string> {
-    const credential = await this.credentialRepository.findLatest();
-    return credential?.cookieHeader || '';
+  /**
+   * The anonymous resolver calls this only when the persisted browser fallback
+   * itself reaches an explicit challenge. Transient public failures never
+   * overwrite a previously valid account state.
+   */
+  async markRuntimeChallenge(error?: string): Promise<void> {
+    if (this.activeOperations.size > 0 || this.logoutInProgress) {
+      return;
+    }
+    await this.invalidateOperation('challenged', {
+      lastValidationCode: 'CAPTCHA_REQUIRED',
+      lastValidationError:
+        error || 'Douyin browser profile requires verification',
+    });
   }
 
-  normalizeCookieHeader(rawCookie: string): NormalizedDouyinCookie {
-    const extracted = this.extractCookieHeader(rawCookie);
-    const cookies = new Map<string, string>();
-
-    for (const part of extracted.split(';')) {
-      const trimmed = part.trim();
-      if (!trimmed) {
-        continue;
-      }
-
-      const separator = trimmed.indexOf('=');
-      if (separator <= 0) {
-        continue;
-      }
-
-      const name = trimmed.slice(0, separator).trim();
-      const value = trimmed.slice(separator + 1).trim();
-      if (!name || COOKIE_ATTRIBUTE_NAMES.has(name.toLowerCase())) {
-        continue;
-      }
-      if (IGNORED_DOUYIN_COOKIE_NAMES.has(name)) {
-        continue;
-      }
-      if (hasInvalidCookieNameCharacter(name)) {
-        continue;
-      }
-
-      cookies.set(name, value);
+  async markRuntimeExpired(error?: string): Promise<void> {
+    if (this.activeOperations.size > 0 || this.logoutInProgress) {
+      return;
     }
-
-    if (cookies.size === 0) {
-      throw new DouyinCredentialError('Invalid Douyin Cookie');
-    }
-
-    return {
-      cookieHeader: Array.from(cookies.entries())
-        .map(([name, value]) => `${name}=${value}`)
-        .join('; '),
-      cookieNames: Array.from(cookies.keys()).sort(),
-    };
-  }
-
-  private async verifyNormalizedCookie(
-    cookieHeader: string,
-    cookieNames: string[],
-    roomId?: string
-  ): Promise<DouyinCookieVerification> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
-
-    try {
-      const webRid = roomId?.trim() || '';
-      const url = webRid
-        ? `https://live.douyin.com/${encodeURIComponent(webRid)}`
-        : 'https://live.douyin.com/';
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': this.getUserAgent(),
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          Referer: webRid ? `https://live.douyin.com/${webRid}` : url,
-          Cookie: cookieHeader,
-        },
-        signal: controller.signal,
-      });
-      const text = await response.text();
-      const captchaDetected = this.isCaptchaPage(text);
-
-      if (!response.ok) {
-        return {
-          ok: false,
-          cookieNames,
-          statusCode: response.status,
-          captchaDetected,
-          error: `Douyin returned HTTP ${response.status}`,
-        };
-      }
-
-      if (captchaDetected) {
-        return {
-          ok: false,
-          cookieNames,
-          statusCode: response.status,
-          captchaDetected: true,
-          error: 'Douyin returned a captcha page',
-        };
-      }
-
-      if (!text.trim()) {
-        return {
-          ok: false,
-          cookieNames,
-          statusCode: response.status,
-          captchaDetected: false,
-          error: 'Douyin returned an empty verification response',
-        };
-      }
-
-      if (webRid && !this.hasRoomInfoMarker(text)) {
-        return {
-          ok: false,
-          cookieNames,
-          statusCode: response.status,
-          captchaDetected: false,
-          error: 'Douyin room info was not found in verification response',
-        };
-      }
-
-      return {
-        ok: true,
-        cookieNames,
-        statusCode: response.status,
-        captchaDetected: false,
-        verifiedAt: new Date(),
-      };
-    } catch (error) {
-      const message =
-        error instanceof Error && error.name === 'AbortError'
-          ? 'Douyin Cookie verification timed out'
-          : error instanceof Error
-          ? error.message
-          : 'Douyin Cookie verification failed';
-      this.logger?.warn('Failed to verify Douyin Cookie', { error: message });
-      return {
-        ok: false,
-        cookieNames,
-        error: message,
-      };
-    } finally {
-      clearTimeout(timer);
-    }
+    await this.invalidateOperation('expired', {
+      verifiedAt: null,
+      authExpiresAt: null,
+      lastValidationCode: 'SESSION_EXPIRED',
+      lastValidationError: error || 'Douyin account session has expired',
+    });
   }
 
   private async prepareBrowserLoginSession(
-    session: DouyinBrowserLoginSession,
-    roomId?: string
+    session: DouyinBrowserLoginSession
   ): Promise<void> {
     try {
-      const browserTarget = await this.createBrowserLoginTarget();
-      session.browser = browserTarget.browser;
-      session.browserContext = browserTarget.browserContext;
-      session.page = browserTarget.page;
-      session.ownsBrowser = browserTarget.ownsBrowser;
-
-      await session.page.setViewport({
-        width: 390,
-        height: 760,
-        deviceScaleFactor: 2,
-        isMobile: true,
-      });
-      await session.page.setUserAgent(this.getUserAgent());
-
-      const webRid = roomId?.trim();
-      const url = webRid
-        ? `https://live.douyin.com/${encodeURIComponent(webRid)}`
-        : 'https://www.douyin.com/';
-
-      await this.navigateToDouyinLoginPage(session.page, url);
-      await this.openDouyinLoginPanel(session.page);
-
+      session.target = await this.browserProfileService.createLoginTarget(
+        session.roomId
+      );
+      if (!this.isSessionOperationActive(session)) {
+        await this.closeBrowserLoginSession(session);
+        return;
+      }
+      await this.browserProfileService.openLoginPanel(session.target.page);
+      if (!this.isSessionOperationActive(session)) {
+        await this.closeBrowserLoginSession(session);
+        return;
+      }
       session.status = 'waiting';
       session.updatedAt = new Date();
       session.pollTimer = setInterval(() => {
@@ -650,9 +560,25 @@ export class DouyinAuthService {
       }, BROWSER_LOGIN_POLL_MS);
       await this.checkBrowserLoginSession(session);
     } catch (error) {
+      if (!this.isSessionOperationActive(session)) {
+        await this.closeBrowserLoginSession(session);
+        return;
+      }
       session.status = 'failed';
-      session.error = error instanceof Error ? error.message : String(error);
+      session.error = this.errorMessage(error);
       session.updatedAt = new Date();
+      if (session.operation) {
+        await this.transitionForOperation(
+          session.operation,
+          'unknown',
+          {
+            lastValidationCode: 'BROWSER_UNAVAILABLE',
+            lastValidationError: session.error,
+          },
+          true
+        );
+        this.releaseOperation(session.operation);
+      }
       this.logger?.error('Failed to start Douyin browser login', {
         sessionId: session.id,
         error: session.error,
@@ -664,269 +590,375 @@ export class DouyinAuthService {
   private async checkBrowserLoginSession(
     session: DouyinBrowserLoginSession
   ): Promise<void> {
-    if (
-      !session.page ||
-      session.status === 'authenticated' ||
-      session.status === 'failed' ||
-      session.status === 'expired' ||
-      session.status === 'cancelled'
-    ) {
+    if (session.checkPromise) {
+      return session.checkPromise;
+    }
+    session.checkPromise = this.doCheckBrowserLoginSession(session).finally(
+      () => {
+        session.checkPromise = undefined;
+      }
+    );
+    return session.checkPromise;
+  }
+
+  private async doCheckBrowserLoginSession(
+    session: DouyinBrowserLoginSession
+  ): Promise<void> {
+    if (!this.isSessionOperationActive(session)) {
+      return;
+    }
+    if (Date.now() >= session.expiresAt.getTime()) {
+      await this.expireBrowserLoginSession(session.id, true);
       return;
     }
 
-    if (Date.now() >= session.expiresAt.getTime()) {
-      await this.expireBrowserLoginSession(session.id);
+    const page = session.target?.page;
+    if (!page || page.isClosed()) {
       return;
     }
 
     try {
-      const cookies = session.browserContext
-        ? await session.browserContext.cookies()
-        : session.browser
-        ? await session.browser.cookies()
-        : await session.page.cookies();
-      if (!this.hasAuthenticatedDouyinCookies(cookies)) {
-        const verificationRequired =
-          session.status === 'verification_required' ||
-          (await this.isIdentityVerificationPage(session.page));
-        session.status = verificationRequired
-          ? 'verification_required'
-          : 'waiting';
-        if (verificationRequired && !session.verification) {
-          session.verification = {
-            stage: 'choose_method',
-            availableMethods: Object.keys(
-              DOUYIN_VERIFICATION_METHOD_LABELS
-            ) as DouyinVerificationMethod[],
-          };
-        } else if (
-          verificationRequired &&
-          session.verification?.stage === 'awaiting_external'
-        ) {
-          session.verification.prompt =
-            (await this.getBrowserLoginVerificationPrompt(session.page)) ||
-            session.verification.prompt;
-        } else if (!verificationRequired) {
-          session.verification = undefined;
-        }
+      // A challenge must win over provisional session cookies.
+      const challenge = await this.browserProfileService.detectChallenge(page);
+      if (!this.isSessionOperationActive(session)) {
+        return;
+      }
+      if (challenge) {
+        await this.enterVerificationRequired(session, challenge);
+        return;
+      }
+
+      const diagnostics = await this.browserProfileService.getCookieDiagnostics(
+        session.target!.browserContext
+      );
+      if (!this.isSessionOperationActive(session)) {
+        return;
+      }
+      if (diagnostics.authenticatedCookieNames.length === 0) {
+        session.status = 'waiting';
+        session.verification = undefined;
         session.updatedAt = new Date();
         return;
       }
 
-      const normalized = this.buildCookieHeaderFromBrowserCookies(cookies);
-      const saved = await this.credentialRepository.saveCredential({
-        cookieHeader: normalized.cookieHeader,
-        cookieNames: normalized.cookieNames,
-        verifiedAt: new Date(),
-        lastValidationError: null,
-      });
-
-      session.status = 'authenticated';
-      session.cookieNames = saved.cookieNames;
-      session.verifiedAt = saved.verifiedAt || new Date();
-      session.verification = undefined;
+      session.status = 'validating';
       session.updatedAt = new Date();
+      const operation = session.operation;
+      if (!operation) {
+        return;
+      }
+      const validating = await this.transitionForOperation(
+        operation,
+        'validating',
+        {
+          cookieNames: diagnostics.cookieNames,
+          authExpiresAt: diagnostics.authExpiresAt || null,
+          lastValidationCode: null,
+          lastValidationError: null,
+        }
+      );
+      if (!validating || !this.isSessionOperationActive(session)) {
+        return;
+      }
+
+      const probe = await this.browserProfileService.probe(
+        page,
+        session.roomId
+      );
+      if (!this.isSessionOperationActive(session)) {
+        return;
+      }
+      if (probe.state === 'challenged') {
+        await this.enterVerificationRequired(
+          session,
+          probe.challenge || 'captcha',
+          probe
+        );
+        return;
+      }
+      if (probe.state === 'expired') {
+        session.status = 'waiting';
+        session.verification = undefined;
+        session.updatedAt = new Date();
+        await this.persistProbe(probe, operation);
+        await this.browserProfileService.openLoginPanel(page);
+        return;
+      }
+      if (probe.state === 'transient') {
+        session.status = 'validating';
+        session.error = probe.reason;
+        session.updatedAt = new Date();
+        await this.persistProbe(probe, operation);
+        return;
+      }
+
+      if (!(await this.persistProbe(probe, operation, true))) {
+        return;
+      }
+      session.status = 'authenticated';
+      session.cookieNames = probe.cookieNames;
+      session.verifiedAt = new Date();
+      session.verification = undefined;
+      session.error = undefined;
+      session.updatedAt = new Date();
+      this.releaseOperation(operation);
       await this.closeBrowserLoginSession(session);
     } catch (error) {
-      if (this.isTransientBrowserNavigationError(error)) {
+      if (this.isTransientNavigationError(error)) {
         session.updatedAt = new Date();
-        this.logger?.debug('Douyin login page is still navigating', {
-          sessionId: session.id,
-        });
         return;
       }
-      session.status = 'failed';
-      session.error =
-        error instanceof Error
-          ? error.message
-          : 'Failed to read Douyin browser Cookie';
+      const message = this.errorMessage(error);
+      if (!this.isSessionOperationActive(session)) {
+        return;
+      }
+      session.status = 'validating';
+      session.error = message;
       session.updatedAt = new Date();
-      this.logger?.error('Failed to complete Douyin browser login', {
-        sessionId: session.id,
-        error: session.error,
-      });
-      await this.closeBrowserLoginSession(session);
-    }
-  }
-
-  private async isIdentityVerificationPage(page: Page): Promise<boolean> {
-    const text = await page.evaluate(() => {
-      const doc = (globalThis as any).document;
-      return (doc.body?.innerText || doc.body?.textContent || '').trim();
-    });
-    return isDouyinIdentityVerificationText(text);
-  }
-
-  private async getBrowserLoginVerificationPrompt(
-    page: Page
-  ): Promise<string | undefined> {
-    const prompt = await page.evaluate(() => {
-      const doc = (globalThis as any).document;
-      const normalize = (value: unknown) =>
-        String(value || '')
-          .replace(/\s+/g, ' ')
-          .trim();
-      const bodyText = normalize(
-        doc.body?.innerText || doc.body?.textContent || ''
-      );
-      const identityIndex = bodyText.search(/身份验证|安全验证/);
-      return identityIndex >= 0
-        ? bodyText.slice(identityIndex, identityIndex + 600)
-        : '';
-    });
-    return prompt || undefined;
-  }
-
-  private async clickVisibleElementByText(
-    page: Page,
-    labels: readonly string[]
-  ): Promise<boolean> {
-    for (const label of labels) {
-      try {
-        const clicked = await page.evaluate(value => {
-          const doc = (globalThis as any).document;
-          const normalize = (text: unknown) =>
-            String(text || '')
-              .replace(/\s+/g, ' ')
-              .trim();
-          const matches = Array.from(
-            doc.querySelectorAll(
-              'button, a, [role="button"], [tabindex], div, span'
-            )
-          ).filter(element => {
-            const node = element as any;
-            const rect = node.getBoundingClientRect();
-            const style = (globalThis as any).getComputedStyle(node);
-            return (
-              normalize(node.innerText || node.textContent) === value &&
-              rect.width > 0 &&
-              rect.height > 0 &&
-              style.visibility !== 'hidden' &&
-              style.display !== 'none'
-            );
-          }) as any[];
-          const labelElement =
-            matches.find(
-              element =>
-                !matches.some(
-                  other => other !== element && element.contains(other)
-                )
-            ) || matches[0];
-          const target =
-            labelElement?.closest('button, a, [role="button"], [tabindex]') ||
-            labelElement;
-          target?.click();
-          return Boolean(target);
-        }, label);
-        if (clicked) {
-          return true;
-        }
-      } catch {
-        // Try the next semantic label.
-      }
-    }
-    return false;
-  }
-
-  private async fillVisibleVerificationCode(
-    page: Page,
-    code: string
-  ): Promise<boolean> {
-    try {
-      await page
-        .locator(
-          '::-p-xpath((//input[contains(@placeholder,"验证码") or contains(@aria-label,"验证码")])[last()])'
-        )
-        .setTimeout(3000)
-        .setVisibility('visible')
-        .fill(code);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private assertDouyinLoginPage(pageUrl: string): void {
-    let hostname = '';
-    try {
-      hostname = new URL(pageUrl).hostname.toLowerCase();
-    } catch {
-      throw new DouyinCredentialError('Douyin login page URL is invalid', 409);
-    }
-
-    if (hostname !== 'douyin.com' && !hostname.endsWith('.douyin.com')) {
-      throw new DouyinCredentialError(
-        'Browser interaction is restricted to Douyin pages',
-        409
-      );
-    }
-  }
-
-  private async openDouyinLoginPanel(page: Page): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      await this.sleep(attempt === 0 ? 2000 : 1000);
-      if (
-        await this.clickVisibleElementByText(page, [
-          '扫码登录',
-          '立即登录',
-          '登录',
-        ])
-      ) {
-        await this.sleep(2000);
-        return;
-      }
-    }
-  }
-
-  private async navigateToDouyinLoginPage(
-    page: Page,
-    url: string
-  ): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000,
+      if (session.operation) {
+        await this.transitionForOperation(session.operation, 'unknown', {
+          lastValidationCode: 'TRANSIENT_ERROR',
+          lastValidationError: message,
         });
-        return;
-      } catch (error) {
-        if (attempt === 1 || !this.isTransientBrowserNavigationError(error)) {
-          throw error;
-        }
-        await this.sleep(1000);
       }
+      this.logger?.warn('Douyin browser login validation was inconclusive', {
+        sessionId: session.id,
+        error: message,
+      });
     }
   }
 
-  private isTransientBrowserNavigationError(error: unknown): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return /execution context was destroyed|navigating frame was detached|frame was detached|cannot find context with specified id/i.test(
-      message
+  private async enterVerificationRequired(
+    session: DouyinBrowserLoginSession,
+    challenge: 'captcha' | 'second_verification',
+    probe?: DouyinProfileProbeResult
+  ): Promise<void> {
+    if (!session.operation || !this.isSessionOperationActive(session)) {
+      return;
+    }
+    session.status = 'verification_required';
+    session.error = undefined;
+    session.verification = session.verification || {
+      stage: 'choose_method',
+      availableMethods: VERIFICATION_METHODS,
+      prompt:
+        challenge === 'second_verification'
+          ? '抖音要求完成账号二次验证。'
+          : '抖音要求完成安全验证。',
+    };
+    session.updatedAt = new Date();
+    await this.transitionForOperation(session.operation, 'challenged', {
+      cookieNames: probe?.cookieNames,
+      authExpiresAt: probe?.authExpiresAt || null,
+      lastValidationCode:
+        challenge === 'second_verification'
+          ? 'SECONDARY_VERIFICATION_REQUIRED'
+          : 'CAPTCHA_REQUIRED',
+      lastValidationError:
+        probe?.reason ||
+        (challenge === 'second_verification'
+          ? 'Douyin secondary verification is required'
+          : 'Douyin captcha verification is required'),
+    });
+  }
+
+  private async persistProbe(
+    probe: DouyinProfileProbeResult,
+    operation: DouyinCredentialOperation,
+    completeOperation = false
+  ): Promise<boolean> {
+    const now = new Date();
+    if (probe.state === 'valid') {
+      return Boolean(
+        await this.transitionForOperation(
+          operation,
+          'valid',
+          {
+            cookieNames: probe.cookieNames,
+            verifiedAt: now,
+            authExpiresAt: probe.authExpiresAt || null,
+            lastValidationCode: null,
+            lastValidationError: null,
+          },
+          completeOperation
+        )
+      );
+    }
+    if (probe.state === 'challenged') {
+      return Boolean(
+        await this.transitionForOperation(
+          operation,
+          'challenged',
+          {
+            cookieNames: probe.cookieNames,
+            authExpiresAt: probe.authExpiresAt || null,
+            lastValidationCode:
+              probe.challenge === 'second_verification'
+                ? 'SECONDARY_VERIFICATION_REQUIRED'
+                : 'CAPTCHA_REQUIRED',
+            lastValidationError:
+              probe.reason || 'Douyin verification is required',
+          },
+          completeOperation
+        )
+      );
+    }
+    if (probe.state === 'expired') {
+      return Boolean(
+        await this.transitionForOperation(
+          operation,
+          'expired',
+          {
+            cookieNames: probe.cookieNames,
+            verifiedAt: null,
+            authExpiresAt: probe.authExpiresAt || null,
+            lastValidationCode: 'SESSION_EXPIRED',
+            lastValidationError: probe.reason || 'Douyin session expired',
+          },
+          completeOperation
+        )
+      );
+    }
+    return Boolean(
+      await this.transitionForOperation(
+        operation,
+        'unknown',
+        {
+          cookieNames: probe.cookieNames,
+          authExpiresAt: probe.authExpiresAt || null,
+          lastValidationCode: 'TRANSIENT_ERROR',
+          lastValidationError:
+            probe.reason || 'Douyin profile validation was inconclusive',
+        },
+        completeOperation
+      )
     );
   }
 
-  private buildCookieHeaderFromBrowserCookies(
-    browserCookies: Cookie[]
-  ): NormalizedDouyinCookie {
-    const cookieHeader = browserCookies
-      .filter(cookie => this.isByteDanceCookieDomain(cookie.domain))
-      .filter(cookie => cookie.name && cookie.value !== undefined)
-      .map(cookie => `${cookie.name}=${cookie.value}`)
-      .join('; ');
-
-    return this.normalizeCookieHeader(cookieHeader);
+  private toVerification(
+    probe: DouyinProfileProbeResult
+  ): DouyinCookieVerification {
+    return {
+      ok: probe.state === 'valid',
+      cookieNames: probe.cookieNames,
+      verifiedAt: probe.state === 'valid' ? new Date() : undefined,
+      statusCode: probe.statusCode,
+      captchaDetected: probe.state === 'challenged',
+      error: probe.state === 'valid' ? undefined : probe.reason,
+    };
   }
 
-  private hasAuthenticatedDouyinCookies(browserCookies: Cookie[]): boolean {
-    return browserCookies
-      .filter(cookie => this.isByteDanceCookieDomain(cookie.domain))
-      .some(cookie =>
-        AUTHENTICATED_COOKIE_NAMES.has(cookie.name.toLowerCase())
+  private async beginOperation(
+    details: Omit<DouyinCredentialTransition, 'state'>
+  ): Promise<DouyinCredentialOperation> {
+    const started = await this.credentialRepository.beginOperation(
+      randomUUID(),
+      {
+        state: 'validating',
+        ...details,
+      }
+    );
+    this.activeOperations.add(this.operationKey(started.operation));
+    return started.operation;
+  }
+
+  private async transitionForOperation(
+    operation: DouyinCredentialOperation,
+    state: DouyinAuthState,
+    details: Omit<DouyinCredentialTransition, 'state'>,
+    completeOperation = false
+  ) {
+    const credential = await this.credentialRepository.transition(
+      {
+        state,
+        ...details,
+      },
+      operation,
+      completeOperation
+    );
+    if (!credential || completeOperation) {
+      this.releaseOperation(operation);
+    }
+    return credential;
+  }
+
+  private async invalidateOperation(
+    state: DouyinAuthState,
+    details: Omit<DouyinCredentialTransition, 'state'>
+  ): Promise<void> {
+    this.activeOperations.clear();
+    await this.credentialRepository.invalidateOperation({
+      state,
+      ...details,
+    });
+  }
+
+  private async reconcileProfileState(): Promise<void> {
+    if (this.logoutInProgress) {
+      return;
+    }
+    if (this.reconciliationPromise) {
+      return this.reconciliationPromise;
+    }
+    this.reconciliationPromise = this.doReconcileProfileState().finally(() => {
+      this.reconciliationPromise = undefined;
+    });
+    return this.reconciliationPromise;
+  }
+
+  private async doReconcileProfileState(): Promise<void> {
+    const operation = await this.beginOperation({
+      lastValidationCode: null,
+      lastValidationError: null,
+    });
+    let target: DouyinBrowserLoginTarget | undefined;
+    try {
+      target = await this.browserProfileService.createLoginTarget();
+      const probe = await this.browserProfileService.probe(target.page);
+      await this.persistProbe(probe, operation, true);
+    } catch (error) {
+      await this.transitionForOperation(
+        operation,
+        'unknown',
+        {
+          lastValidationCode: 'BROWSER_UNAVAILABLE',
+          lastValidationError: this.errorMessage(error),
+        },
+        true
       );
+    } finally {
+      this.releaseOperation(operation);
+      if (target) {
+        await this.browserProfileService.closeTarget(target);
+      }
+    }
   }
 
-  private isByteDanceCookieDomain(domain: string): boolean {
-    return BYTE_DANCE_COOKIE_DOMAIN_PATTERN.test(domain.replace(/^\./, ''));
+  private isSessionOperationActive(
+    session: DouyinBrowserLoginSession
+  ): boolean {
+    return (
+      this.isActiveSession(session.status) &&
+      Boolean(session.operation && this.isOperationActive(session.operation))
+    );
+  }
+
+  private isOperationActive(operation?: DouyinCredentialOperation): boolean {
+    return Boolean(
+      operation?.id &&
+        operation.generation > 0 &&
+        this.activeOperations.has(this.operationKey(operation))
+    );
+  }
+
+  private releaseOperation(operation?: DouyinCredentialOperation): void {
+    if (operation) {
+      this.activeOperations.delete(this.operationKey(operation));
+    }
+  }
+
+  private operationKey(operation: DouyinCredentialOperation): string {
+    return `${operation.generation}:${operation.id}`;
   }
 
   private getBrowserLoginSession(sessionId: string): DouyinBrowserLoginSession {
@@ -947,10 +979,9 @@ export class DouyinAuthService {
       expiresAt: session.expiresAt,
       updatedAt: session.updatedAt,
       screenshotUpdatedAt:
-        session.page &&
-        (session.status === 'initializing' ||
-          session.status === 'waiting' ||
-          session.status === 'verification_required')
+        session.target?.page &&
+        !session.target.page.isClosed() &&
+        this.isActiveSession(session.status)
           ? new Date()
           : undefined,
       cookieNames: session.cookieNames,
@@ -960,24 +991,31 @@ export class DouyinAuthService {
     };
   }
 
-  private async expireBrowserLoginSession(sessionId: string): Promise<void> {
+  private async expireBrowserLoginSession(
+    sessionId: string,
+    calledFromCheck = false
+  ): Promise<void> {
     const session = this.browserLoginSessions.get(sessionId);
     if (!session) {
       return;
     }
-    if (
-      session.status === 'initializing' ||
-      session.status === 'waiting' ||
-      session.status === 'verification_required'
-    ) {
+    if (this.isActiveSession(session.status)) {
       session.status = 'expired';
       session.updatedAt = new Date();
+      await this.invalidateOperation('unknown', {
+        lastValidationCode: 'TRANSIENT_ERROR',
+        lastValidationError:
+          'Douyin browser login timed out; profile recheck started',
+      });
+      this.releaseOperation(session.operation);
     }
-    await this.closeBrowserLoginSession(session);
+    await this.closeBrowserLoginSession(session, !calledFromCheck);
+    await this.reconcileProfileState();
   }
 
   private async closeBrowserLoginSession(
-    session: DouyinBrowserLoginSession
+    session: DouyinBrowserLoginSession,
+    waitForWork = false
   ): Promise<void> {
     if (session.pollTimer) {
       clearInterval(session.pollTimer);
@@ -987,286 +1025,59 @@ export class DouyinAuthService {
       clearTimeout(session.expireTimer);
       session.expireTimer = undefined;
     }
-    if (session.browserContext) {
-      try {
-        await session.browserContext.close();
-      } catch (error) {
-        this.logger?.debug('Failed to close Douyin login browser context', {
-          sessionId: session.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      session.browserContext = undefined;
+    await this.closeBrowserLoginTarget(session);
+    if (waitForWork && session.preparePromise) {
+      await session.preparePromise.catch(() => undefined);
+      await this.closeBrowserLoginTarget(session);
     }
-    if (session.browser) {
-      try {
-        if (session.ownsBrowser) {
-          await session.browser.close();
-        } else {
-          await session.browser.disconnect();
-        }
-      } catch (error) {
-        this.logger?.debug('Failed to release Douyin login browser', {
-          sessionId: session.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      session.browser = undefined;
-      session.page = undefined;
-      session.ownsBrowser = undefined;
+    if (waitForWork && session.checkPromise) {
+      await Promise.race([
+        session.checkPromise.catch(() => undefined),
+        this.sleep(2_500),
+      ]);
     }
+  }
+
+  private async closeBrowserLoginTarget(
+    session: DouyinBrowserLoginSession
+  ): Promise<void> {
+    if (!session.target) {
+      return;
+    }
+    const target = session.target;
+    session.target = undefined;
+    await this.browserProfileService.closeTarget(target);
   }
 
   private pruneBrowserLoginSessions(): void {
-    const removableStates = new Set<DouyinBrowserLoginState>([
-      'authenticated',
-      'expired',
-      'failed',
-      'cancelled',
-    ]);
     const cutoff = Date.now() - BROWSER_LOGIN_TTL_MS;
-    for (const [sessionId, session] of this.browserLoginSessions.entries()) {
+    for (const [id, session] of this.browserLoginSessions.entries()) {
       if (
-        removableStates.has(session.status) &&
+        !this.isActiveSession(session.status) &&
         session.updatedAt.getTime() < cutoff
       ) {
-        this.browserLoginSessions.delete(sessionId);
+        this.browserLoginSessions.delete(id);
       }
     }
   }
 
-  private resolveChromiumExecutablePath(): string | undefined {
-    const candidates = [
-      process.env.CHROMIUM_PATH,
-      process.env.PUPPETEER_EXECUTABLE_PATH,
-      '/usr/bin/chromium-browser',
-      '/usr/bin/chromium',
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    ].filter(Boolean) as string[];
-
-    return candidates.find(candidate => existsSync(candidate));
+  private isActiveSession(status: DouyinBrowserLoginState): boolean {
+    return [
+      'initializing',
+      'waiting',
+      'verification_required',
+      'validating',
+    ].includes(status);
   }
 
-  private async createBrowserLoginTarget(): Promise<{
-    browser: Browser;
-    browserContext: BrowserContext;
-    page: Page;
-    ownsBrowser: boolean;
-  }> {
-    const puppeteer = await this.importPuppeteer();
-    const remoteEndpoint = this.getBrowserEndpoint();
-    let browser: Browser;
-    let ownsBrowser = false;
-
-    if (remoteEndpoint) {
-      const connection = await this.resolveRemoteBrowserConnection(
-        remoteEndpoint
-      );
-      browser = await puppeteer.connect(connection);
-    } else {
-      const executablePath = this.resolveChromiumExecutablePath();
-      if (!executablePath) {
-        throw new DouyinCredentialError(
-          'Browser endpoint is not configured and Chromium executable was not found.',
-          500
-        );
-      }
-
-      browser = await puppeteer.launch({
-        executablePath,
-        headless: true,
-        args: this.buildChromiumLaunchArgs(),
-      });
-      ownsBrowser = true;
-    }
-
-    const browserContext = await browser.createBrowserContext();
-    const page = await browserContext.newPage();
-    return { browser, browserContext, page, ownsBrowser };
-  }
-
-  private getBrowserEndpoint(): string {
-    return (
-      process.env.DOUYIN_BROWSER_ENDPOINT?.trim() ||
-      process.env.DOUYIN_BROWSER_WS_ENDPOINT?.trim() ||
-      process.env.BROWSER_WS_ENDPOINT?.trim() ||
-      ''
+  private isTransientNavigationError(error: unknown): boolean {
+    return /execution context was destroyed|navigating frame was detached|frame was detached|cannot find context with specified id/i.test(
+      this.errorMessage(error)
     );
   }
 
-  private async resolveRemoteBrowserConnection(endpoint: string): Promise<{
-    browserWSEndpoint: string;
-    headers?: Record<string, string>;
-  }> {
-    if (endpoint.startsWith('ws://') || endpoint.startsWith('wss://')) {
-      const hostHeader = this.getBrowserHostHeader(endpoint);
-      return {
-        browserWSEndpoint: endpoint,
-        headers: hostHeader ? { Host: hostHeader } : undefined,
-      };
-    }
-
-    const endpointUrl = new URL(endpoint);
-    const versionUrl = new URL('/json/version', endpointUrl);
-    const hostHeader = this.getBrowserHostHeader(endpoint);
-    const response = await this.requestText(versionUrl, hostHeader);
-    const version = JSON.parse(response) as { webSocketDebuggerUrl?: string };
-
-    if (!version.webSocketDebuggerUrl) {
-      throw new DouyinCredentialError(
-        'Browser endpoint did not return a WebSocket debugger URL',
-        500
-      );
-    }
-
-    const wsUrl = new URL(version.webSocketDebuggerUrl);
-    wsUrl.protocol = endpointUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-    wsUrl.hostname = endpointUrl.hostname;
-    wsUrl.port = endpointUrl.port;
-
-    return {
-      browserWSEndpoint: wsUrl.toString(),
-      headers: hostHeader ? { Host: hostHeader } : undefined,
-    };
-  }
-
-  private getBrowserHostHeader(endpoint: string): string {
-    const configured = process.env.DOUYIN_BROWSER_HOST_HEADER?.trim();
-    if (configured) {
-      return configured;
-    }
-
-    const endpointUrl = new URL(endpoint);
-    if (
-      endpointUrl.hostname === 'localhost' ||
-      endpointUrl.hostname === '127.0.0.1'
-    ) {
-      return '';
-    }
-
-    const port =
-      endpointUrl.port ||
-      (endpointUrl.protocol === 'https:' || endpointUrl.protocol === 'wss:'
-        ? '443'
-        : '80');
-    return `127.0.0.1:${port}`;
-  }
-
-  private requestText(url: URL, hostHeader: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
-        url,
-        {
-          method: 'GET',
-          headers: hostHeader ? { Host: hostHeader } : undefined,
-        },
-        response => {
-          let body = '';
-          response.setEncoding('utf8');
-          response.on('data', chunk => {
-            body += chunk;
-          });
-          response.on('end', () => {
-            if ((response.statusCode || 500) >= 400) {
-              reject(
-                new DouyinCredentialError(
-                  `Browser endpoint returned HTTP ${
-                    response.statusCode
-                  }: ${body.slice(0, 120)}`,
-                  500
-                )
-              );
-              return;
-            }
-            resolve(body);
-          });
-        }
-      );
-
-      request.setTimeout(5000, () => {
-        request.destroy(new Error('Browser endpoint request timed out'));
-      });
-      request.on('error', reject);
-      request.end();
-    });
-  }
-
-  private async importPuppeteer(): Promise<typeof import('puppeteer-core')> {
-    const dynamicImport = new Function(
-      'specifier',
-      'return import(specifier)'
-    ) as (specifier: string) => Promise<typeof import('puppeteer-core')>;
-
-    return dynamicImport('puppeteer-core');
-  }
-
-  private buildChromiumLaunchArgs(): string[] {
-    const args = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-blink-features=AutomationControlled',
-    ];
-    const proxy =
-      process.env.HTTPS_PROXY ||
-      process.env.https_proxy ||
-      process.env.HTTP_PROXY ||
-      process.env.http_proxy ||
-      process.env.ALL_PROXY ||
-      process.env.all_proxy;
-    if (proxy) {
-      args.push(`--proxy-server=${proxy}`);
-    }
-    return args;
-  }
-
-  private extractCookieHeader(rawCookie: string): string {
-    const trimmed = rawCookie.trim();
-    if (!trimmed) {
-      throw new DouyinCredentialError('Douyin Cookie is required');
-    }
-
-    const cookieLine = trimmed
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .find(line => /^cookie\s*:/i.test(line));
-
-    return (cookieLine || trimmed)
-      .replace(/^cookie\s*:\s*/i, '')
-      .replace(/\r?\n/g, '; ');
-  }
-
-  private getConfiguredCookie(): string {
-    return getConfig().platforms?.douyin?.cookie?.trim() || '';
-  }
-
-  private getUserAgent(): string {
-    return (
-      getConfig().platforms?.douyin?.userAgent?.trim() ||
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
-    );
-  }
-
-  private isCaptchaPage(html: string): boolean {
-    const title = html.match(/<title>(.*?)<\/title>/i)?.[1] || '';
-    return (
-      /验证码中间页|安全验证|captcha|verify/i.test(title) ||
-      /captcha\/index\.js|secsdk-captcha|argus-csp-token/i.test(html)
-    );
-  }
-
-  private hasRoomInfoMarker(html: string): boolean {
-    return (
-      html.includes('__pace_f') &&
-      (html.includes('roomInfo') ||
-        html.includes('"room"') ||
-        html.includes('roomStore'))
-    );
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   private sleep(ms: number): Promise<void> {

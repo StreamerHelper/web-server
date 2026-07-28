@@ -48,7 +48,8 @@ describe('PollerProcessor scheduling', () => {
       checked: 0,
     });
     expect(
-      processor.jobService.recoverInterruptedJobsOnStartup.mock.invocationCallOrder[0]
+      processor.jobService.recoverInterruptedJobsOnStartup.mock
+        .invocationCallOrder[0]
     ).toBeLessThan(
       processor.streamerService.findActive.mock.invocationCallOrder[0]
     );
@@ -89,6 +90,87 @@ describe('PollerProcessor heartbeat timeout selection', () => {
       'streamer-1',
       'bilibili',
       12000
+    );
+  });
+});
+
+describe('PollerProcessor resolver header handling', () => {
+  it('passes ephemeral headers to the recorder without persisting them', async () => {
+    const processor = new PollerProcessor() as any;
+    const streamHeaders = {
+      cookie: 'ttwid=ephemeral-secret',
+      referer: 'https://live.douyin.com/',
+    };
+    const signedStreamUrl =
+      'https://pull.example/live.flv?auth_key=private-url-secret#fragment';
+    processor.recorderConfig = {
+      heartbeatInterval: 3,
+      heartbeatTimeout: 12,
+      maxRecordingTime: 3600,
+    };
+    processor.streamerService = {
+      updateLastCheckTime: jest.fn().mockResolvedValue(undefined),
+      updateLastLiveTime: jest.fn().mockResolvedValue(undefined),
+    };
+    processor.jobService = {
+      findActiveJobForStreamer: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({
+        id: 'job-row-1',
+        jobId: 'job-public-1',
+      }),
+      updateStatus: jest.fn().mockResolvedValue(undefined),
+    };
+    processor.platformService = {
+      checkLiveStatus: jest.fn().mockResolvedValue({
+        isLive: true,
+        title: 'live title',
+      }),
+      resolveStream: jest.fn().mockResolvedValue({
+        url: signedStreamUrl,
+        headers: streamHeaders,
+        requestedQuality: 'high',
+        effectiveQuality: 'high',
+        qualityApplied: true,
+      }),
+      getDanmakuUrl: jest.fn().mockResolvedValue(''),
+    };
+    processor.recorderManager = {
+      startRecording: jest.fn().mockResolvedValue(undefined),
+    };
+    processor.logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    };
+
+    await processor.checkStreamer({
+      id: 'streamer-row-1',
+      streamerId: 'douyin-web-rid',
+      roomId: '742000000000',
+      name: 'streamer',
+      platform: 'douyin',
+      recordSettings: { quality: 'high' },
+    });
+
+    const persistedJob = processor.jobService.create.mock.calls[0][0];
+    expect(JSON.stringify(persistedJob)).not.toContain('ephemeral-secret');
+    expect(JSON.stringify(persistedJob)).not.toContain('private-url-secret');
+    expect(persistedJob).toEqual(
+      expect.objectContaining({
+        streamUrl: 'https://pull.example/live.flv',
+        metadata: expect.objectContaining({
+          stream_url: 'https://pull.example/live.flv',
+        }),
+      })
+    );
+    expect(processor.recorderManager.startRecording).toHaveBeenCalledWith(
+      'douyin',
+      'douyin-web-rid',
+      expect.objectContaining({
+        streamUrl: signedStreamUrl,
+        streamHeaders,
+      })
     );
   });
 });

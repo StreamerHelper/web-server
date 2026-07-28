@@ -61,6 +61,16 @@ describe('JobService startup recovery', () => {
 });
 
 describe('JobService browse cover data', () => {
+  const createBrowseQueryBuilder = (jobs: any[], total = jobs.length) => ({
+    select: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    orderBy: jest.fn().mockReturnThis(),
+    addOrderBy: jest.fn().mockReturnThis(),
+    take: jest.fn().mockReturnThis(),
+    skip: jest.fn().mockReturnThis(),
+    getManyAndCount: jest.fn().mockResolvedValue([jobs, total]),
+  });
+
   const createTemplateService = () => {
     const service = new SubmissionTemplateService() as any;
     service.submissionConfig = {
@@ -92,11 +102,9 @@ describe('JobService browse cover data', () => {
     };
 
     service.jobModel = {
-      createQueryBuilder: jest.fn().mockReturnValue({
-        andWhere: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([job]),
-      }),
+      createQueryBuilder: jest
+        .fn()
+        .mockReturnValue(createBrowseQueryBuilder([job])),
     };
     service.storageService = {
       getSignedUrl: jest
@@ -116,9 +124,9 @@ describe('JobService browse cover data', () => {
     };
     service.submissionTemplateService = createTemplateService();
 
-    const groups = await service.findAllGroupedByDate();
+    const result = await service.findAllGroupedByDate();
 
-    expect(groups['2026-04-18']).toEqual([
+    expect(result.groups['2026-04-18']).toEqual([
       expect.objectContaining({
         jobId: 'job-1',
         title: '主播A - 直播间A - 2026-04-18',
@@ -134,10 +142,8 @@ describe('JobService browse cover data', () => {
       warn: jest.fn(),
     };
     service.jobModel = {
-      createQueryBuilder: jest.fn().mockReturnValue({
-        andWhere: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([
+      createQueryBuilder: jest.fn().mockReturnValue(
+        createBrowseQueryBuilder([
           {
             id: 'job-db-id',
             jobId: 'job-2',
@@ -153,8 +159,8 @@ describe('JobService browse cover data', () => {
             createdAt: new Date('2026-04-18T12:00:00+08:00'),
             coverPath: 'jobs/job-2/cover/snapshot.jpg',
           },
-        ]),
-      }),
+        ])
+      ),
     };
     service.storageService = {
       getSignedUrl: jest.fn().mockRejectedValue(new Error('missing object')),
@@ -172,9 +178,9 @@ describe('JobService browse cover data', () => {
     };
     service.submissionTemplateService = createTemplateService();
 
-    const groups = await service.findAllGroupedByDate();
+    const result = await service.findAllGroupedByDate();
 
-    expect(groups['2026-04-18']).toEqual([
+    expect(result.groups['2026-04-18']).toEqual([
       expect.objectContaining({
         jobId: 'job-2',
         title: '直播间B / 主播B / 12:00',
@@ -186,10 +192,8 @@ describe('JobService browse cover data', () => {
   it('uses the default submission title template when streamer has no title template', async () => {
     const service = new JobService() as any;
     service.jobModel = {
-      createQueryBuilder: jest.fn().mockReturnValue({
-        andWhere: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([
+      createQueryBuilder: jest.fn().mockReturnValue(
+        createBrowseQueryBuilder([
           {
             id: 'job-db-id',
             jobId: 'job-3',
@@ -205,8 +209,8 @@ describe('JobService browse cover data', () => {
             createdAt: new Date('2026-04-18T12:00:00+08:00'),
             coverPath: null,
           },
-        ]),
-      }),
+        ])
+      ),
     };
     service.streamerModel = {
       find: jest.fn().mockResolvedValue([
@@ -219,14 +223,55 @@ describe('JobService browse cover data', () => {
     };
     service.submissionTemplateService = createTemplateService();
 
-    const groups = await service.findAllGroupedByDate();
+    const result = await service.findAllGroupedByDate();
 
-    expect(groups['2026-04-18']).toEqual([
+    expect(result.groups['2026-04-18']).toEqual([
       expect.objectContaining({
         jobId: 'job-3',
         title: '主播C的直播录像 2026-04-18',
       }),
     ]);
+  });
+
+  it('applies browse filters and pagination in the database query', async () => {
+    const service = new JobService() as any;
+    const queryBuilder = createBrowseQueryBuilder([], 37);
+    service.jobModel = {
+      createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
+    };
+
+    const result = await service.findAllGroupedByDate(
+      '主播A',
+      '2026-04-01',
+      '2026-04-30',
+      3,
+      12,
+      24
+    );
+
+    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
+      "(job.metadata->>'storageDeleted') IS DISTINCT FROM 'true'"
+    );
+    expect(queryBuilder.select).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        'job.id',
+        'job.streamerId',
+        'job.startTime',
+        'job.coverPath',
+      ])
+    );
+    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
+      'job.streamerName = :streamerName',
+      { streamerName: '主播A' }
+    );
+    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
+      'job.segmentCount >= :minSegmentCount',
+      { minSegmentCount: 3 }
+    );
+    expect(queryBuilder.take).toHaveBeenCalledWith(12);
+    expect(queryBuilder.skip).toHaveBeenCalledWith(24);
+    expect(queryBuilder.getManyAndCount).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ groups: {}, total: 37 });
   });
 
   it('returns video offsets for timeline aligned playback', async () => {

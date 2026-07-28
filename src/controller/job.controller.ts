@@ -22,6 +22,11 @@ import {
   normalizeAutoDeleteSettings,
   resolveRecordingQuality,
 } from '../utils/record-settings';
+import { normalizePagination } from '../utils/pagination';
+import {
+  sanitizeStreamUrl,
+  sanitizeUrlQueriesInText,
+} from '../utils/sensitive-url';
 
 @Controller('/api/jobs')
 export class JobController {
@@ -67,8 +72,8 @@ export class JobController {
     @Query('sortBy')
     sortBy: 'createdAt' | 'updatedAt' | 'startTime' | 'endTime' = 'createdAt',
     @Query('sortOrder') sortOrder: 'ASC' | 'DESC' = 'DESC',
-    @Query('limit') limit = 50,
-    @Query('offset') offset = 0
+    @Query('limit') limitValue?: string,
+    @Query('offset') offsetValue?: string
   ) {
     try {
       // 如果传入 id，返回单个任务
@@ -84,6 +89,11 @@ export class JobController {
       }
 
       // 否则返回任务列表
+      const { limit, offset } = normalizePagination(
+        limitValue,
+        offsetValue,
+        50
+      );
       let result;
 
       if (status) {
@@ -151,26 +161,47 @@ export class JobController {
     @Query('streamerName') streamerName?: string,
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
-    @Query('minSegmentCount') minSegmentCount?: string
+    @Query('minSegmentCount') minSegmentCount?: string,
+    @Query('limit') limitValue?: string,
+    @Query('offset') offsetValue?: string
   ) {
     try {
-      const minSegments = minSegmentCount ? parseInt(minSegmentCount, 10) : undefined;
-      const groups = await this.jobService.findAllGroupedByDate(
+      const parsedMinSegments = Number.parseInt(
+        String(minSegmentCount ?? ''),
+        10
+      );
+      const minSegments =
+        Number.isFinite(parsedMinSegments) && parsedMinSegments >= 0
+          ? parsedMinSegments
+          : undefined;
+      const { limit, offset } = normalizePagination(
+        limitValue,
+        offsetValue,
+        24
+      );
+      const result = await this.jobService.findAllGroupedByDate(
         streamerName,
         startDate,
         endDate,
-        minSegments
+        minSegments,
+        limit,
+        offset
       );
 
       // 转换为数组格式，按日期降序排列
-      const result = Object.entries(groups)
+      const groups = Object.entries(result.groups)
         .sort(([a], [b]) => b.localeCompare(a))
         .map(([date, jobs]) => ({
           date,
           jobs,
         }));
 
-      return { groups: result };
+      return {
+        groups,
+        total: result.total,
+        limit,
+        offset,
+      };
     } catch (error) {
       this.ctx.logger.error('Failed to browse jobs', {
         error: error instanceof Error ? error.message : String(error),
@@ -529,6 +560,7 @@ export class JobController {
         platform,
         streamerId
       );
+      const persistedStreamUrl = sanitizeStreamUrl(resolvedStream.url);
 
       // 创建任务记录（先设为 PENDING）
       const job = await this.jobService.create({
@@ -537,11 +569,11 @@ export class JobController {
         roomName: status.title,
         roomId: streamer.roomId,
         platform,
-        streamUrl: resolvedStream.url,
+        streamUrl: persistedStreamUrl,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
         metadata: {
-          stream_url: resolvedStream.url,
+          stream_url: persistedStreamUrl,
           danmaku_url: danmakuUrl,
           requestedQuality,
           effectiveQuality: resolvedStream.effectiveQuality,
@@ -561,6 +593,7 @@ export class JobController {
           platform,
           streamerId,
           streamUrl: resolvedStream.url,
+          streamHeaders: resolvedStream.headers,
           danmakuUrl,
           roomId: streamer.roomId,
           outputDir: path.join(process.cwd(), 'temp', job.id),
@@ -574,11 +607,10 @@ export class JobController {
         this.ctx.logger.info(`Recording started manually: ${job.jobId}`);
       } catch (startError) {
         // 启动失败，标记 Job 为 FAILED
-        await this.jobService.updateStatus(
-          job.id,
-          JOB_STATUS.FAILED,
+        const message = sanitizeUrlQueriesInText(
           startError instanceof Error ? startError.message : String(startError)
         );
+        await this.jobService.updateStatus(job.id, JOB_STATUS.FAILED, message);
         throw startError;
       }
 
@@ -591,7 +623,9 @@ export class JobController {
       };
     } catch (error) {
       this.ctx.logger.error('Failed to start job', {
-        error: error instanceof Error ? error.message : String(error),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
       this.ctx.status = 500;
       return { error: 'Internal server error' };
@@ -734,6 +768,7 @@ export class JobController {
         oldJob.platform as Platform,
         oldJob.streamerId
       );
+      const persistedStreamUrl = sanitizeStreamUrl(resolvedStream.url);
 
       // 创建新任务（先设为 PENDING）
       const newJob = await this.jobService.create({
@@ -742,11 +777,11 @@ export class JobController {
         roomName: status.title,
         roomId: oldJob.roomId,
         platform: oldJob.platform,
-        streamUrl: resolvedStream.url,
+        streamUrl: persistedStreamUrl,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
         metadata: {
-          stream_url: resolvedStream.url,
+          stream_url: persistedStreamUrl,
           danmaku_url: danmakuUrl,
           requestedQuality,
           effectiveQuality: resolvedStream.effectiveQuality,
@@ -769,6 +804,7 @@ export class JobController {
             platform: oldJob.platform as Platform,
             streamerId: oldJob.streamerId,
             streamUrl: resolvedStream.url,
+            streamHeaders: resolvedStream.headers,
             danmakuUrl,
             roomId: oldJob.roomId,
             outputDir: path.join(process.cwd(), 'temp', newJob.id),
@@ -783,10 +819,13 @@ export class JobController {
         this.ctx.logger.info(`Retry recording started: ${newJob.jobId}`);
       } catch (startError) {
         // 启动失败，标记 Job 为 FAILED
+        const message = sanitizeUrlQueriesInText(
+          startError instanceof Error ? startError.message : String(startError)
+        );
         await this.jobService.updateStatus(
           newJob.id,
           JOB_STATUS.FAILED,
-          startError instanceof Error ? startError.message : String(startError)
+          message
         );
         throw startError;
       }
@@ -795,7 +834,9 @@ export class JobController {
       return { newJobId: newJob.jobId };
     } catch (error) {
       this.ctx.logger.error('Failed to retry job', {
-        error: error instanceof Error ? error.message : String(error),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
       this.ctx.status = 500;
       return { error: 'Internal server error' };

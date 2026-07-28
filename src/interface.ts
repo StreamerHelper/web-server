@@ -249,6 +249,11 @@ export interface PlatformAdapter {
 
 export interface ResolvedStream {
   url: string;
+  /**
+   * Ephemeral request headers returned by a platform resolver.
+   * They may contain short-lived credentials and must never be persisted.
+   */
+  headers?: Record<string, string>;
   requestedQuality?: RecordingQuality;
   effectiveQuality?: RecordingQuality;
   qualityApplied: boolean;
@@ -521,13 +526,42 @@ export interface BilibiliCredential {
 
 // ============ 抖音凭证相关 ============
 
-/** 抖音 Web Cookie 凭证 */
+export type DouyinAuthState =
+  | 'unconfigured'
+  | 'unknown'
+  | 'validating'
+  | 'valid'
+  | 'challenged'
+  | 'expired';
+
+export type DouyinAuthFailureCode =
+  | 'BROWSER_UNAVAILABLE'
+  | 'CAPTCHA_REQUIRED'
+  | 'SECONDARY_VERIFICATION_REQUIRED'
+  | 'SESSION_EXPIRED'
+  | 'PROFILE_MIGRATION_REQUIRED'
+  | 'TRANSIENT_ERROR';
+
+/**
+ * 抖音浏览器身份状态元数据。
+ *
+ * 实际登录态只保存在专用 Chromium profile 中。cookieHeader 是旧版本迁移字段，
+ * 新代码不得再把它作为长期身份来源。
+ */
 export interface DouyinCredential {
   id?: string;
-  cookieHeader: string;
+  slot?: string;
+  state?: DouyinAuthState;
+  cookieHeader?: string | null;
   cookieNames: string[];
   verifiedAt?: Date | null;
+  authExpiresAt?: Date | null;
+  stateChangedAt?: Date | null;
+  lastValidationCode?: DouyinAuthFailureCode | null;
   lastValidationError?: string | null;
+  operationId?: string | null;
+  generation?: number;
+  version?: number;
   createdAt?: Date;
   updatedAt?: Date;
 }

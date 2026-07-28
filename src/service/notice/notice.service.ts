@@ -9,6 +9,7 @@ import {
 import { LoggerLevel, MidwayLogger } from '@midwayjs/logger';
 import { createHash } from 'crypto';
 import { format, inspect } from 'util';
+import { sanitizeUrlQueriesInText } from '../../utils/sensitive-url';
 import { NoticeLoggerTransport } from './notice-logger.transport';
 import {
   NormalizedNotice,
@@ -23,7 +24,7 @@ import { ServerChanNoticeChannel } from './server-chan.notice-channel';
 
 const NOTICE_TRANSPORT_NAME = 'notice';
 const SENSITIVE_KEY =
-  /password|passwd|secret|token|cookie|authorization|api[-_]?key|access[-_]?key|send[-_]?key|signature/i;
+  /password|passwd|secret|token|cookie|authorization|api[-_]?key|access[-_]?key|send[-_]?key|signature|stream[-_]?url/i;
 
 @Provide()
 @Scope(ScopeEnum.Singleton)
@@ -315,8 +316,8 @@ function sanitizeValue(
   if (value instanceof Error) {
     return {
       name: value.name,
-      message: value.message,
-      stack: value.stack,
+      message: redactSensitiveText(value.message),
+      stack: value.stack ? redactSensitiveText(value.stack) : value.stack,
     };
   }
   if (Array.isArray(value)) {
@@ -343,7 +344,7 @@ function sanitizeValue(
 }
 
 function redactSensitiveText(value: string): string {
-  return value
+  return sanitizeUrlQueriesInText(value)
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
     .replace(
       /\b(password|passwd|secret|token|cookie|authorization|api[-_]?key|send[-_]?key)\b(\s*[:=]\s*)([^,\s;}]+)/gi,

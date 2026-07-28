@@ -104,11 +104,16 @@ describe('NoticeService', () => {
       level: 'error',
       meta: {},
       args: [
-        'Provider request failed token=private-token',
+        'Provider request failed token=private-token at https://pull.example/live.flv?auth_key=private-url-token',
         {
           cookie: 'private-cookie',
+          streamUrl:
+            'https://pull.example/live.flv?auth_key=private-structured-url',
           nested: { apiKey: 'private-key', status: 401 },
         },
+        new Error(
+          'stream failed https://pull.example/live.flv?auth_key=private-error-url'
+        ),
       ],
     });
     await new Promise(resolve => setImmediate(resolve));
@@ -119,6 +124,10 @@ describe('NoticeService', () => {
     expect(sentNotice.content).not.toContain('private-cookie');
     expect(sentNotice.content).not.toContain('private-key');
     expect(sentNotice.content).not.toContain('private-token');
+    expect(sentNotice.content).not.toContain('private-url-token');
+    expect(sentNotice.content).not.toContain('private-structured-url');
+    expect(sentNotice.content).not.toContain('private-error-url');
+    expect(sentNotice.content).toContain('https://pull.example/live.flv');
   });
 
   it('attaches to the Midway app logger without changing call sites', async () => {

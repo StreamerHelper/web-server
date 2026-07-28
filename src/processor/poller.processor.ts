@@ -10,6 +10,10 @@ import {
   normalizeAutoDeleteSettings,
   resolveRecordingQuality,
 } from '../utils/record-settings';
+import {
+  sanitizeStreamUrl,
+  sanitizeUrlQueriesInText,
+} from '../utils/sensitive-url';
 
 /**
  * 主播状态轮询任务
@@ -143,6 +147,7 @@ export class PollerProcessor implements IProcessor {
         platform,
         streamerId
       );
+      const persistedStreamUrl = sanitizeStreamUrl(resolvedStream.url);
 
       // 创建 Job 记录（先设为 PENDING，启动成功后再更新为 RECORDING）
       const job = await this.jobService.create({
@@ -151,11 +156,11 @@ export class PollerProcessor implements IProcessor {
         roomName: status.title,
         roomId: streamer.roomId,
         platform,
-        streamUrl: resolvedStream.url,
+        streamUrl: persistedStreamUrl,
         danmakuUrl,
         status: JOB_STATUS.PENDING,
         metadata: {
-          stream_url: resolvedStream.url,
+          stream_url: persistedStreamUrl,
           danmaku_url: danmakuUrl,
           requestedQuality,
           effectiveQuality: resolvedStream.effectiveQuality,
@@ -179,6 +184,7 @@ export class PollerProcessor implements IProcessor {
           platform,
           streamerId,
           streamUrl: resolvedStream.url,
+          streamHeaders: resolvedStream.headers,
           danmakuUrl,
           roomId: streamer.roomId,
           outputDir: path.join(process.cwd(), 'temp', job.id),
@@ -197,18 +203,26 @@ export class PollerProcessor implements IProcessor {
         await this.streamerService.updateLastLiveTime(id);
       } catch (startError) {
         // 启动失败，标记 Job 为 FAILED
-        await this.jobService.updateStatus(
-          job.id,
-          JOB_STATUS.FAILED,
+        const message = sanitizeUrlQueriesInText(
           startError instanceof Error ? startError.message : String(startError)
         );
+        await this.jobService.updateStatus(job.id, JOB_STATUS.FAILED, message);
         throw startError;
       }
     } catch (error) {
+      if ((error as { code?: string })?.code === 'DOUYIN_BACKOFF') {
+        this.logger.debug('Douyin resolver is in cooldown', {
+          streamerId,
+          platform,
+        });
+        return;
+      }
       this.logger.error('Failed to check streamer', {
         streamerId,
         platform,
-        error: error instanceof Error ? error : String(error),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
     }
   }

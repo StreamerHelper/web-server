@@ -28,7 +28,8 @@ describe('Recording abnormal exit logging', () => {
       jobId: 'display-123',
       platform: 'bilibili',
       streamerId: 'streamer-1',
-      streamUrl: 'https://example.com/live.flv',
+      streamUrl:
+        'https://example.com/live.flv?auth_key=private-stream-url#fragment',
       danmakuUrl: 'wss://example.com/danmaku',
       roomId: 'room-1',
       outputDir: '/tmp/job-123',
@@ -76,10 +77,14 @@ describe('Recording abnormal exit logging', () => {
         reason: 'heartbeat_timeout',
         finalStatus: JOB_STATUS.FAILED,
         failureReason: 'Timed out waiting for uploads',
+        streamUrl: 'https://example.com/live.flv',
         ffmpegRestartAttempts: 2,
         videoSegments: 1,
         danmakuSegments: 1,
       })
+    );
+    expect(JSON.stringify(failureLogger.error.mock.calls[0])).not.toContain(
+      'private-stream-url'
     );
   });
 

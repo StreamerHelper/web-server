@@ -14,12 +14,16 @@ import {
   SegmentInfo,
   StreamStatus,
 } from '../interface';
+import {
+  sanitizeStreamUrl,
+  sanitizeUrlQueriesInText,
+} from '../utils/sensitive-url';
+import { parseVideoSegmentTimestamp } from '../utils/video-segment-time';
 import { DanmakuManager } from './danmaku.service';
 import { FFmpegExitEvent, FFmpegService } from './ffmpeg.service';
 import { HighlightService } from './highlight.service';
 import { JobService } from './job.service';
 import { TranscriptSchedulerService } from './transcript-scheduler.service';
-import { parseVideoSegmentTimestamp } from '../utils/video-segment-time';
 
 /**
  * 录制选项（由调用方提供）
@@ -30,6 +34,8 @@ export interface RecordingInputOptions {
   platform: Platform;
   streamerId: string;
   streamUrl: string;
+  /** Ephemeral platform headers; never persist them in job metadata. */
+  streamHeaders?: Record<string, string>;
   danmakuUrl: string;
   roomId: string;
   outputDir: string;
@@ -174,6 +180,7 @@ export class Recording extends EventEmitter {
   readonly platform: Platform;
   readonly streamerId: string;
   streamUrl: string;
+  private streamHeaders?: Record<string, string>;
   readonly danmakuUrl: string;
   readonly roomId: string;
   readonly outputDir: string;
@@ -242,7 +249,8 @@ export class Recording extends EventEmitter {
   private ffmpegRestartTimer: NodeJS.Timeout | null = null;
   private lastFFmpegOutputTime = 0; // FFmpeg 最后输出时间
   private ffmpegRestartAttempts = 0;
-  private isHandlingHeartbeatTimeout = false;
+  private streamRecoveryInFlight: Promise<void> | null = null;
+  private streamRecoveryGeneration = 0;
   private isStreamRecoveryPendingOutput = false;
   private failureReason: string | null = null;
   private recordingFailed = false;
@@ -266,6 +274,7 @@ export class Recording extends EventEmitter {
     this.platform = options.platform;
     this.streamerId = options.streamerId;
     this.streamUrl = options.streamUrl;
+    this.streamHeaders = options.streamHeaders;
     this.danmakuUrl = options.danmakuUrl;
     this.roomId = options.roomId;
     this.outputDir = options.outputDir;
@@ -356,7 +365,7 @@ export class Recording extends EventEmitter {
       // 2. 更新 Job 状态
       await this.jobService.updateStatus(this.id, JOB_STATUS.RECORDING);
       await this.jobService.updateMetadata(this.id, {
-        stream_url: this.streamUrl,
+        stream_url: sanitizeStreamUrl(this.streamUrl),
         danmaku_url: this.danmakuUrl,
         requestedQuality: this.requestedQuality,
         effectiveQuality: this.effectiveQuality,
@@ -412,16 +421,16 @@ export class Recording extends EventEmitter {
         danmakuSegments: this.danmakuSegments.length,
       });
     } catch (error) {
-      this.rejectStarted(
-        error instanceof Error ? error : new Error(String(error))
+      const message = sanitizeUrlQueriesInText(
+        error instanceof Error ? error.message : String(error)
       );
+      this.rejectStarted(new Error(message));
       this.logger.error('Recording failed', {
         id: this.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
       });
       this.recordingFailed = true;
-      this.failureReason =
-        error instanceof Error ? error.message : String(error);
+      this.failureReason = message;
 
       await this.stop('failed');
 
@@ -443,6 +452,7 @@ export class Recording extends EventEmitter {
     }
 
     this.isStopping = true;
+    this.streamRecoveryGeneration += 1;
     this.logger.info('Stopping recording', { id: this.id, reason });
 
     // 停止心跳定时器
@@ -580,7 +590,9 @@ export class Recording extends EventEmitter {
    */
   private handleFFmpegExit(event: FFmpegExitEvent): void {
     if (event.isNatural) {
-      void this.finalizeNaturalFFmpegExit(event);
+      void this.runStreamRecovery(generation =>
+        this.finalizeNaturalFFmpegExit(event, generation)
+      );
     } else if (this.isStopping) {
       this.logger.info('FFmpeg process exited - stopped by user', {
         id: this.id,
@@ -599,11 +611,18 @@ export class Recording extends EventEmitter {
   }
 
   private async finalizeNaturalFFmpegExit(
-    event: FFmpegExitEvent
+    event: FFmpegExitEvent,
+    recoveryGeneration: number
   ): Promise<void> {
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+      return;
+    }
     try {
       await this.processListChanges();
     } catch (error) {
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error('Failed to process remaining segments', {
         id: this.id,
@@ -614,6 +633,9 @@ export class Recording extends EventEmitter {
       this.resolveEndReason?.('failed');
       return;
     }
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+      return;
+    }
 
     this.logger.info('FFmpeg process exited naturally', {
       id: this.id,
@@ -621,7 +643,12 @@ export class Recording extends EventEmitter {
       signal: event.signal,
     });
 
-    if (await this.continueRecordingAfterNaturalExit(event)) {
+    if (
+      await this.continueRecordingAfterNaturalExit(event, recoveryGeneration)
+    ) {
+      return;
+    }
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
       return;
     }
 
@@ -634,13 +661,20 @@ export class Recording extends EventEmitter {
   }
 
   private async continueRecordingAfterNaturalExit(
-    event: FFmpegExitEvent
+    event: FFmpegExitEvent,
+    recoveryGeneration: number
   ): Promise<boolean> {
-    if (this.isStopping || !this.refreshStream) {
+    if (
+      this.isStreamRecoveryCancelled(recoveryGeneration) ||
+      !this.refreshStream
+    ) {
       return false;
     }
 
     const liveStatus = await this.safeCheckLiveStatus();
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+      return true;
+    }
     if (liveStatus && !liveStatus.isLive) {
       this.logger.info('Natural FFmpeg exit confirmed stream is offline', {
         id: this.id,
@@ -665,22 +699,33 @@ export class Recording extends EventEmitter {
 
     try {
       await this.refreshStreamUrl();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return true;
+      }
       this.ffmpegRestartAttempts = 0;
       await this.startFFmpegProcess();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return true;
+      }
       this.logger.info('FFmpeg continued after refreshing stream URL', {
         id: this.id,
         platform: this.platform,
         streamerId: this.streamerId,
-        streamUrl: this.streamUrl,
+        streamUrl: sanitizeStreamUrl(this.streamUrl),
       });
       return true;
     } catch (error) {
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return true;
+      }
       if (this.isOfflineStreamError(error)) {
         this.logger.info('Stream refresh reports stream is offline', {
           id: this.id,
           platform: this.platform,
           streamerId: this.streamerId,
-          error: error instanceof Error ? error.message : String(error),
+          error: sanitizeUrlQueriesInText(
+            error instanceof Error ? error.message : String(error)
+          ),
         });
         return false;
       }
@@ -691,7 +736,9 @@ export class Recording extends EventEmitter {
           id: this.id,
           platform: this.platform,
           streamerId: this.streamerId,
-          error: error instanceof Error ? error.message : String(error),
+          error: sanitizeUrlQueriesInText(
+            error instanceof Error ? error.message : String(error)
+          ),
         }
       );
       this.scheduleFFmpegRestart(
@@ -719,7 +766,9 @@ export class Recording extends EventEmitter {
         id: this.id,
         platform: this.platform,
         streamerId: this.streamerId,
-        error: error instanceof Error ? error.message : String(error),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
       return null;
     }
@@ -735,6 +784,7 @@ export class Recording extends EventEmitter {
     this.resetHeartbeatTimer();
     await this.ffmpeg.start({
       streamUrl: this.streamUrl,
+      headers: this.streamHeaders,
       outputDir: this.videoDir,
       segmentTime: this.segmentTime,
       listFilePath: this.pathsConfig.listFilePath,
@@ -760,6 +810,7 @@ export class Recording extends EventEmitter {
       return;
     }
 
+    const safeLastError = sanitizeUrlQueriesInText(lastError);
     this.ffmpegRestartAttempts += 1;
 
     if (this.ffmpegRestartAttempts > Recording.MAX_FFMPEG_RESTART_ATTEMPTS) {
@@ -781,7 +832,7 @@ export class Recording extends EventEmitter {
       streamRecoveryReason: reason,
       streamRecoveryLastAt: new Date().toISOString(),
       streamRecoveryNextRetryAt: nextRetryAt,
-      streamRecoveryLastError: lastError,
+      streamRecoveryLastError: safeLastError,
       lastFFmpegOutputTime: this.lastFFmpegOutputTime,
     });
 
@@ -793,25 +844,34 @@ export class Recording extends EventEmitter {
       maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
       delayMs,
       reason,
-      lastError,
+      lastError: safeLastError,
     });
 
     this.ffmpegRestartTimer = setTimeout(() => {
       this.ffmpegRestartTimer = null;
-      void this.restartFFmpegProcess(reason);
+      void this.runStreamRecovery(generation =>
+        this.restartFFmpegProcess(reason, generation)
+      );
     }, delayMs);
   }
 
   private async restartFFmpegProcess(
-    reason: FFmpegRecoveryReason
+    reason: FFmpegRecoveryReason,
+    recoveryGeneration: number
   ): Promise<void> {
-    if (this.isStopping) {
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
       return;
     }
 
     try {
       await this.refreshStreamUrl();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       await this.startFFmpegProcess();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       this.persistStreamRecoveryState({
         streamRecoveryInProgress: true,
         streamRecoveryAttempt: this.ffmpegRestartAttempts,
@@ -826,16 +886,21 @@ export class Recording extends EventEmitter {
         attempt: this.ffmpegRestartAttempts,
         maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
         reason,
-        streamUrl: this.streamUrl,
+        streamUrl: sanitizeStreamUrl(this.streamUrl),
       });
     } catch (error) {
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       if (this.isOfflineStreamError(error)) {
         this.logger.info('Stream refresh reports stream is offline', {
           id: this.id,
           platform: this.platform,
           streamerId: this.streamerId,
           reason,
-          error: error instanceof Error ? error.message : String(error),
+          error: sanitizeUrlQueriesInText(
+            error instanceof Error ? error.message : String(error)
+          ),
         });
         this.persistStreamRecoveryState({
           streamRecoveryInProgress: false,
@@ -854,7 +919,9 @@ export class Recording extends EventEmitter {
         attempt: this.ffmpegRestartAttempts,
         maxAttempts: Recording.MAX_FFMPEG_RESTART_ATTEMPTS,
         reason,
-        error: error instanceof Error ? error.message : String(error),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
 
       this.scheduleFFmpegRestart(
@@ -932,12 +999,13 @@ export class Recording extends EventEmitter {
 
     const resolved = await this.refreshStream();
     this.streamUrl = resolved.url;
+    this.streamHeaders = resolved.headers;
     this.effectiveQuality = resolved.effectiveQuality;
     this.qualityApplied = resolved.qualityApplied;
     this.qualityNote = resolved.note;
 
     await this.jobService.updateMetadata(this.id, {
-      stream_url: resolved.url,
+      stream_url: sanitizeStreamUrl(resolved.url),
       effectiveQuality: resolved.effectiveQuality,
       qualityApplied: resolved.qualityApplied,
       qualityNote: resolved.note,
@@ -1204,10 +1272,13 @@ export class Recording extends EventEmitter {
       clearTimeout(this.heartbeatTimer);
     }
 
-    this.heartbeatTimer = setTimeout(async () => {
+    const heartbeatTimer = setTimeout(async () => {
       // 定时器触发 = FFmpeg 已超时无输出
       // 检查 Job 状态
       const currentJob = await this.jobService.findById(this.id);
+      if (this.heartbeatTimer !== heartbeatTimer || this.isStopping) {
+        return;
+      }
 
       if (!currentJob) {
         this.logger.error('Job not found');
@@ -1230,14 +1301,21 @@ export class Recording extends EventEmitter {
 
       await this.handleHeartbeatTimeout();
     }, this.recordingConfig.heartbeatTimeout);
+    this.heartbeatTimer = heartbeatTimer;
   }
 
   private async handleHeartbeatTimeout(): Promise<void> {
-    if (this.isHandlingHeartbeatTimeout || this.isStopping) {
+    return await this.runStreamRecovery(generation =>
+      this.recoverAfterHeartbeatTimeout(generation)
+    );
+  }
+
+  private async recoverAfterHeartbeatTimeout(
+    recoveryGeneration: number
+  ): Promise<void> {
+    if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
       return;
     }
-
-    this.isHandlingHeartbeatTimeout = true;
     const nextAttempt = Math.min(
       this.ffmpegRestartAttempts + 1,
       Recording.MAX_FFMPEG_RESTART_ATTEMPTS
@@ -1253,8 +1331,14 @@ export class Recording extends EventEmitter {
         streamRecoveryLastError: '',
         lastFFmpegOutputTime: this.lastFFmpegOutputTime,
       });
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
 
       const liveStatus = await this.safeCheckLiveStatus();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       if (liveStatus && !liveStatus.isLive) {
         this.logger.info('Heartbeat timeout confirmed stream is offline', {
           id: this.id,
@@ -1281,6 +1365,9 @@ export class Recording extends EventEmitter {
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
 
       this.logger.warn('FFmpeg heartbeat timeout, recovering stream', {
         id: this.id,
@@ -1291,6 +1378,9 @@ export class Recording extends EventEmitter {
       });
 
       await this.ffmpeg.stop();
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       this.scheduleFFmpegRestart(
         {
           code: null,
@@ -1300,6 +1390,9 @@ export class Recording extends EventEmitter {
         'heartbeat_timeout'
       );
     } catch (error) {
+      if (this.isStreamRecoveryCancelled(recoveryGeneration)) {
+        return;
+      }
       this.logger.error('Failed to handle FFmpeg heartbeat timeout', {
         id: this.id,
         error: error instanceof Error ? error.message : String(error),
@@ -1312,9 +1405,33 @@ export class Recording extends EventEmitter {
         },
         'heartbeat_timeout'
       );
-    } finally {
-      this.isHandlingHeartbeatTimeout = false;
     }
+  }
+
+  private runStreamRecovery(
+    operation: (generation: number) => Promise<void>
+  ): Promise<void> {
+    if (this.isStopping) {
+      return Promise.resolve();
+    }
+    if (this.streamRecoveryInFlight) {
+      return this.streamRecoveryInFlight;
+    }
+
+    const generation = this.streamRecoveryGeneration;
+    const tracked = Promise.resolve()
+      .then(() => operation(generation))
+      .finally(() => {
+        if (this.streamRecoveryInFlight === tracked) {
+          this.streamRecoveryInFlight = null;
+        }
+      });
+    this.streamRecoveryInFlight = tracked;
+    return tracked;
+  }
+
+  private isStreamRecoveryCancelled(generation: number): boolean {
+    return this.isStopping || generation !== this.streamRecoveryGeneration;
   }
 
   private markStreamRecovered(): void {
@@ -1719,7 +1836,7 @@ export class Recording extends EventEmitter {
       startTime: this.startTime,
       endTime,
       durationMs: endTime - this.startTime,
-      streamUrl: this.streamUrl,
+      streamUrl: sanitizeStreamUrl(this.streamUrl),
       danmakuUrl: this.danmakuUrl,
       requestedQuality: this.requestedQuality,
       effectiveQuality: this.effectiveQuality,

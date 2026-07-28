@@ -8,6 +8,10 @@ import {
   StreamStatus,
 } from '../interface';
 import { getConfig } from '../config/loader';
+import {
+  sanitizeStreamUrl,
+  sanitizeUrlQueriesInText,
+} from '../utils/sensitive-url';
 
 interface DouyinUser {
   nickname?: string;
@@ -62,6 +66,12 @@ interface DouyinRoomSnapshot {
   room: DouyinRoom;
   webRid: string;
   anchor?: DouyinUser;
+  fallbackStreamHeaders?: Record<string, string>;
+  resolverStream?: {
+    url: string;
+    headers?: Record<string, string>;
+    effectiveQuality?: RecordingQuality;
+  };
 }
 
 interface StreamCandidate {
@@ -76,17 +86,65 @@ type QualityBucket = 'origin' | 'high' | 'medium' | 'low' | 'unknown';
 
 const DOUYIN_LIVE_STATUS = 2;
 const REQUEST_TIMEOUT_MS = 15_000;
-const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
-const GUEST_COOKIE_TTL_MS = 10 * 60 * 1000;
-const IGNORED_DOUYIN_COOKIE_NAMES = new Set(['s_v_web_id']);
+const RESOLVER_REQUEST_TIMEOUT_MS = 25_000;
+const RESOLVER_BUSY_RETRY_MS = 5_000;
+export const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
+export const DOUYIN_BACKOFF_ERROR_CODE = 'DOUYIN_BACKOFF';
+const GUEST_COOKIE_TTL_MS = 24 * 60 * 60 * 1000;
+const RESOLVER_CACHE_TTL_MS = 5_000;
+const RESOLVER_CACHE_MAX_ENTRIES = 256;
+const CIRCUIT_BASE_DELAY_MS = 30_000;
+const CIRCUIT_MAX_DELAY_MS = 5 * 60 * 1000;
+const CIRCUIT_MAX_ENTRIES = 256;
+const GLOBAL_CIRCUIT_KEY = '*';
 
-export type DouyinCookieProvider = () => Promise<string | undefined>;
+export type DouyinBrowserPageOutcome =
+  | 'ok'
+  | 'challenged'
+  | 'expired'
+  | 'transient';
+
+export interface DouyinBrowserPageResult {
+  html: string;
+  outcome: DouyinBrowserPageOutcome;
+  error?: string;
+}
+
+export interface DouyinAdapterOptions {
+  browserPageProvider?: (webRid: string) => Promise<DouyinBrowserPageResult>;
+  onBrowserOutcome?: (
+    outcome: DouyinBrowserPageOutcome,
+    error?: string
+  ) => Promise<void>;
+}
+
+type DouyinResolverResponse =
+  | {
+      state: 'live';
+      roomId?: string;
+      title?: string;
+      stream: {
+        url: string;
+        headers?: Record<string, string>;
+        effectiveQuality?: RecordingQuality;
+      };
+    }
+  | {
+      state: 'offline';
+      roomId?: string;
+      title?: string;
+    }
+  | {
+      state: 'unavailable';
+      code: string;
+      message: string;
+    };
 
 /**
  * 抖音直播适配器。
  *
- * 抖音 Web 直播页会把房间状态和 stream_url 写在 __pace_f 推送的数据块里。
- * 这里优先解析页面内公开播放数据，失败时仅对数字 room_id 尝试旧版 reflow/info 接口。
+ * 录播主链只使用匿名身份：动态申请 ttwid，解析公开页面及 reflow 数据。
+ * 持久化浏览器只作为最后回退，账号登录态不是正常录制的前置条件。
  */
 export class DouyinAdapter implements PlatformAdapter {
   readonly name: Platform = 'douyin';
@@ -97,6 +155,14 @@ export class DouyinAdapter implements PlatformAdapter {
         expiresAt: number;
       }
     | undefined;
+  private static circuits = new Map<
+    string,
+    { failureCount: number; retryAt: number; reason: string }
+  >();
+  private static resolverCache = new Map<
+    string,
+    { expiresAt: number; snapshot: DouyinRoomSnapshot }
+  >();
 
   private readonly liveBaseUrl = 'https://live.douyin.com';
   private readonly reflowApis = [
@@ -105,15 +171,15 @@ export class DouyinAdapter implements PlatformAdapter {
   ];
 
   private logger: ILogger;
-  private cookieProvider?: DouyinCookieProvider;
+  private options: DouyinAdapterOptions;
 
-  constructor(logger: ILogger, cookieProvider?: DouyinCookieProvider) {
+  constructor(logger: ILogger, options?: DouyinAdapterOptions) {
     this.logger = logger;
-    this.cookieProvider = cookieProvider;
+    this.options = options || {};
   }
 
   async getStreamerStatus(streamerId: string): Promise<StreamStatus> {
-    const snapshot = await this.fetchRoomSnapshot(streamerId);
+    const snapshot = await this.fetchRoomSnapshot(streamerId, 'high');
     const { room, webRid, anchor } = snapshot;
 
     return {
@@ -130,7 +196,7 @@ export class DouyinAdapter implements PlatformAdapter {
     streamerId: string,
     quality: RecordingQuality = 'high'
   ): Promise<ResolvedStream> {
-    const snapshot = await this.fetchRoomSnapshot(streamerId);
+    const snapshot = await this.fetchRoomSnapshot(streamerId, quality);
     const { room, webRid } = snapshot;
 
     if (!this.isLive(room)) {
@@ -149,11 +215,24 @@ export class DouyinAdapter implements PlatformAdapter {
       );
     }
 
+    if (snapshot.resolverStream) {
+      return {
+        url: snapshot.resolverStream.url,
+        headers: snapshot.resolverStream.headers,
+        requestedQuality: quality,
+        effectiveQuality: snapshot.resolverStream.effectiveQuality || quality,
+        qualityApplied: true,
+      };
+    }
+
     this.mergeOriginStreams(room.stream_url);
 
+    const streamHeaders =
+      snapshot.fallbackStreamHeaders ||
+      this.buildStreamHeaders(webRid, await this.buildDouyinCookie(webRid));
     const candidates = this.buildStreamCandidates(room.stream_url, quality);
     for (const candidate of candidates) {
-      if (await this.validateStreamUrl(candidate.url, webRid)) {
+      if (await this.validateStreamUrl(candidate.url, streamHeaders)) {
         this.logger?.debug('Using Douyin stream URL', {
           streamerId,
           webRid,
@@ -162,6 +241,7 @@ export class DouyinAdapter implements PlatformAdapter {
         });
         return {
           url: candidate.url,
+          headers: streamHeaders,
           requestedQuality: quality,
           effectiveQuality: candidate.effectiveQuality,
           qualityApplied: true,
@@ -198,16 +278,37 @@ export class DouyinAdapter implements PlatformAdapter {
   }
 
   private async fetchRoomSnapshot(
-    streamerId: string
+    streamerId: string,
+    quality: RecordingQuality = 'high'
   ): Promise<DouyinRoomSnapshot> {
     const webRid = await this.resolveRoomInput(streamerId);
+    this.pruneResolverCache();
+    const resolverSnapshot = await this.fetchResolverRoom(webRid, quality);
+    if (resolverSnapshot) {
+      this.resetRoomCircuit(webRid);
+      return resolverSnapshot;
+    }
+    this.assertFallbackCircuitClosed(webRid);
+
     const pageUrl = `${this.liveBaseUrl}/${encodeURIComponent(webRid)}`;
     let captchaDetected = false;
+    const fallbackCookie = await this.buildDouyinCookie(webRid);
+    const fallbackStreamHeaders = this.buildStreamHeaders(
+      webRid,
+      fallbackCookie
+    );
+
+    if (/^\d{10,}$/.test(webRid)) {
+      const reflow = await this.fetchReflowRoom(webRid, fallbackCookie);
+      if (reflow) {
+        this.resetFallbackCircuit(webRid);
+        return { ...reflow, fallbackStreamHeaders };
+      }
+    }
 
     try {
-      const cookie = await this.buildDouyinCookie(webRid);
       const html = await this.fetchText(pageUrl, {
-        headers: this.buildPageHeaders(webRid, cookie),
+        headers: this.buildPageHeaders(webRid, fallbackCookie),
       });
 
       if (this.isCaptchaPage(html)) {
@@ -215,7 +316,8 @@ export class DouyinAdapter implements PlatformAdapter {
       } else {
         const snapshot = this.extractRoomSnapshot(html, webRid);
         if (snapshot) {
-          return snapshot;
+          this.resetFallbackCircuit(webRid);
+          return { ...snapshot, fallbackStreamHeaders };
         }
       }
     } catch (error) {
@@ -226,23 +328,51 @@ export class DouyinAdapter implements PlatformAdapter {
       });
     }
 
-    if (/^\d{10,}$/.test(webRid)) {
-      const fallback = await this.fetchReflowRoom(webRid);
-      if (fallback) {
-        return fallback;
+    if (this.options.browserPageProvider) {
+      try {
+        const browserResult = await this.options.browserPageProvider(webRid);
+        await this.options.onBrowserOutcome?.(
+          browserResult.outcome,
+          browserResult.error
+        );
+        if (browserResult.outcome === 'challenged') {
+          captchaDetected = true;
+        } else if (browserResult.outcome === 'ok') {
+          const snapshot = this.extractRoomSnapshot(browserResult.html, webRid);
+          if (snapshot) {
+            this.resetFallbackCircuit(webRid);
+            return { ...snapshot, fallbackStreamHeaders };
+          }
+        }
+      } catch (error) {
+        this.logger?.debug('Douyin browser fallback failed', {
+          streamerId,
+          webRid,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await this.options.onBrowserOutcome?.(
+          'transient',
+          error instanceof Error ? error.message : String(error)
+        );
       }
     }
 
     if (captchaDetected) {
+      const retryAfterMs = this.openCircuit('captcha', webRid);
       throw new PlatformError(
-        'Douyin captcha verification required. Configure a verified Douyin web Cookie in settings.platforms.douyin.cookie.',
+        `Douyin captcha verification required; anonymous resolver will retry in ${Math.ceil(
+          retryAfterMs / 1000
+        )} seconds.`,
         'douyin',
         DOUYIN_CAPTCHA_ERROR_CODE
       );
     }
 
+    const retryAfterMs = this.openCircuit('room-info', webRid);
     throw new PlatformError(
-      'Can not extract Douyin room info',
+      `Can not extract Douyin room info; resolver will retry in ${Math.ceil(
+        retryAfterMs / 1000
+      )} seconds.`,
       'douyin',
       'ROOM_INFO_ERROR'
     );
@@ -409,7 +539,8 @@ export class DouyinAdapter implements PlatformAdapter {
   }
 
   private async fetchReflowRoom(
-    roomId: string
+    roomId: string,
+    cookie: string
   ): Promise<DouyinRoomSnapshot | null> {
     for (const api of this.reflowApis) {
       try {
@@ -417,7 +548,6 @@ export class DouyinAdapter implements PlatformAdapter {
           room_id: roomId,
           live_id: '1',
         });
-        const cookie = await this.buildDouyinCookie(roomId);
         const data = await this.fetchJson<any>(`${api}?${params.toString()}`, {
           headers: this.buildPageHeaders(roomId, cookie),
         });
@@ -439,6 +569,235 @@ export class DouyinAdapter implements PlatformAdapter {
     }
 
     return null;
+  }
+
+  private async fetchResolverRoom(
+    webRid: string,
+    quality: RecordingQuality
+  ): Promise<DouyinRoomSnapshot | null> {
+    const resolverUrl = process.env.DOUYIN_RESOLVER_URL?.trim();
+    if (!resolverUrl) {
+      return null;
+    }
+
+    const cacheKey = `${resolverUrl}:${webRid}:${quality}`;
+    this.pruneResolverCache();
+    const cached = DouyinAdapter.resolverCache.get(cacheKey);
+    if (cached) {
+      return cached.snapshot;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      RESOLVER_REQUEST_TIMEOUT_MS
+    );
+    try {
+      const response = await fetch(new URL('/v1/douyin/resolve', resolverUrl), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          url: `${this.liveBaseUrl}/${encodeURIComponent(webRid)}`,
+          quality,
+          protocol: 'flv',
+        }),
+        signal: controller.signal,
+      });
+      const payload = this.parseResolverResponse(await response.json());
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      if (payload.state === 'unavailable') {
+        if (payload.code === 'BUSY') {
+          throw new PlatformError(
+            `Douyin resolver is busy; retry in ${Math.ceil(
+              RESOLVER_BUSY_RETRY_MS / 1000
+            )} seconds.`,
+            'douyin',
+            DOUYIN_BACKOFF_ERROR_CODE
+          );
+        }
+        throw new Error(`${payload.code}: ${payload.message}`);
+      }
+
+      const roomId = payload.roomId || webRid;
+      const snapshot: DouyinRoomSnapshot =
+        payload.state === 'live'
+          ? {
+              webRid,
+              room: {
+                id_str: roomId,
+                title: payload.title || '',
+                status: DOUYIN_LIVE_STATUS,
+                stream_url: {
+                  flv_pull_url: payload.stream.url,
+                },
+              },
+              resolverStream: {
+                url: payload.stream.url,
+                headers: this.normalizeResolverHeaders(payload.stream.headers),
+                effectiveQuality: payload.stream.effectiveQuality,
+              },
+            }
+          : {
+              webRid,
+              room: {
+                id_str: roomId,
+                title: payload.title || '',
+                status: 4,
+              },
+            };
+
+      this.pruneResolverCache();
+      if (DouyinAdapter.resolverCache.size >= RESOLVER_CACHE_MAX_ENTRIES) {
+        const oldestKey = DouyinAdapter.resolverCache.keys().next().value;
+        if (typeof oldestKey === 'string') {
+          DouyinAdapter.resolverCache.delete(oldestKey);
+        }
+      }
+      DouyinAdapter.resolverCache.set(cacheKey, {
+        expiresAt: Date.now() + RESOLVER_CACHE_TTL_MS,
+        snapshot,
+      });
+      return snapshot;
+    } catch (error) {
+      if (
+        error instanceof PlatformError &&
+        error.code === DOUYIN_BACKOFF_ERROR_CODE
+      ) {
+        throw error;
+      }
+      this.logger?.debug('Douyin resolver sidecar request failed', {
+        webRid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private parseResolverResponse(value: unknown): DouyinResolverResponse {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('Invalid Douyin resolver response');
+    }
+
+    const payload = value as Record<string, unknown>;
+    const roomId = this.optionalResolverString(payload.roomId);
+    const title = this.optionalResolverString(payload.title);
+
+    if (payload.state === 'offline') {
+      return {
+        state: 'offline',
+        roomId,
+        title,
+      };
+    }
+
+    if (payload.state === 'unavailable') {
+      if (
+        typeof payload.code !== 'string' ||
+        typeof payload.message !== 'string'
+      ) {
+        throw new Error('Invalid Douyin resolver response');
+      }
+      return {
+        state: 'unavailable',
+        code: payload.code,
+        message: payload.message,
+      };
+    }
+
+    if (
+      payload.state !== 'live' ||
+      !payload.stream ||
+      typeof payload.stream !== 'object' ||
+      Array.isArray(payload.stream)
+    ) {
+      throw new Error('Invalid Douyin resolver response');
+    }
+
+    const stream = payload.stream as Record<string, unknown>;
+    if (typeof stream.url !== 'string' || !/^https?:\/\//i.test(stream.url)) {
+      throw new Error('Invalid Douyin resolver response');
+    }
+    if (
+      stream.effectiveQuality !== undefined &&
+      !this.isRecordingQuality(stream.effectiveQuality)
+    ) {
+      throw new Error('Invalid Douyin resolver response');
+    }
+    if (
+      stream.headers !== undefined &&
+      (!stream.headers ||
+        typeof stream.headers !== 'object' ||
+        Array.isArray(stream.headers) ||
+        Object.values(stream.headers).some(value => typeof value !== 'string'))
+    ) {
+      throw new Error('Invalid Douyin resolver response');
+    }
+
+    return {
+      state: 'live',
+      roomId,
+      title,
+      stream: {
+        url: stream.url,
+        headers: stream.headers as Record<string, string> | undefined,
+        effectiveQuality: stream.effectiveQuality as
+          | RecordingQuality
+          | undefined,
+      },
+    };
+  }
+
+  private optionalResolverString(value: unknown): string | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (typeof value !== 'string') {
+      throw new Error('Invalid Douyin resolver response');
+    }
+    return value;
+  }
+
+  private isRecordingQuality(value: unknown): value is RecordingQuality {
+    return value === 'high' || value === 'medium' || value === 'low';
+  }
+
+  private pruneResolverCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of DouyinAdapter.resolverCache) {
+      if (entry.expiresAt <= now) {
+        DouyinAdapter.resolverCache.delete(key);
+      }
+    }
+  }
+
+  private normalizeResolverHeaders(
+    headers?: Record<string, string>
+  ): Record<string, string> | undefined {
+    if (!headers) {
+      return undefined;
+    }
+    const normalized: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers)) {
+      const normalizedName = name.toLowerCase();
+      if (
+        /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) &&
+        ['cookie', 'user-agent', 'referer', 'origin'].includes(
+          normalizedName
+        ) &&
+        typeof value === 'string' &&
+        !/[\r\n]/.test(value) &&
+        value.length <= 16 * 1024
+      ) {
+        normalized[name] = value;
+      }
+    }
+    return Object.keys(normalized).length > 0 ? normalized : undefined;
   }
 
   private mergeOriginStreams(streamUrl: DouyinStreamUrl): void {
@@ -616,7 +975,7 @@ export class DouyinAdapter implements PlatformAdapter {
 
   private async validateStreamUrl(
     url: string,
-    webRid: string
+    streamHeaders: Record<string, string>
   ): Promise<boolean> {
     if (!/^https?:\/\//i.test(url) && !/^rtmp:\/\//i.test(url)) {
       return false;
@@ -633,13 +992,7 @@ export class DouyinAdapter implements PlatformAdapter {
       const response = await fetch(url, {
         method: 'GET',
         headers: {
-          ...this.buildStreamHeaders(
-            webRid,
-            this.mergeCookieHeaders(
-              await this.buildConfiguredCookie(),
-              `__ac_nonce=${this.generateNonce()}`
-            )
-          ),
+          ...streamHeaders,
           Range: 'bytes=0-0',
         },
         signal: controller.signal,
@@ -648,8 +1001,10 @@ export class DouyinAdapter implements PlatformAdapter {
       return response.status < 400;
     } catch (error) {
       this.logger?.debug('Douyin stream URL validation failed', {
-        url,
-        error: error instanceof Error ? error.message : String(error),
+        url: sanitizeStreamUrl(url),
+        error: sanitizeUrlQueriesInText(
+          error instanceof Error ? error.message : String(error)
+        ),
       });
       return false;
     } finally {
@@ -664,9 +1019,24 @@ export class DouyinAdapter implements PlatformAdapter {
     }
 
     const parsed = new URL(trimmed);
+    const hostname = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== 'https:') {
+      throw new PlatformError(
+        'Unsupported Douyin room URL',
+        'douyin',
+        'UNSUPPORTED_URL'
+      );
+    }
     const direct = this.extractRoomIdFromUrl(parsed);
     if (direct) {
       return direct;
+    }
+    if (hostname !== 'v.douyin.com') {
+      throw new PlatformError(
+        'Unsupported Douyin room URL',
+        'douyin',
+        'UNSUPPORTED_URL'
+      );
     }
 
     const redirected = await this.resolveRedirect(trimmed);
@@ -689,7 +1059,10 @@ export class DouyinAdapter implements PlatformAdapter {
     const rootLiveIndex = parts.findIndex(
       (part, index) => part === 'root' && parts[index + 1] === 'live'
     );
-    if (hostname.endsWith('douyin.com') && rootLiveIndex !== -1) {
+    if (
+      (hostname === 'douyin.com' || hostname.endsWith('.douyin.com')) &&
+      rootLiveIndex !== -1
+    ) {
       return parts[rootLiveIndex + 2] || null;
     }
 
@@ -705,12 +1078,18 @@ export class DouyinAdapter implements PlatformAdapter {
   }
 
   private async resolveRedirect(url: string): Promise<string> {
-    const response = await fetch(url, {
-      redirect: 'follow',
-      headers: this.buildPageHeaders('', await this.buildDouyinCookie('')),
-    });
-    await response.body?.cancel();
-    return response.url || url;
+    return await this.fetchWithTimeout(
+      url,
+      {
+        redirect: 'follow',
+        headers: this.buildPageHeaders('', await this.buildDouyinCookie('')),
+      },
+      async response => {
+        const redirectedUrl = response.url || url;
+        await response.body?.cancel();
+        return redirectedUrl;
+      }
+    );
   }
 
   private buildPageHeaders(
@@ -751,35 +1130,76 @@ export class DouyinAdapter implements PlatformAdapter {
     return (
       getConfig().platforms?.douyin?.userAgent?.trim() ||
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+        '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
     );
   }
 
   private async buildDouyinCookie(webRid: string): Promise<string> {
     return this.mergeCookieHeaders(
       await this.getGuestCookie(webRid),
-      await this.buildConfiguredCookie(),
+      `odin_ttid=${this.generateRandomHex(160)}`,
       `__ac_nonce=${this.generateNonce()}`
     );
   }
 
-  private async buildConfiguredCookie(): Promise<string> {
-    const savedCookie = (await this.cookieProvider?.())?.trim();
-    if (savedCookie) {
-      return savedCookie;
-    }
-    return getConfig().platforms?.douyin?.cookie?.trim() || '';
-  }
-
   private async getGuestCookie(webRid: string): Promise<string> {
     const cached = DouyinAdapter.guestCookieCache;
-    if (cached && cached.expiresAt > Date.now()) {
+    if (
+      cached &&
+      cached.expiresAt > Date.now() &&
+      cached.value.includes('ttwid=')
+    ) {
       return cached.value;
     }
+    DouyinAdapter.guestCookieCache = undefined;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
+    try {
+      const response = await fetch(
+        'https://ttwid.bytedance.com/ttwid/union/register/',
+        {
+          method: 'POST',
+          headers: {
+            'User-Agent': this.getUserAgent(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            region: 'cn',
+            aid: 6383,
+            needFid: false,
+            service: 'https://www.douyin.com',
+            union: true,
+            fid: '',
+          }),
+          signal: controller.signal,
+        }
+      );
+      await response.body?.cancel();
+      const cookie = this.extractSetCookieHeader(response.headers);
+      if (!cookie.includes('ttwid=')) {
+        throw new Error('ttwid registration did not return a ttwid cookie');
+      }
+      DouyinAdapter.guestCookieCache = {
+        value: cookie,
+        expiresAt: Date.now() + GUEST_COOKIE_TTL_MS,
+      };
+      return cookie;
+    } catch (error) {
+      this.logger?.debug('Failed to register Douyin ttwid', {
+        webRid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const fallbackController = new AbortController();
+    const fallbackTimer = setTimeout(
+      () => fallbackController.abort(),
+      REQUEST_TIMEOUT_MS
+    );
     try {
       const response = await fetch(this.liveBaseUrl, {
         headers: {
@@ -789,10 +1209,17 @@ export class DouyinAdapter implements PlatformAdapter {
           'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
           Referer: `${this.liveBaseUrl}/${webRid}`,
         },
-        signal: controller.signal,
+        signal: fallbackController.signal,
       });
       await response.body?.cancel();
       const cookie = this.extractSetCookieHeader(response.headers);
+      if (!cookie.includes('ttwid=')) {
+        this.logger?.debug(
+          'Douyin fallback page did not return a ttwid cookie',
+          { webRid }
+        );
+        return '';
+      }
       DouyinAdapter.guestCookieCache = {
         value: cookie,
         expiresAt: Date.now() + GUEST_COOKIE_TTL_MS,
@@ -805,7 +1232,7 @@ export class DouyinAdapter implements PlatformAdapter {
       });
       return '';
     } finally {
-      clearTimeout(timer);
+      clearTimeout(fallbackTimer);
     }
   }
 
@@ -834,9 +1261,6 @@ export class DouyinAdapter implements PlatformAdapter {
           continue;
         }
         const name = trimmed.slice(0, separator);
-        if (IGNORED_DOUYIN_COOKIE_NAMES.has(name)) {
-          continue;
-        }
         cookies.set(name, trimmed.slice(separator + 1));
       }
     }
@@ -855,7 +1279,70 @@ export class DouyinAdapter implements PlatformAdapter {
   }
 
   private generateNonce(): string {
-    return `0${Math.random().toString(16).slice(2, 22).padEnd(20, '0')}`;
+    return this.generateRandomHex(21);
+  }
+
+  private generateRandomHex(length: number): string {
+    let value = '';
+    while (value.length < length) {
+      value += Math.random().toString(16).slice(2);
+    }
+    return value.slice(0, length);
+  }
+
+  private assertFallbackCircuitClosed(webRid: string): void {
+    const now = Date.now();
+    for (const key of [GLOBAL_CIRCUIT_KEY, webRid]) {
+      const circuit = DouyinAdapter.circuits.get(key);
+      if (!circuit || circuit.retryAt <= now) {
+        continue;
+      }
+      throw new PlatformError(
+        `Douyin resolver is cooling down after ${
+          circuit.reason
+        }; retry in ${Math.ceil((circuit.retryAt - now) / 1000)} seconds.`,
+        'douyin',
+        DOUYIN_BACKOFF_ERROR_CODE
+      );
+    }
+  }
+
+  private openCircuit(reason: string, webRid: string): number {
+    const key = reason === 'captcha' ? GLOBAL_CIRCUIT_KEY : webRid;
+    const circuit = DouyinAdapter.circuits.get(key) || {
+      failureCount: 0,
+      retryAt: 0,
+      reason: '',
+    };
+    circuit.failureCount += 1;
+    const delay = Math.min(
+      CIRCUIT_BASE_DELAY_MS * 2 ** (circuit.failureCount - 1),
+      CIRCUIT_MAX_DELAY_MS
+    );
+    circuit.retryAt = Date.now() + delay;
+    circuit.reason = reason;
+    if (
+      !DouyinAdapter.circuits.has(key) &&
+      DouyinAdapter.circuits.size >= CIRCUIT_MAX_ENTRIES
+    ) {
+      const oldestKey = Array.from(DouyinAdapter.circuits.keys()).find(
+        existingKey => existingKey !== GLOBAL_CIRCUIT_KEY
+      );
+      if (typeof oldestKey === 'string') {
+        DouyinAdapter.circuits.delete(oldestKey);
+      }
+    }
+    DouyinAdapter.circuits.set(key, circuit);
+    return delay;
+  }
+
+  private resetRoomCircuit(webRid: string): void {
+    DouyinAdapter.circuits.delete(webRid);
+  }
+
+  private resetFallbackCircuit(webRid: string): void {
+    DouyinAdapter.circuits.delete(GLOBAL_CIRCUIT_KEY);
+    this.resetRoomCircuit(webRid);
   }
 
   private isLive(room: DouyinRoom): boolean {
@@ -920,18 +1407,49 @@ export class DouyinAdapter implements PlatformAdapter {
   }
 
   private async fetchText(url: string, options?: RequestInit): Promise<string> {
-    const response = await fetch(url, options);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    return await response.text();
+    return await this.fetchWithTimeout(url, options, async response => {
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      return await response.text();
+    });
   }
 
   private async fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(url, options);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    return await this.fetchWithTimeout(url, options, async response => {
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      return (await response.json()) as T;
+    });
+  }
+
+  private async fetchWithTimeout<T>(
+    input: string | URL,
+    options: RequestInit | undefined,
+    consume: (response: Response) => Promise<T>
+  ): Promise<T> {
+    const controller = new AbortController();
+    const callerSignal = options?.signal;
+    const abortFromCaller = () => controller.abort();
+    if (callerSignal?.aborted) {
+      controller.abort();
+    } else {
+      callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
     }
-    return (await response.json()) as T;
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(input, {
+        ...options,
+        signal: controller.signal,
+      });
+      return await consume(response);
+    } finally {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener('abort', abortFromCaller);
+    }
   }
 }

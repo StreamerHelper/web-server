@@ -20,7 +20,8 @@ import { BilibiliAdapter } from '../platform/bilibili';
 import { DouyuAdapter } from '../platform/douyu';
 import { DouyinAdapter } from '../platform/douyin';
 import { HuyaAdapter } from '../platform/huya';
-import { DouyinCredentialRepository } from '../repository/douyin-credential.repository';
+import { DouyinAuthService } from './douyin-auth.service';
+import { DouyinBrowserProfileService } from './douyin-browser-profile.service';
 
 /**
  * 平台服务
@@ -35,7 +36,10 @@ export class PlatformService {
   private logger: ILogger;
 
   @Inject()
-  private douyinCredentialRepository: DouyinCredentialRepository;
+  private douyinAuthService: DouyinAuthService;
+
+  @Inject()
+  private douyinBrowserProfileService: DouyinBrowserProfileService;
 
   private adapters = new Map<Platform, new (logger: any) => PlatformAdapter>([
     ['bilibili', BilibiliAdapter],
@@ -49,10 +53,23 @@ export class PlatformService {
    */
   getAdapter(platform: Platform): PlatformAdapter {
     if (platform === 'douyin') {
-      return new DouyinAdapter(this.logger, async () => {
-        const credential =
-          await this.douyinCredentialRepository?.findLatest?.();
-        return credential?.cookieHeader;
+      return new DouyinAdapter(this.logger, {
+        browserPageProvider: async webRid => {
+          const result =
+            await this.douyinBrowserProfileService.fetchLiveRoomPage(webRid);
+          return {
+            html: result.html || '',
+            outcome: result.state === 'valid' ? 'ok' : result.state,
+            error: result.reason,
+          };
+        },
+        onBrowserOutcome: async (outcome, error) => {
+          if (outcome === 'challenged') {
+            await this.douyinAuthService.markRuntimeChallenge(error);
+          } else if (outcome === 'expired') {
+            await this.douyinAuthService.markRuntimeExpired(error);
+          }
+        },
       });
     }
 

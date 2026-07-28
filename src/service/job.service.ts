@@ -633,20 +633,43 @@ export class JobService {
   }
 
   /**
-   * 获取所有任务，按日期分组（用于内容浏览）
+   * 分页获取任务并按日期分组（用于内容浏览）
    * @param streamerName 主播名称筛选（可选）
    * @param startDate 开始日期筛选（可选，格式 YYYY-MM-DD）
    * @param endDate 结束日期筛选（可选，格式 YYYY-MM-DD）
    * @param minSegmentCount 最小片段数量筛选（可选）
+   * @param limit 每页数量
+   * @param offset 偏移量
    */
   async findAllGroupedByDate(
     streamerName?: string,
     startDate?: string,
     endDate?: string,
-    minSegmentCount?: number
-  ): Promise<Record<string, any[]>> {
+    minSegmentCount?: number,
+    limit = 24,
+    offset = 0
+  ): Promise<{ groups: Record<string, any[]>; total: number }> {
     // 构建查询条件
     const queryBuilder = this.jobModel.createQueryBuilder('job');
+
+    queryBuilder.select([
+      'job.id',
+      'job.jobId',
+      'job.streamerId',
+      'job.streamerName',
+      'job.roomName',
+      'job.platform',
+      'job.status',
+      'job.duration',
+      'job.segmentCount',
+      'job.startTime',
+      'job.endTime',
+      'job.createdAt',
+      'job.coverPath',
+    ]);
+    queryBuilder.andWhere(
+      "(job.metadata->>'storageDeleted') IS DISTINCT FROM 'true'"
+    );
 
     if (streamerName) {
       queryBuilder.andWhere('job.streamerName = :streamerName', {
@@ -666,24 +689,26 @@ export class JobService {
       queryBuilder.andWhere('job.startTime <= :endDate', { endDate: end });
     }
 
-    queryBuilder.orderBy('job.startTime', 'DESC');
+    if (minSegmentCount !== undefined) {
+      queryBuilder.andWhere('job.segmentCount >= :minSegmentCount', {
+        minSegmentCount,
+      });
+    }
 
-    const jobs = await queryBuilder.getMany();
+    queryBuilder
+      .orderBy('job.startTime', 'DESC', 'NULLS LAST')
+      .addOrderBy('job.createdAt', 'DESC')
+      .addOrderBy('job.id', 'DESC')
+      .take(limit)
+      .skip(offset);
+
+    const [jobs, total] = await queryBuilder.getManyAndCount();
     const streamerById = await this.findStreamerMapForJobs(jobs);
 
     // 按日期分组
     const groups: Record<string, any[]> = {};
 
     for (const job of jobs) {
-      if (job.metadata?.storageDeleted) {
-        continue;
-      }
-
-      // 片段数量筛选：如果设置了 minSegmentCount，则只保留片段数大于等于该值的任务
-      if (minSegmentCount !== undefined && job.segmentCount < minSegmentCount) {
-        continue;
-      }
-
       const dateKey = job.startTime
         ? dayjs(job.startTime).format('YYYY-MM-DD')
         : dayjs(job.createdAt).format('YYYY-MM-DD');
@@ -711,7 +736,7 @@ export class JobService {
       });
     }
 
-    return groups;
+    return { groups, total };
   }
 
   /**
