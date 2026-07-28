@@ -193,6 +193,101 @@ describe('DouyinBrowserProfileService', () => {
     await expect(service.detectChallenge(page)).resolves.toBe('captcha');
   });
 
+  it('ignores a preloaded captcha frame when its iframe is hidden', async () => {
+    const service = createService();
+    const mainFrame = {
+      parentFrame: jest.fn().mockReturnValue(null),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '扫码登录 验证码登录 密码登录',
+        title: '抖音精选电脑版',
+        html: '<script src="secsdk-captcha/index.js"></script>',
+      }),
+    };
+    const hiddenFrameElement = {
+      isVisible: jest.fn().mockResolvedValue(false),
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+    const hiddenCaptchaFrame = {
+      parentFrame: jest.fn().mockReturnValue(mainFrame),
+      frameElement: jest.fn().mockResolvedValue(hiddenFrameElement),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '',
+        title: 'RMC NoCaptcha',
+        html: '',
+      }),
+    };
+    const page = {
+      frames: () => [mainFrame, hiddenCaptchaFrame],
+    };
+
+    await expect(service.detectChallenge(page)).resolves.toBeUndefined();
+    expect(hiddenFrameElement.isVisible).toHaveBeenCalledTimes(1);
+    expect(hiddenCaptchaFrame.evaluate).not.toHaveBeenCalled();
+  });
+
+  it('detects captcha runtime markers only inside an active child frame', async () => {
+    const service = createService();
+    const mainFrame = {
+      parentFrame: jest.fn().mockReturnValue(null),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '抖音首页',
+        title: '抖音',
+        html: '<script src="secsdk-captcha/index.js"></script>',
+      }),
+    };
+    const frameElement = {
+      isVisible: jest.fn().mockResolvedValue(true),
+      evaluate: jest.fn().mockResolvedValue(true),
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+    const activeCaptchaFrame = {
+      parentFrame: jest.fn().mockReturnValue(mainFrame),
+      frameElement: jest.fn().mockResolvedValue(frameElement),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '',
+        title: '',
+        html: '<script src="secsdk-captcha/index.js"></script>',
+      }),
+    };
+    const page = {
+      frames: () => [mainFrame, activeCaptchaFrame],
+    };
+
+    await expect(service.detectChallenge(page)).resolves.toBe('captcha');
+  });
+
+  it('ignores a captcha frame that is rendered but not active', async () => {
+    const service = createService();
+    const mainFrame = {
+      parentFrame: jest.fn().mockReturnValue(null),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '抖音首页',
+        title: '抖音',
+        html: '',
+      }),
+    };
+    const frameElement = {
+      isVisible: jest.fn().mockResolvedValue(true),
+      evaluate: jest.fn().mockResolvedValue(false),
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+    const inactiveCaptchaFrame = {
+      parentFrame: jest.fn().mockReturnValue(mainFrame),
+      frameElement: jest.fn().mockResolvedValue(frameElement),
+      evaluate: jest.fn().mockResolvedValue({
+        text: '',
+        title: 'RMC NoCaptcha',
+        html: '',
+      }),
+    };
+    const page = {
+      frames: () => [mainFrame, inactiveCaptchaFrame],
+    };
+
+    await expect(service.detectChallenge(page)).resolves.toBeUndefined();
+    expect(inactiveCaptchaFrame.evaluate).not.toHaveBeenCalled();
+  });
+
   it('detects a login prompt inside a child frame', async () => {
     const service = createService();
     const page = {
@@ -440,14 +535,34 @@ describe('DouyinBrowserProfileService', () => {
     expect(launch).not.toHaveBeenCalled();
   });
 
-  it('selects a verification method and fills the code across frames', async () => {
+  it('discovers and selects visible verification methods across frames', async () => {
     const service = createService();
+    const createHandle = (matched: boolean) => {
+      const target = {
+        click: jest.fn().mockResolvedValue(undefined),
+      };
+      return {
+        target,
+        handle: {
+          asElement: jest.fn().mockReturnValue(matched ? target : null),
+          dispose: jest.fn().mockResolvedValue(undefined),
+        },
+      };
+    };
     const firstFrame = {
+      evaluateHandle: jest.fn().mockImplementation(() => {
+        return createHandle(false).handle;
+      }),
       evaluate: jest.fn().mockResolvedValue(false),
     };
     const secondFrame = {
+      evaluateHandle: jest.fn().mockImplementation((_fn, labels) => {
+        const matched =
+          labels.includes('接收短信验证码') || labels.includes('手机刷脸认证');
+        return createHandle(matched).handle;
+      }),
       evaluate: jest.fn().mockImplementation((_fn, value) => {
-        return value === '接收短信验证码' || value === '123456';
+        return value === '123456';
       }),
     };
     const page = {
@@ -455,8 +570,11 @@ describe('DouyinBrowserProfileService', () => {
     };
 
     await expect(
-      service.selectVerificationMethod(page, 'receive_sms')
-    ).resolves.toBe(true);
+      service.getAvailableVerificationMethods(page)
+    ).resolves.toEqual(['receive_sms', 'face']);
+    await expect(service.selectVerificationMethod(page, 'face')).resolves.toBe(
+      true
+    );
     await expect(service.fillVerificationCode(page, '123456')).resolves.toBe(
       true
     );

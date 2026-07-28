@@ -9,6 +9,7 @@ import type {
   Browser,
   BrowserContext,
   Cookie,
+  ElementHandle,
   Frame,
   HTTPResponse,
   Page,
@@ -45,9 +46,9 @@ const AUTHENTICATED_COOKIE_NAMES = new Set([
 ]);
 
 const VERIFICATION_METHOD_LABELS = {
-  receive_sms: '接收短信验证码',
-  face: '手机刷脸验证',
-  send_sms: '发送短信验证',
+  receive_sms: ['接收短信验证码', '接收短信验证'],
+  face: ['手机刷脸验证', '手机刷脸认证'],
+  send_sms: ['发送短信验证', '发送短信验证码'],
 } as const;
 
 const VERIFICATION_SUBMIT_LABELS = [
@@ -104,6 +105,7 @@ interface FrameSnapshot {
   text: string;
   title: string;
   html: string;
+  isTopLevel: boolean;
 }
 
 interface DouyinSelfProfileState {
@@ -462,16 +464,6 @@ export class DouyinBrowserProfileService {
       return 'captcha';
     }
 
-    try {
-      const html = await page.content();
-      const title = await page.title();
-      if (this.isCaptchaSnapshot({ text: '', title, html })) {
-        return 'captcha';
-      }
-    } catch {
-      // A navigation can replace the page while it is being inspected.
-    }
-
     return undefined;
   }
 
@@ -505,8 +497,38 @@ export class DouyinBrowserProfileService {
     page: Page,
     method: DouyinProfileVerificationMethod
   ): Promise<boolean> {
-    const label = VERIFICATION_METHOD_LABELS[method];
-    return this.clickVisibleTextAcrossFrames(page, [label]);
+    const labels = VERIFICATION_METHOD_LABELS[method];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (await this.clickVisibleTextAcrossFrames(page, labels)) {
+        return true;
+      }
+      if (attempt === 0) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+    }
+    return false;
+  }
+
+  async getAvailableVerificationMethods(
+    page: Page
+  ): Promise<DouyinProfileVerificationMethod[]> {
+    const methods = Object.keys(
+      VERIFICATION_METHOD_LABELS
+    ) as DouyinProfileVerificationMethod[];
+    const availableMethods: DouyinProfileVerificationMethod[] = [];
+
+    for (const method of methods) {
+      if (
+        await this.hasVisibleTextAcrossFrames(
+          page,
+          VERIFICATION_METHOD_LABELS[method]
+        )
+      ) {
+        availableMethods.push(method);
+      }
+    }
+
+    return availableMethods;
   }
 
   async fillVerificationCode(page: Page, code: string): Promise<boolean> {
@@ -515,6 +537,9 @@ export class DouyinBrowserProfileService {
     }
 
     for (const frame of page.frames()) {
+      if (!(await this.isFrameVisible(frame))) {
+        continue;
+      }
       try {
         const filled = await frame.evaluate(value => {
           const scope = globalThis as any;
@@ -606,8 +631,10 @@ export class DouyinBrowserProfileService {
             body
           );
         const secondaryVerification =
-          /身份验证|安全验证/.test(body) &&
-          /短信验证码|刷脸验证|本人操作|验证方式|接收短信|发送短信/.test(body);
+          /身份验证|身份认证|安全验证/.test(body) &&
+          /短信验证码|刷脸验证|刷脸认证|本人操作|验证方式|接收短信|发送短信/.test(
+            body
+          );
 
         let payload: any;
         try {
@@ -770,9 +797,22 @@ export class DouyinBrowserProfileService {
 
   private async collectFrameSnapshots(page: Page): Promise<FrameSnapshot[]> {
     const snapshots: FrameSnapshot[] = [];
-    for (const frame of page.frames()) {
+    const frames = page.frames();
+    for (const [index, frame] of frames.entries()) {
       try {
-        snapshots.push(await this.getFrameSnapshot(frame));
+        if (!(await this.isFrameVisible(frame))) {
+          continue;
+        }
+        const parentFrame =
+          typeof frame.parentFrame === 'function'
+            ? frame.parentFrame()
+            : index === 0
+            ? null
+            : undefined;
+        snapshots.push({
+          ...(await this.getFrameSnapshot(frame)),
+          isTopLevel: parentFrame === null,
+        });
       } catch {
         // Cross-origin frames are individually inspectable, but can disappear
         // during verification navigation. Missing one frame is transient.
@@ -781,7 +821,9 @@ export class DouyinBrowserProfileService {
     return snapshots;
   }
 
-  private async getFrameSnapshot(frame: Frame): Promise<FrameSnapshot> {
+  private async getFrameSnapshot(
+    frame: Frame
+  ): Promise<Omit<FrameSnapshot, 'isTopLevel'>> {
     return frame.evaluate(() => {
       const doc = (globalThis as any).document;
       const normalize = (value: unknown) =>
@@ -798,8 +840,8 @@ export class DouyinBrowserProfileService {
 
   private isSecondaryVerificationSnapshot(snapshot: FrameSnapshot): boolean {
     return (
-      /身份验证|安全验证/.test(snapshot.text) &&
-      /短信验证码|刷脸验证|本人操作|验证方式|接收短信|发送短信/.test(
+      /身份验证|身份认证|安全验证/.test(snapshot.text) &&
+      /短信验证码|刷脸验证|刷脸认证|本人操作|验证方式|接收短信|发送短信/.test(
         snapshot.text
       )
     );
@@ -808,38 +850,61 @@ export class DouyinBrowserProfileService {
   private isCaptchaSnapshot(snapshot: FrameSnapshot): boolean {
     return (
       /验证码中间页|captcha|访问验证/i.test(snapshot.title) ||
-      /captcha\/index\.js|secsdk-captcha|argus-csp-token/i.test(
-        snapshot.html
-      ) ||
+      (!snapshot.isTopLevel &&
+        /captcha\/index\.js|secsdk-captcha|argus-csp-token/i.test(
+          snapshot.html
+        )) ||
       (/安全验证/.test(snapshot.text) &&
         /拖动滑块|完成验证|验证后继续|网络环境存在风险/.test(snapshot.text))
     );
+  }
+
+  private async hasVisibleTextAcrossFrames(
+    page: Page,
+    labels: readonly string[]
+  ): Promise<boolean> {
+    return this.findVisibleTextAcrossFrames(page, labels, false);
   }
 
   private async clickVisibleTextAcrossFrames(
     page: Page,
     labels: readonly string[]
   ): Promise<boolean> {
+    return this.findVisibleTextAcrossFrames(page, labels, true);
+  }
+
+  private async findVisibleTextAcrossFrames(
+    page: Page,
+    labels: readonly string[],
+    click: boolean
+  ): Promise<boolean> {
     for (const frame of page.frames()) {
-      for (const label of labels) {
-        try {
-          const clicked = await frame.evaluate(value => {
+      if (!(await this.isFrameVisible(frame))) {
+        continue;
+      }
+      let handle: Awaited<ReturnType<Frame['evaluateHandle']>> | undefined;
+      try {
+        handle = await frame.evaluateHandle(
+          values => {
             const scope = globalThis as any;
             const doc = scope.document;
             const normalize = (text: unknown) =>
               String(text || '')
-                .replace(/\s+/g, ' ')
+                .replace(/\s+/g, '')
                 .trim();
+            const normalizedLabels = new Set(values.map(normalize));
             const matches = Array.from(
               doc.querySelectorAll(
-                'button, a, [role="button"], [tabindex], div, span'
+                'button, a, [role="button"], [tabindex], label, div, span'
               )
             ).filter(element => {
               const node = element as any;
               const rect = node.getBoundingClientRect();
               const style = scope.getComputedStyle(node);
               return (
-                normalize(node.innerText || node.textContent) === value &&
+                normalizedLabels.has(
+                  normalize(node.innerText || node.textContent)
+                ) &&
                 rect.width > 0 &&
                 rect.height > 0 &&
                 style.visibility !== 'hidden' &&
@@ -854,20 +919,115 @@ export class DouyinBrowserProfileService {
                   )
               ) || matches[0];
             const target =
-              labelElement?.closest('button, a, [role="button"], [tabindex]') ||
-              labelElement;
-            target?.click();
-            return Boolean(target);
-          }, label);
-          if (clicked) {
-            return true;
-          }
-        } catch {
-          // Continue across labels and frames during navigation.
+              labelElement?.closest(
+                'button, a, [role="button"], [tabindex], label'
+              ) || labelElement;
+            if (
+              !target ||
+              target.disabled ||
+              target.getAttribute?.('aria-disabled') === 'true'
+            ) {
+              return null;
+            }
+            return target;
+          },
+          [...labels]
+        );
+        const target = handle.asElement() as ElementHandle<Element> | null;
+        if (!target) {
+          continue;
         }
+        if (click) {
+          await target.click();
+        }
+        return true;
+      } catch {
+        // Continue across frames while Douyin replaces verification UI.
+      } finally {
+        await handle?.dispose().catch(() => undefined);
       }
     }
     return false;
+  }
+
+  private async isFrameVisible(frame: Frame): Promise<boolean> {
+    let currentFrame: Frame | undefined = frame;
+    const visited = new Set<Frame>();
+
+    while (
+      currentFrame &&
+      !visited.has(currentFrame) &&
+      typeof currentFrame.parentFrame === 'function'
+    ) {
+      visited.add(currentFrame);
+      const parentFrame = currentFrame.parentFrame();
+      if (!parentFrame) {
+        return true;
+      }
+
+      let frameElement: Awaited<ReturnType<Frame['frameElement']>> | undefined;
+      try {
+        frameElement = await currentFrame.frameElement();
+        const isActive =
+          (await frameElement.isVisible()) &&
+          (await frameElement.evaluate(element => {
+            const doc = element.ownerDocument;
+            const view = doc.defaultView;
+            if (!view) {
+              return false;
+            }
+            const rect = element.getBoundingClientRect();
+            if (
+              rect.width < 2 ||
+              rect.height < 2 ||
+              rect.right <= 0 ||
+              rect.bottom <= 0 ||
+              rect.left >= view.innerWidth ||
+              rect.top >= view.innerHeight
+            ) {
+              return false;
+            }
+
+            let current: Element | null = element;
+            while (current) {
+              const style = view.getComputedStyle(current);
+              if (
+                style.display === 'none' ||
+                style.visibility === 'hidden' ||
+                style.visibility === 'collapse' ||
+                Number(style.opacity) <= 0.01 ||
+                style.pointerEvents === 'none'
+              ) {
+                return false;
+              }
+              current = current.parentElement;
+            }
+
+            const x = Math.min(
+              Math.max(rect.left + rect.width / 2, 0),
+              Math.max(view.innerWidth - 1, 0)
+            );
+            const y = Math.min(
+              Math.max(rect.top + rect.height / 2, 0),
+              Math.max(view.innerHeight - 1, 0)
+            );
+            const hitTarget = doc.elementFromPoint(x, y);
+            return (
+              !hitTarget || hitTarget === element || element.contains(hitTarget)
+            );
+          }));
+        if (!isActive) {
+          return false;
+        }
+      } catch {
+        return false;
+      } finally {
+        await frameElement?.dispose().catch(() => undefined);
+      }
+      currentFrame = parentFrame;
+    }
+
+    return true;
   }
 
   private async createBrowserTarget(): Promise<DouyinBrowserLoginTarget> {

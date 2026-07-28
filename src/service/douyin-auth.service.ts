@@ -16,6 +16,7 @@ import {
 import {
   DouyinBrowserLoginTarget,
   DouyinBrowserProfileService,
+  DouyinProfileChallenge,
   DouyinProfileProbeResult,
 } from './douyin-browser-profile.service';
 
@@ -46,6 +47,7 @@ export type DouyinVerificationStage =
   | 'awaiting_external';
 
 export interface DouyinBrowserLoginVerification {
+  challenge: DouyinProfileChallenge;
   stage: DouyinVerificationStage;
   method?: DouyinVerificationMethod;
   availableMethods: DouyinVerificationMethod[];
@@ -74,6 +76,7 @@ interface DouyinBrowserLoginSession {
   expireTimer?: NodeJS.Timeout;
   preparePromise?: Promise<void>;
   checkPromise?: Promise<void>;
+  pageOperation?: Promise<void>;
   cookieNames?: string[];
   verifiedAt?: Date;
   error?: string;
@@ -422,73 +425,120 @@ export class DouyinAuthService {
     interaction: DouyinBrowserLoginInteraction
   ): Promise<DouyinBrowserLoginStatus> {
     const session = this.getBrowserLoginSession(sessionId);
-    const page = session.target?.page;
-    if (
-      !page ||
-      page.isClosed() ||
-      session.status !== 'verification_required'
-    ) {
-      throw new DouyinCredentialError('Douyin verification is not ready', 409);
-    }
+    let shouldCheck = false;
 
-    if (interaction?.type === 'select_verification_method') {
-      if (!VERIFICATION_METHODS.includes(interaction.method)) {
+    await this.withBrowserPageOperation(session, async () => {
+      const page = session.target?.page;
+      if (
+        !page ||
+        page.isClosed() ||
+        session.status !== 'verification_required'
+      ) {
         throw new DouyinCredentialError(
-          'Douyin verification method is invalid'
-        );
-      }
-      const selected =
-        await this.browserProfileService.selectVerificationMethod(
-          page,
-          interaction.method
-        );
-      if (!selected) {
-        throw new DouyinCredentialError(
-          'Selected Douyin verification method is not available',
+          'Douyin verification is not ready',
           409
         );
       }
-      session.verification = {
-        stage:
-          interaction.method === 'receive_sms'
-            ? 'awaiting_code'
-            : 'awaiting_external',
-        method: interaction.method,
-        availableMethods: VERIFICATION_METHODS,
-        prompt:
-          interaction.method === 'receive_sms'
-            ? '验证码已发送到绑定手机，请在这里输入。'
-            : interaction.method === 'face'
-            ? '请在手机端完成刷脸验证，系统会自动继续。'
-            : '请按抖音提示使用绑定手机发送短信，系统会自动继续。',
-      };
-    } else if (interaction?.type === 'submit_verification_code') {
-      if (session.verification?.method !== 'receive_sms') {
+
+      if (interaction?.type === 'select_verification_method') {
+        if (!VERIFICATION_METHODS.includes(interaction.method)) {
+          throw new DouyinCredentialError(
+            'Douyin verification method is invalid'
+          );
+        }
+        if (session.verification?.challenge !== 'second_verification') {
+          throw new DouyinCredentialError(
+            'Selected Douyin verification method is not available',
+            409
+          );
+        }
+        const availableMethods =
+          await this.browserProfileService.getAvailableVerificationMethods(
+            page
+          );
+        if (!availableMethods.includes(interaction.method)) {
+          session.verification = {
+            challenge: 'second_verification',
+            stage: 'choose_method',
+            availableMethods,
+            prompt: '抖音验证页面已更新，请重新选择可用的验证方式。',
+          };
+          session.updatedAt = new Date();
+          throw new DouyinCredentialError(
+            'Selected Douyin verification method is not available',
+            409
+          );
+        }
+        const selected =
+          await this.browserProfileService.selectVerificationMethod(
+            page,
+            interaction.method
+          );
+        if (!selected) {
+          session.verification = {
+            challenge: 'second_verification',
+            stage: 'choose_method',
+            availableMethods:
+              await this.browserProfileService.getAvailableVerificationMethods(
+                page
+              ),
+            prompt: '抖音验证页面已更新，请重新选择可用的验证方式。',
+          };
+          session.updatedAt = new Date();
+          throw new DouyinCredentialError(
+            'Selected Douyin verification method is not available',
+            409
+          );
+        }
+        session.verification = {
+          challenge: 'second_verification',
+          stage:
+            interaction.method === 'receive_sms'
+              ? 'awaiting_code'
+              : 'awaiting_external',
+          method: interaction.method,
+          availableMethods,
+          prompt:
+            interaction.method === 'receive_sms'
+              ? '验证码已发送到绑定手机，请在这里输入。'
+              : interaction.method === 'face'
+              ? '请在手机端完成刷脸认证，系统会自动继续。'
+              : '请按抖音提示使用绑定手机发送短信，系统会自动继续。',
+        };
+      } else if (interaction?.type === 'submit_verification_code') {
+        if (session.verification?.method !== 'receive_sms') {
+          throw new DouyinCredentialError(
+            'SMS verification has not been selected',
+            409
+          );
+        }
+        const submitted =
+          await this.browserProfileService.submitVerificationCode(
+            page,
+            interaction.code
+          );
+        if (!submitted) {
+          throw new DouyinCredentialError(
+            'Douyin verification code input is not available',
+            409
+          );
+        }
+        session.verification = {
+          ...session.verification,
+          stage: 'processing',
+        };
+        shouldCheck = true;
+      } else {
         throw new DouyinCredentialError(
-          'SMS verification has not been selected',
-          409
+          'Douyin verification interaction type is invalid'
         );
       }
-      const submitted = await this.browserProfileService.submitVerificationCode(
-        page,
-        interaction.code
-      );
-      if (!submitted) {
-        throw new DouyinCredentialError(
-          'Douyin verification code input is not available',
-          409
-        );
-      }
-      session.verification = {
-        ...session.verification,
-        stage: 'processing',
-      };
+      session.updatedAt = new Date();
+    });
+
+    if (shouldCheck) {
       await this.sleep(500);
       await this.checkBrowserLoginSession(session);
-    } else {
-      throw new DouyinCredentialError(
-        'Douyin verification interaction type is invalid'
-      );
     }
 
     session.updatedAt = new Date();
@@ -593,11 +643,11 @@ export class DouyinAuthService {
     if (session.checkPromise) {
       return session.checkPromise;
     }
-    session.checkPromise = this.doCheckBrowserLoginSession(session).finally(
-      () => {
-        session.checkPromise = undefined;
-      }
-    );
+    session.checkPromise = this.withBrowserPageOperation(session, () =>
+      this.doCheckBrowserLoginSession(session)
+    ).finally(() => {
+      session.checkPromise = undefined;
+    });
     return session.checkPromise;
   }
 
@@ -730,22 +780,38 @@ export class DouyinAuthService {
 
   private async enterVerificationRequired(
     session: DouyinBrowserLoginSession,
-    challenge: 'captcha' | 'second_verification',
+    challenge: DouyinProfileChallenge,
     probe?: DouyinProfileProbeResult
   ): Promise<void> {
     if (!session.operation || !this.isSessionOperationActive(session)) {
       return;
     }
+    const page = session.target?.page;
+    const availableMethods =
+      challenge === 'second_verification' && page && !page.isClosed()
+        ? await this.browserProfileService.getAvailableVerificationMethods(page)
+        : [];
+    const previousVerification = session.verification;
     session.status = 'verification_required';
     session.error = undefined;
-    session.verification = session.verification || {
-      stage: 'choose_method',
-      availableMethods: VERIFICATION_METHODS,
-      prompt:
-        challenge === 'second_verification'
-          ? '抖音要求完成账号二次验证。'
-          : '抖音要求完成安全验证。',
-    };
+    session.verification =
+      previousVerification?.challenge === challenge &&
+      previousVerification.stage !== 'choose_method'
+        ? {
+            ...previousVerification,
+            availableMethods,
+          }
+        : {
+            challenge,
+            stage: 'choose_method',
+            availableMethods,
+            prompt:
+              challenge === 'second_verification'
+                ? availableMethods.length > 0
+                  ? '抖音要求完成账号二次验证。'
+                  : '正在读取抖音提供的验证方式，请稍候。'
+                : '抖音要求完成安全验证。',
+          };
     session.updatedAt = new Date();
     await this.transitionForOperation(session.operation, 'challenged', {
       cookieNames: probe?.cookieNames,
@@ -1061,6 +1127,31 @@ export class DouyinAuthService {
     }
   }
 
+  private async withBrowserPageOperation<T>(
+    session: DouyinBrowserLoginSession,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const previousOperation = session.pageOperation;
+    let release!: () => void;
+    const currentOperation = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    session.pageOperation = currentOperation;
+
+    if (previousOperation) {
+      await previousOperation;
+    }
+
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (session.pageOperation === currentOperation) {
+        session.pageOperation = undefined;
+      }
+    }
+  }
+
   private isActiveSession(status: DouyinBrowserLoginState): boolean {
     return [
       'initializing',
@@ -1087,7 +1178,7 @@ export class DouyinAuthService {
 
 export function isDouyinIdentityVerificationText(text: string): boolean {
   return (
-    /身份验证|安全验证/.test(text) &&
-    /短信验证码|刷脸验证|本人操作|验证方式/.test(text)
+    /身份验证|身份认证|安全验证/.test(text) &&
+    /短信验证码|刷脸验证|刷脸认证|本人操作|验证方式/.test(text)
   );
 }

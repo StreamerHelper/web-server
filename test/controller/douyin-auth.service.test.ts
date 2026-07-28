@@ -75,6 +75,9 @@ describe('DouyinAuthService', () => {
       openLoginPanel: jest.fn().mockResolvedValue(true),
       detectChallenge: jest.fn().mockResolvedValue(undefined),
       getCookieDiagnostics: jest.fn(),
+      getAvailableVerificationMethods: jest
+        .fn()
+        .mockResolvedValue(['receive_sms', 'face', 'send_sms']),
       selectVerificationMethod: jest.fn().mockResolvedValue(true),
       submitVerificationCode: jest.fn().mockResolvedValue(true),
     };
@@ -274,6 +277,7 @@ describe('DouyinAuthService', () => {
     expect(session.status).toBe('verification_required');
     expect(session.verification).toEqual(
       expect.objectContaining({
+        challenge: 'second_verification',
         stage: 'choose_method',
         availableMethods: ['receive_sms', 'face', 'send_sms'],
       })
@@ -285,6 +289,39 @@ describe('DouyinAuthService', () => {
       })
     );
     expect(service.browserProfileService.probe).not.toHaveBeenCalled();
+  });
+
+  it('does not advertise secondary methods for a captcha challenge', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    service.browserProfileService.detectChallenge.mockResolvedValue('captcha');
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('verification_required');
+    expect(session.verification).toEqual(
+      expect.objectContaining({
+        challenge: 'captcha',
+        stage: 'choose_method',
+        availableMethods: [],
+      })
+    );
+    expect(
+      service.browserProfileService.getAvailableVerificationMethods
+    ).not.toHaveBeenCalled();
+
+    service.browserLoginSessions.set(session.id, session);
+    await expect(
+      service.interactWithBrowserLogin(session.id, {
+        type: 'select_verification_method',
+        method: 'receive_sms',
+      })
+    ).rejects.toMatchObject({ status: 409 });
+    expect(session.verification.challenge).toBe('captcha');
+    expect(
+      service.browserProfileService.selectVerificationMethod
+    ).not.toHaveBeenCalled();
   });
 
   it('does not authenticate from Cookie names without a successful probe', async () => {
@@ -363,6 +400,61 @@ describe('DouyinAuthService', () => {
     expect(
       service.browserProfileService.detectChallenge
     ).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes verification interaction behind an in-flight login check', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    session.status = 'verification_required';
+    session.verification = {
+      challenge: 'second_verification',
+      stage: 'choose_method',
+      availableMethods: ['receive_sms'],
+    };
+    service.browserLoginSessions.set(session.id, session);
+
+    let checkStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      checkStarted = resolve;
+    });
+    let releaseCheck!: () => void;
+    const gate = new Promise<void>(resolve => {
+      releaseCheck = resolve;
+    });
+    const order: string[] = [];
+    service.browserProfileService.detectChallenge.mockImplementation(
+      async () => {
+        order.push('check-start');
+        checkStarted();
+        await gate;
+        order.push('check-end');
+        return 'second_verification';
+      }
+    );
+    service.browserProfileService.getAvailableVerificationMethods.mockResolvedValue(
+      ['receive_sms']
+    );
+    service.browserProfileService.selectVerificationMethod.mockImplementation(
+      async () => {
+        order.push('select');
+        return true;
+      }
+    );
+
+    const check = service.checkBrowserLoginSession(session);
+    await started;
+    const interaction = service.interactWithBrowserLogin(session.id, {
+      type: 'select_verification_method',
+      method: 'receive_sms',
+    });
+    await Promise.resolve();
+    expect(order).toEqual(['check-start']);
+
+    releaseCheck();
+    await Promise.all([check, interaction]);
+
+    expect(order).toEqual(['check-start', 'check-end', 'select']);
   });
 
   it('rejects a stale in-flight probe after cancellation and restores the persisted profile state', async () => {
@@ -592,6 +684,7 @@ describe('DouyinAuthService', () => {
     service.activateSession(session);
     session.status = 'verification_required';
     session.verification = {
+      challenge: 'second_verification',
       stage: 'choose_method',
       availableMethods: ['receive_sms', 'face', 'send_sms'],
     };
