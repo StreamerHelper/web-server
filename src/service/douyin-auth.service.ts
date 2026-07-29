@@ -348,10 +348,10 @@ export class DouyinAuthService {
       session => this.isActiveSession(session.status)
     );
     if (activeSession) {
-      throw new DouyinCredentialError(
-        'A Douyin browser login is already in progress',
-        409
-      );
+      await this.checkBrowserLoginSession(activeSession);
+      if (this.isActiveSession(activeSession.status)) {
+        return this.serializeBrowserLoginSession(activeSession);
+      }
     }
 
     const now = new Date();
@@ -669,12 +669,18 @@ export class DouyinAuthService {
 
     try {
       // A challenge must win over provisional session cookies.
-      const challenge = await this.browserProfileService.detectChallenge(page);
+      const verificationState =
+        await this.browserProfileService.detectVerificationState(page);
       if (!this.isSessionOperationActive(session)) {
         return;
       }
-      if (challenge) {
-        await this.enterVerificationRequired(session, challenge);
+      if (verificationState) {
+        await this.enterVerificationRequired(
+          session,
+          verificationState.challenge,
+          undefined,
+          verificationState.awaitingCode
+        );
         return;
       }
 
@@ -781,37 +787,51 @@ export class DouyinAuthService {
   private async enterVerificationRequired(
     session: DouyinBrowserLoginSession,
     challenge: DouyinProfileChallenge,
-    probe?: DouyinProfileProbeResult
+    probe?: DouyinProfileProbeResult,
+    awaitingCode = false
   ): Promise<void> {
     if (!session.operation || !this.isSessionOperationActive(session)) {
       return;
     }
     const page = session.target?.page;
     const availableMethods =
-      challenge === 'second_verification' && page && !page.isClosed()
+      !awaitingCode &&
+      challenge === 'second_verification' &&
+      page &&
+      !page.isClosed()
         ? await this.browserProfileService.getAvailableVerificationMethods(page)
         : [];
     const previousVerification = session.verification;
     session.status = 'verification_required';
     session.error = undefined;
-    session.verification =
-      previousVerification?.challenge === challenge &&
-      previousVerification.stage !== 'choose_method'
-        ? {
-            ...previousVerification,
-            availableMethods,
-          }
-        : {
-            challenge,
-            stage: 'choose_method',
-            availableMethods,
-            prompt:
-              challenge === 'second_verification'
-                ? availableMethods.length > 0
-                  ? '抖音要求完成账号二次验证。'
-                  : '正在读取抖音提供的验证方式，请稍候。'
-                : '抖音要求完成安全验证。',
-          };
+    if (awaitingCode) {
+      session.verification = {
+        challenge: 'second_verification',
+        stage: 'awaiting_code',
+        method: 'receive_sms',
+        availableMethods: [],
+        prompt: '验证码已发送到绑定手机，请在这里输入。',
+      };
+    } else {
+      session.verification =
+        previousVerification?.challenge === challenge &&
+        previousVerification.stage !== 'choose_method'
+          ? {
+              ...previousVerification,
+              availableMethods,
+            }
+          : {
+              challenge,
+              stage: 'choose_method',
+              availableMethods,
+              prompt:
+                challenge === 'second_verification'
+                  ? availableMethods.length > 0
+                    ? '抖音要求完成账号二次验证。'
+                    : '正在读取抖音提供的验证方式，请稍候。'
+                  : '抖音要求完成安全验证。',
+            };
+    }
     session.updatedAt = new Date();
     await this.transitionForOperation(session.operation, 'challenged', {
       cookieNames: probe?.cookieNames,

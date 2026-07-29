@@ -225,6 +225,131 @@ describe('DouyinBrowserProfileService', () => {
     expect(hiddenCaptchaFrame.evaluate).not.toHaveBeenCalled();
   });
 
+  it('recognizes the active SMS code step without an identity heading', async () => {
+    const service = createService();
+    const input = {
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+    service.findActiveVerificationCodeInput = jest
+      .fn()
+      .mockResolvedValue(input);
+    const page = {
+      frames: () => [
+        {
+          evaluate: jest.fn().mockResolvedValue({
+            text: '接收短信验证码 短信已发送至 187****09 重新发送 验证',
+            title: '',
+            html: '',
+          }),
+        },
+      ],
+    };
+
+    await expect(service.detectVerificationState(page)).resolves.toEqual({
+      challenge: 'second_verification',
+      awaitingCode: true,
+    });
+    expect(input.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('fills the hit-testable SMS input instead of the covered login input', async () => {
+    const service = createService();
+    const scope = globalThis as any;
+    const originalGlobals = {
+      document: scope.document,
+      innerWidth: scope.innerWidth,
+      innerHeight: scope.innerHeight,
+      getComputedStyle: scope.getComputedStyle,
+      HTMLInputElement: scope.HTMLInputElement,
+    };
+    const body = {
+      innerText:
+        '接收短信验证码 短信已发送至 187****09 重新发送 验证 选择其他验证方式',
+      parentElement: null,
+    };
+    const createInput = (left: number, parentElement: any) =>
+      ({
+        placeholder: '请输入验证码',
+        name: 'button-input',
+        disabled: false,
+        parentElement,
+        getAttribute: jest.fn().mockReturnValue(null),
+        getBoundingClientRect: () => ({
+          left,
+          top: 100,
+          right: left + 100,
+          bottom: 120,
+          width: 100,
+          height: 20,
+        }),
+        contains: jest.fn().mockReturnValue(false),
+        dispatchEvent: jest.fn(),
+        focus: jest.fn(),
+      } as any);
+    const background = createInput(100, {
+      innerText: '验证码登录 获取验证码 登录',
+      parentElement: body,
+    });
+    const verification = createInput(400, {
+      innerText: body.innerText,
+      parentElement: body,
+    });
+    const cover = {};
+    const document = {
+      body,
+      activeElement: null,
+      querySelectorAll: jest.fn().mockReturnValue([background, verification]),
+      elementFromPoint: jest.fn((x: number) =>
+        x < 300 ? cover : verification
+      ),
+    };
+    class FakeInput {}
+    Object.defineProperty(FakeInput.prototype, 'value', {
+      set(value) {
+        (this as any).storedValue = value;
+      },
+    });
+    scope.document = document;
+    scope.innerWidth = 1_000;
+    scope.innerHeight = 800;
+    scope.getComputedStyle = () => ({
+      display: 'block',
+      visibility: 'visible',
+      opacity: '1',
+      pointerEvents: 'auto',
+    });
+    scope.HTMLInputElement = FakeInput;
+
+    const frame = {
+      evaluateHandle: jest.fn(async callback => {
+        const node = callback();
+        const handle: any = {
+          asElement: () => (node ? handle : null),
+          evaluate: jest.fn(async (evaluate, value) => evaluate(node, value)),
+          dispose: jest.fn().mockResolvedValue(undefined),
+        };
+        return handle;
+      }),
+    };
+
+    try {
+      await expect(
+        service.fillVerificationCode({ frames: () => [frame] }, '123456')
+      ).resolves.toBe(true);
+      expect(background.storedValue).toBeUndefined();
+      expect(verification.storedValue).toBe('123456');
+      expect(verification.focus).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const [key, value] of Object.entries(originalGlobals)) {
+        if (value === undefined) {
+          delete scope[key];
+        } else {
+          scope[key] = value;
+        }
+      }
+    }
+  });
+
   it('detects captcha runtime markers only inside an active child frame', async () => {
     const service = createService();
     const mainFrame = {
@@ -491,13 +616,9 @@ describe('DouyinBrowserProfileService', () => {
     const service = createService();
     const now = 1_800_000_000_000;
     jest.spyOn(Date, 'now').mockReturnValue(now);
-    const activeMarker = `streamer-helper:douyin:${
-      now - 30 * 60_000
-    }:active`;
+    const activeMarker = `streamer-helper:douyin:${now - 30 * 60_000}:active`;
     const recentMarker = `streamer-helper:douyin:${now - 60_000}:recent`;
-    const staleMarker = `streamer-helper:douyin:${
-      now - 16 * 60_000
-    }:stale`;
+    const staleMarker = `streamer-helper:douyin:${now - 16 * 60_000}:stale`;
     service.activePageMarkers.add(activeMarker);
     const createPage = (marker: string) => ({
       evaluate: jest.fn().mockResolvedValue(marker),
@@ -575,12 +696,42 @@ describe('DouyinBrowserProfileService', () => {
     await expect(service.selectVerificationMethod(page, 'face')).resolves.toBe(
       true
     );
+    const verificationInput = {
+      evaluate: jest.fn().mockResolvedValue(undefined),
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+    service.findActiveVerificationCodeInput = jest
+      .fn()
+      .mockResolvedValue(verificationInput);
     await expect(service.fillVerificationCode(page, '123456')).resolves.toBe(
       true
     );
+    expect(verificationInput.evaluate).toHaveBeenCalledWith(
+      expect.any(Function),
+      '123456'
+    );
+    expect(verificationInput.dispose).toHaveBeenCalledTimes(1);
     await expect(
       service.fillVerificationCode(page, 'bad-code')
     ).rejects.toThrow('must contain 4 to 8 digits');
+  });
+
+  it('confirms SMS selection only after the active code input appears', async () => {
+    const service = createService();
+    service.clickVisibleTextAcrossFrames = jest.fn().mockResolvedValue(true);
+    service.waitForActiveVerificationCodeInput = jest
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const page = {};
+
+    await expect(
+      service.selectVerificationMethod(page, 'receive_sms')
+    ).resolves.toBe(false);
+    await expect(
+      service.selectVerificationMethod(page, 'receive_sms')
+    ).resolves.toBe(true);
+    expect(service.waitForActiveVerificationCodeInput).toHaveBeenCalledTimes(2);
   });
 
   it('returns cookie diagnostics without exposing values', () => {

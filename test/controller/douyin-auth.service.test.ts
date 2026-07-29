@@ -18,8 +18,7 @@ describe('DouyinAuthService', () => {
       credential = {
         ...(credential || {}),
         slot: 'default',
-        cookieNames:
-          transition.cookieNames ?? credential?.cookieNames ?? [],
+        cookieNames: transition.cookieNames ?? credential?.cookieNames ?? [],
         verifiedAt:
           transition.verifiedAt !== undefined
             ? transition.verifiedAt
@@ -74,6 +73,7 @@ describe('DouyinAuthService', () => {
       logout: jest.fn().mockResolvedValue(undefined),
       openLoginPanel: jest.fn().mockResolvedValue(true),
       detectChallenge: jest.fn().mockResolvedValue(undefined),
+      detectVerificationState: jest.fn().mockResolvedValue(undefined),
       getCookieDiagnostics: jest.fn(),
       getAvailableVerificationMethods: jest
         .fn()
@@ -268,9 +268,10 @@ describe('DouyinAuthService', () => {
     const service = createService();
     const session = createSession();
     service.activateSession(session);
-    service.browserProfileService.detectChallenge.mockResolvedValue(
-      'second_verification'
-    );
+    service.browserProfileService.detectVerificationState.mockResolvedValue({
+      challenge: 'second_verification',
+      awaitingCode: false,
+    });
 
     await service.checkBrowserLoginSession(session);
 
@@ -295,7 +296,10 @@ describe('DouyinAuthService', () => {
     const service = createService();
     const session = createSession();
     service.activateSession(session);
-    service.browserProfileService.detectChallenge.mockResolvedValue('captcha');
+    service.browserProfileService.detectVerificationState.mockResolvedValue({
+      challenge: 'captcha',
+      awaitingCode: false,
+    });
 
     await service.checkBrowserLoginSession(session);
 
@@ -321,6 +325,37 @@ describe('DouyinAuthService', () => {
     expect(session.verification.challenge).toBe('captcha');
     expect(
       service.browserProfileService.selectVerificationMethod
+    ).not.toHaveBeenCalled();
+  });
+
+  it('keeps the session on the concrete SMS code step during polling', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    session.status = 'verification_required';
+    session.verification = {
+      challenge: 'second_verification',
+      stage: 'processing',
+      method: 'receive_sms',
+      availableMethods: ['receive_sms'],
+    };
+    service.browserProfileService.detectVerificationState.mockResolvedValue({
+      challenge: 'second_verification',
+      awaitingCode: true,
+    });
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('verification_required');
+    expect(session.verification).toEqual({
+      challenge: 'second_verification',
+      stage: 'awaiting_code',
+      method: 'receive_sms',
+      availableMethods: [],
+      prompt: '验证码已发送到绑定手机，请在这里输入。',
+    });
+    expect(
+      service.browserProfileService.getCookieDiagnostics
     ).not.toHaveBeenCalled();
   });
 
@@ -381,7 +416,7 @@ describe('DouyinAuthService', () => {
     const gate = new Promise<void>(resolve => {
       release = resolve;
     });
-    service.browserProfileService.detectChallenge.mockImplementation(
+    service.browserProfileService.detectVerificationState.mockImplementation(
       async () => {
         await gate;
         return undefined;
@@ -398,7 +433,7 @@ describe('DouyinAuthService', () => {
     await Promise.all([first, second]);
 
     expect(
-      service.browserProfileService.detectChallenge
+      service.browserProfileService.detectVerificationState
     ).toHaveBeenCalledTimes(1);
   });
 
@@ -423,13 +458,16 @@ describe('DouyinAuthService', () => {
       releaseCheck = resolve;
     });
     const order: string[] = [];
-    service.browserProfileService.detectChallenge.mockImplementation(
+    service.browserProfileService.detectVerificationState.mockImplementation(
       async () => {
         order.push('check-start');
         checkStarted();
         await gate;
         order.push('check-end');
-        return 'second_verification';
+        return {
+          challenge: 'second_verification',
+          awaitingCode: false,
+        };
       }
     );
     service.browserProfileService.getAvailableVerificationMethods.mockResolvedValue(
@@ -455,6 +493,21 @@ describe('DouyinAuthService', () => {
     await Promise.all([check, interaction]);
 
     expect(order).toEqual(['check-start', 'check-end', 'select']);
+  });
+
+  it('returns the active browser login session so the UI can reattach', async () => {
+    const service = createService();
+    const session = createSession();
+    service.browserLoginSessions.set(session.id, session);
+    service.checkBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.startBrowserLogin('another-room');
+
+    expect(result.sessionId).toBe(session.id);
+    expect(result.status).toBe('waiting');
+    expect(
+      service.browserProfileService.createLoginTarget
+    ).not.toHaveBeenCalled();
   });
 
   it('rejects a stale in-flight probe after cancellation and restores the persisted profile state', async () => {
@@ -539,9 +592,9 @@ describe('DouyinAuthService', () => {
     releaseTarget(lateTarget);
     await cancellation;
 
-    expect(service.browserProfileService.openLoginPanel).not.toHaveBeenCalledWith(
-      lateTarget.page
-    );
+    expect(
+      service.browserProfileService.openLoginPanel
+    ).not.toHaveBeenCalledWith(lateTarget.page);
     expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
       lateTarget
     );

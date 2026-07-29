@@ -21,6 +21,8 @@ const SELF_PROFILE_TIMEOUT_MS = 10_000;
 const SELF_PROFILE_NAVIGATION_TIMEOUT_MS = 15_000;
 const MANAGED_PAGE_MARKER_PREFIX = 'streamer-helper:douyin:';
 const MANAGED_PAGE_STALE_MS = 15 * 60 * 1000;
+const VERIFICATION_TRANSITION_TIMEOUT_MS = 5_000;
+const VERIFICATION_TRANSITION_POLL_MS = 100;
 
 const DOUYIN_ORIGINS = [
   'https://www.douyin.com',
@@ -73,6 +75,11 @@ export type DouyinProfileVerificationMethod =
   | 'receive_sms'
   | 'face'
   | 'send_sms';
+
+export interface DouyinProfileVerificationState {
+  challenge: DouyinProfileChallenge;
+  awaitingCode: boolean;
+}
 
 export interface DouyinCookieDiagnostics {
   cookieNames: string[];
@@ -449,22 +456,48 @@ export class DouyinBrowserProfileService {
   /**
    * Detects both the first-party page and cross-origin verification frames.
    */
-  async detectChallenge(
+  async detectVerificationState(
     page: Page
-  ): Promise<DouyinProfileChallenge | undefined> {
+  ): Promise<DouyinProfileVerificationState | undefined> {
     const snapshots = await this.collectFrameSnapshots(page);
+    const smsCodeStep = snapshots.some(snapshot =>
+      this.isSmsVerificationCodeSnapshot(snapshot)
+    );
+    if (smsCodeStep) {
+      const codeInput = await this.findActiveVerificationCodeInput(page);
+      const awaitingCode = Boolean(codeInput);
+      if (codeInput) {
+        await codeInput.dispose().catch(() => undefined);
+      }
+      return {
+        challenge: 'second_verification',
+        awaitingCode,
+      };
+    }
 
     if (
       snapshots.some(snapshot => this.isSecondaryVerificationSnapshot(snapshot))
     ) {
-      return 'second_verification';
+      return {
+        challenge: 'second_verification',
+        awaitingCode: false,
+      };
     }
 
     if (snapshots.some(snapshot => this.isCaptchaSnapshot(snapshot))) {
-      return 'captcha';
+      return {
+        challenge: 'captcha',
+        awaitingCode: false,
+      };
     }
 
     return undefined;
+  }
+
+  async detectChallenge(
+    page: Page
+  ): Promise<DouyinProfileChallenge | undefined> {
+    return (await this.detectVerificationState(page))?.challenge;
   }
 
   async isLoginRequired(page: Page): Promise<boolean> {
@@ -500,7 +533,9 @@ export class DouyinBrowserProfileService {
     const labels = VERIFICATION_METHOD_LABELS[method];
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (await this.clickVisibleTextAcrossFrames(page, labels)) {
-        return true;
+        return method === 'receive_sms'
+          ? this.waitForActiveVerificationCodeInput(page)
+          : true;
       }
       if (attempt === 0) {
         await new Promise(resolve => setTimeout(resolve, 150));
@@ -536,71 +571,38 @@ export class DouyinBrowserProfileService {
       throw new Error('Douyin verification code must contain 4 to 8 digits');
     }
 
-    for (const frame of page.frames()) {
-      if (!(await this.isFrameVisible(frame))) {
-        continue;
-      }
-      try {
-        const filled = await frame.evaluate(value => {
-          const scope = globalThis as any;
-          const doc = scope.document;
-          const inputs = Array.from(doc.querySelectorAll('input')) as any[];
-          const input = inputs.find(node => {
-            const rect = node.getBoundingClientRect();
-            const style = scope.getComputedStyle(node);
-            const label = [
-              node.placeholder,
-              node.getAttribute('aria-label'),
-              node.name,
-            ]
-              .filter(Boolean)
-              .join(' ');
-            return (
-              /验证码|verification|code/i.test(label) &&
-              rect.width > 0 &&
-              rect.height > 0 &&
-              style.visibility !== 'hidden' &&
-              style.display !== 'none'
-            );
-          });
-          if (!input) {
-            return false;
-          }
-
-          const descriptor = Object.getOwnPropertyDescriptor(
-            scope.HTMLInputElement.prototype,
-            'value'
-          );
-          descriptor?.set?.call(input, value);
-          input.dispatchEvent(new scope.Event('input', { bubbles: true }));
-          input.dispatchEvent(new scope.Event('change', { bubbles: true }));
-          input.focus();
-          return true;
-        }, code);
-        if (filled) {
-          return true;
-        }
-      } catch {
-        // Continue with the next frame while Douyin replaces verification UI.
-      }
+    const input = await this.findActiveVerificationCodeInput(page);
+    if (!input) {
+      return false;
     }
-
-    return false;
+    try {
+      await this.setVerificationCode(input, code);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await input.dispose().catch(() => undefined);
+    }
   }
 
   async submitVerificationCode(page: Page, code: string): Promise<boolean> {
-    if (!(await this.fillVerificationCode(page, code))) {
+    if (!/^\d{4,8}$/.test(code)) {
+      throw new Error('Douyin verification code must contain 4 to 8 digits');
+    }
+
+    const input = await this.findActiveVerificationCodeInput(page);
+    if (!input) {
       return false;
     }
 
-    const submitted = await this.clickVisibleTextAcrossFrames(
-      page,
-      VERIFICATION_SUBMIT_LABELS
-    );
-    if (!submitted) {
-      await page.keyboard.press('Enter');
+    try {
+      await this.setVerificationCode(input, code);
+      return await this.clickVerificationCodeSubmit(page);
+    } catch {
+      return false;
+    } finally {
+      await input.dispose().catch(() => undefined);
     }
-    return true;
   }
 
   /**
@@ -795,6 +797,248 @@ export class DouyinBrowserProfileService {
     }
   }
 
+  private async waitForActiveVerificationCodeInput(
+    page: Page
+  ): Promise<boolean> {
+    const deadline = Date.now() + VERIFICATION_TRANSITION_TIMEOUT_MS;
+    do {
+      const input = await this.findActiveVerificationCodeInput(page);
+      if (input) {
+        await input.dispose().catch(() => undefined);
+        return true;
+      }
+      await new Promise(resolve =>
+        setTimeout(resolve, VERIFICATION_TRANSITION_POLL_MS)
+      );
+    } while (Date.now() < deadline);
+    return false;
+  }
+
+  /**
+   * Returns only the code input inside the active secondary-verification
+   * panel. Douyin keeps a second, visually covered login input in the DOM, so
+   * CSS visibility alone is not sufficient.
+   */
+  private async findActiveVerificationCodeInput(
+    page: Page
+  ): Promise<ElementHandle<HTMLInputElement> | undefined> {
+    for (const frame of page.frames()) {
+      if (!(await this.isFrameVisible(frame))) {
+        continue;
+      }
+
+      let handle: Awaited<ReturnType<Frame['evaluateHandle']>> | undefined;
+      try {
+        handle = await frame.evaluateHandle(() => {
+          const scope = globalThis as any;
+          const doc = scope.document;
+          const normalize = (value: unknown) =>
+            String(value || '')
+              .replace(/\s+/g, '')
+              .trim();
+          const pageText = normalize(
+            doc.body?.innerText || doc.body?.textContent
+          );
+          if (
+            !/接收短信验证码|接收短信验证/.test(pageText) ||
+            !/短信已发送至|验证码已发送|重新发送/.test(pageText)
+          ) {
+            return null;
+          }
+          const isActive = (node: any) => {
+            if (
+              node.disabled ||
+              node.getAttribute?.('aria-disabled') === 'true'
+            ) {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            if (
+              rect.width < 2 ||
+              rect.height < 2 ||
+              rect.right <= 0 ||
+              rect.bottom <= 0 ||
+              rect.left >= scope.innerWidth ||
+              rect.top >= scope.innerHeight
+            ) {
+              return false;
+            }
+            let current = node;
+            while (current) {
+              const style = scope.getComputedStyle(current);
+              if (
+                style.display === 'none' ||
+                style.visibility === 'hidden' ||
+                style.visibility === 'collapse' ||
+                Number(style.opacity) <= 0.01 ||
+                style.pointerEvents === 'none'
+              ) {
+                return false;
+              }
+              current = current.parentElement;
+            }
+            const x = Math.min(
+              Math.max(rect.left + rect.width / 2, 0),
+              Math.max(scope.innerWidth - 1, 0)
+            );
+            const y = Math.min(
+              Math.max(rect.top + rect.height / 2, 0),
+              Math.max(scope.innerHeight - 1, 0)
+            );
+            const hitTarget = doc.elementFromPoint(x, y);
+            return (
+              hitTarget === node ||
+              (hitTarget && typeof node.contains === 'function'
+                ? node.contains(hitTarget)
+                : false)
+            );
+          };
+
+          const inputs = Array.from(doc.querySelectorAll('input')).filter(
+            (node: any) => {
+              const label = [
+                node.placeholder,
+                node.getAttribute?.('aria-label'),
+                node.name,
+              ]
+                .filter(Boolean)
+                .join(' ');
+              return /验证码|verification|code/i.test(label) && isActive(node);
+            }
+          ) as any[];
+          return (
+            inputs.find(input => doc.activeElement === input) ||
+            inputs[0] ||
+            null
+          );
+        });
+        const input =
+          handle.asElement() as ElementHandle<HTMLInputElement> | null;
+        if (input) {
+          return input;
+        }
+      } catch {
+        // Continue while Douyin replaces the verification panel or frame.
+      }
+      await handle?.dispose().catch(() => undefined);
+    }
+    return undefined;
+  }
+
+  private async setVerificationCode(
+    input: ElementHandle<HTMLInputElement>,
+    code: string
+  ): Promise<void> {
+    await input.evaluate((node, value) => {
+      const scope = globalThis as any;
+      const descriptor = Object.getOwnPropertyDescriptor(
+        scope.HTMLInputElement.prototype,
+        'value'
+      );
+      if (descriptor?.set) {
+        descriptor.set.call(node, value);
+      } else {
+        node.value = value;
+      }
+      node.dispatchEvent(new scope.Event('input', { bubbles: true }));
+      node.dispatchEvent(new scope.Event('change', { bubbles: true }));
+      node.focus();
+    }, code);
+  }
+
+  private async clickVerificationCodeSubmit(page: Page): Promise<boolean> {
+    const deadline = Date.now() + 1_000;
+    do {
+      const input = await this.findActiveVerificationCodeInput(page);
+      if (!input) {
+        await new Promise(resolve =>
+          setTimeout(resolve, VERIFICATION_TRANSITION_POLL_MS)
+        );
+        continue;
+      }
+      let handle:
+        | Awaited<ReturnType<ElementHandle['evaluateHandle']>>
+        | undefined;
+      try {
+        handle = await input.evaluateHandle(
+          (node, values) => {
+            const scope = globalThis as any;
+            const doc = scope.document;
+            const normalize = (value: unknown) =>
+              String(value || '')
+                .replace(/\s+/g, '')
+                .trim();
+            const findVerificationContainer = (element: any) => {
+              let current = element.parentElement;
+              while (current && current !== doc.body) {
+                const text = normalize(
+                  current.innerText || current.textContent
+                );
+                if (
+                  /接收短信验证码|接收短信验证/.test(text) &&
+                  /短信已发送至|验证码已发送|重新发送/.test(text)
+                ) {
+                  return current;
+                }
+                current = current.parentElement;
+              }
+              return null;
+            };
+            const container = findVerificationContainer(node);
+            if (!container) {
+              return null;
+            }
+            const normalizedLabels = new Set(values.map(normalize));
+            const matches = Array.from(
+              container.querySelectorAll(
+                'button, a, [role="button"], [tabindex], label, div, span'
+              )
+            ).filter((element: any) =>
+              normalizedLabels.has(
+                normalize(element.innerText || element.textContent)
+              )
+            ) as any[];
+            const target =
+              matches.find(
+                element =>
+                  !matches.some(
+                    other => other !== element && element.contains(other)
+                  )
+              ) || matches[0];
+            const className = String(
+              target?.getAttribute?.('class') || target?.className || ''
+            );
+            if (
+              !target ||
+              target.disabled ||
+              target.getAttribute?.('aria-disabled') === 'true' ||
+              target.getAttribute?.('data-disabled') === 'true' ||
+              /(^|[-_\s])disabled(?:[-_\s]|$)/i.test(className)
+            ) {
+              return null;
+            }
+            return target;
+          },
+          [...VERIFICATION_SUBMIT_LABELS]
+        );
+        const target = handle.asElement() as ElementHandle<Element> | null;
+        if (target) {
+          await target.click();
+          return true;
+        }
+      } catch {
+        // Retry briefly while React enables or replaces the submit action.
+      } finally {
+        await handle?.dispose().catch(() => undefined);
+        await input.dispose().catch(() => undefined);
+      }
+      await new Promise(resolve =>
+        setTimeout(resolve, VERIFICATION_TRANSITION_POLL_MS)
+      );
+    } while (Date.now() < deadline);
+    return false;
+  }
+
   private async collectFrameSnapshots(page: Page): Promise<FrameSnapshot[]> {
     const snapshots: FrameSnapshot[] = [];
     const frames = page.frames();
@@ -840,10 +1084,18 @@ export class DouyinBrowserProfileService {
 
   private isSecondaryVerificationSnapshot(snapshot: FrameSnapshot): boolean {
     return (
-      /身份验证|身份认证|安全验证/.test(snapshot.text) &&
-      /短信验证码|刷脸验证|刷脸认证|本人操作|验证方式|接收短信|发送短信/.test(
-        snapshot.text
-      )
+      this.isSmsVerificationCodeSnapshot(snapshot) ||
+      (/身份验证|身份认证|安全验证/.test(snapshot.text) &&
+        /短信验证码|刷脸验证|刷脸认证|本人操作|验证方式|接收短信|发送短信/.test(
+          snapshot.text
+        ))
+    );
+  }
+
+  private isSmsVerificationCodeSnapshot(snapshot: FrameSnapshot): boolean {
+    return (
+      /接收短信验证码|接收短信验证/.test(snapshot.text) &&
+      /短信已发送至|验证码已发送|重新发送/.test(snapshot.text)
     );
   }
 
