@@ -134,11 +134,22 @@ describe('DouyinCredentialRepository', () => {
     const started = await repository.beginOperation('operation-5', {
       state: 'validating',
     });
+    if (!started) {
+      throw new Error('Expected the operation to be acquired');
+    }
     expect(started.operation).toEqual({ id: 'operation-5', generation: 5 });
 
-    await repository.invalidateOperation({
-      state: 'expired',
-      verifiedAt: null,
+    const replacement = await repository.beginOperation(
+      'replacement-operation',
+      {
+        state: 'expired',
+        verifiedAt: null,
+      },
+      { replaceActive: true }
+    );
+    expect(replacement?.operation).toEqual({
+      id: 'replacement-operation',
+      generation: 6,
     });
     await expect(
       repository.transition(
@@ -149,5 +160,87 @@ describe('DouyinCredentialRepository', () => {
     ).resolves.toBeNull();
     expect(current.state).toBe('expired');
     expect(current.generation).toBe(6);
+  });
+
+  it('rejects a competing acquire and only takes over the expected operation', async () => {
+    const repository = new DouyinCredentialRepository() as any;
+    let current: any = {
+      id: 'credential-id',
+      slot: 'default',
+      state: 'validating',
+      cookieNames: [],
+      operationId: 'active-operation',
+      generation: 7,
+    };
+    const entityRepository = {
+      createQueryBuilder: jest.fn(() => createInsertBuilder()),
+      findOneOrFail: jest.fn(async () => current),
+      create: jest.fn(value => value),
+      save: jest.fn(async value => {
+        current = value;
+        return value;
+      }),
+    };
+    repository.repo = {
+      manager: {
+        transaction: jest.fn(async callback =>
+          callback({
+            getRepository: () => entityRepository,
+          })
+        ),
+      },
+    };
+
+    await expect(
+      repository.beginOperation('competing-operation', {
+        state: 'validating',
+      })
+    ).resolves.toBeNull();
+    await expect(
+      repository.beginOperation(
+        'stale-takeover',
+        { state: 'validating' },
+        {
+          expectedOperation: {
+            id: 'active-operation',
+            generation: 6,
+          },
+        }
+      )
+    ).resolves.toBeNull();
+    await expect(
+      repository.transitionWhenIdle({
+        state: 'challenged',
+        lastValidationCode: 'CAPTCHA_REQUIRED',
+      })
+    ).resolves.toBeNull();
+    expect(entityRepository.save).not.toHaveBeenCalled();
+
+    const takeover = await repository.beginOperation(
+      'replacement-operation',
+      { state: 'validating' },
+      {
+        expectedOperation: {
+          id: 'active-operation',
+          generation: 7,
+        },
+      }
+    );
+
+    expect(takeover).toEqual(
+      expect.objectContaining({
+        operation: {
+          id: 'replacement-operation',
+          generation: 8,
+        },
+      })
+    );
+    expect(current).toEqual(
+      expect.objectContaining({
+        operationId: 'replacement-operation',
+        generation: 8,
+      })
+    );
+    expect(entityRepository.save).toHaveBeenCalledTimes(1);
   });
 });

@@ -29,6 +29,19 @@ export interface DouyinCredentialOperationStart {
   operation: DouyinCredentialOperation;
 }
 
+export interface DouyinCredentialOperationAcquireOptions {
+  /**
+   * Take over only the exact operation observed by the caller. This is used to
+   * reconcile work left behind by a previous backend process.
+   */
+  expectedOperation?: DouyinCredentialOperation;
+  /**
+   * User-requested logout is the only flow allowed to invalidate any current
+   * owner unconditionally.
+   */
+  replaceActive?: boolean;
+}
+
 @Provide()
 @Scope(ScopeEnum.Singleton)
 export class DouyinCredentialRepository {
@@ -60,10 +73,23 @@ export class DouyinCredentialRepository {
 
   async beginOperation(
     operationId: string,
-    transition: DouyinCredentialTransition
-  ): Promise<DouyinCredentialOperationStart> {
+    transition: DouyinCredentialTransition,
+    options: DouyinCredentialOperationAcquireOptions = {}
+  ): Promise<DouyinCredentialOperationStart | null> {
     return this.repo.manager.transaction(async manager => {
       const { repository, current } = await this.lockSingleton(manager);
+      if (!options.replaceActive) {
+        if (options.expectedOperation) {
+          if (
+            current.operationId !== options.expectedOperation.id ||
+            current.generation !== options.expectedOperation.generation
+          ) {
+            return null;
+          }
+        } else if (current.operationId) {
+          return null;
+        }
+      }
       const operation = {
         id: operationId,
         generation: current.generation + 1,
@@ -78,15 +104,18 @@ export class DouyinCredentialRepository {
     });
   }
 
-  async invalidateOperation(
+  async transitionWhenIdle(
     transition: DouyinCredentialTransition
-  ): Promise<DouyinCredential> {
+  ): Promise<DouyinCredential | null> {
     return this.repo.manager.transaction(async manager => {
       const { repository, current } = await this.lockSingleton(manager);
+      if (current.operationId) {
+        return null;
+      }
       return repository.save(
         this.createNextCredential(repository, current, transition, {
           operationId: null,
-          generation: current.generation + 1,
+          generation: current.generation,
         })
       );
     });

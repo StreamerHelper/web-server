@@ -39,6 +39,20 @@ describe('DouyinBrowserProfileService', () => {
       sourceScheme: 'Secure',
     } as any);
 
+  const createValidationPage = (browserContext: any) => {
+    const validationPage = {
+      url: jest.fn().mockReturnValue('https://www.douyin.com/'),
+      browserContext: jest.fn().mockReturnValue(browserContext),
+      evaluateOnNewDocument: jest.fn().mockResolvedValue(undefined),
+      evaluate: jest.fn().mockResolvedValue(undefined),
+      setViewport: jest.fn().mockResolvedValue(undefined),
+      isClosed: jest.fn().mockReturnValue(false),
+      close: jest.fn().mockResolvedValue(undefined),
+    };
+    browserContext.newPage = jest.fn().mockResolvedValue(validationPage);
+    return validationPage;
+  };
+
   afterEach(() => {
     jest.restoreAllMocks();
     if (originalBrowserEndpoint === undefined) {
@@ -459,7 +473,7 @@ describe('DouyinBrowserProfileService', () => {
     );
   });
 
-  it('marks a profile valid only when the account endpoint returns a stable identity', async () => {
+  it('validates identity in a sibling page without navigating the interactive login page', async () => {
     const service = createService();
     const response = { status: () => 200 };
     const browserContext = {
@@ -469,6 +483,7 @@ describe('DouyinBrowserProfileService', () => {
           createCookie('sessionid', 'secret', '.douyin.com', 1_800_000_000),
         ]),
     };
+    const validationPage = createValidationPage(browserContext);
     const page = {
       url: () => 'https://live.douyin.com/123456',
       browserContext: () => browserContext,
@@ -485,6 +500,7 @@ describe('DouyinBrowserProfileService', () => {
       httpStatus: 200,
       statusCode: 0,
       hasStableUserId: true,
+      accountFingerprint: 'a'.repeat(64),
       loginRequired: false,
     });
 
@@ -494,14 +510,58 @@ describe('DouyinBrowserProfileService', () => {
       expect.objectContaining({
         state: 'valid',
         statusCode: 200,
+        accountFingerprint: 'a'.repeat(64),
         authenticatedCookieNames: ['sessionid'],
       })
     );
+    expect((browserContext as any).newPage).toHaveBeenCalledTimes(1);
     expect(service.navigate).toHaveBeenCalledWith(
-      page,
+      validationPage,
       'https://www.douyin.com/',
       expect.any(Number)
     );
+    expect(service.navigate).not.toHaveBeenCalledWith(
+      page,
+      expect.any(String),
+      expect.any(Number)
+    );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not accept an identity payload from a failed HTTP response', async () => {
+    const service = createService();
+    const browserContext = {
+      cookies: jest
+        .fn()
+        .mockResolvedValue([
+          createCookie('sessionid', 'secret', '.douyin.com'),
+        ]),
+    };
+    const validationPage = createValidationPage(browserContext);
+    const page = {
+      url: () => 'https://www.douyin.com/',
+      browserContext: () => browserContext,
+    };
+    jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
+    jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
+    service.navigate = jest.fn().mockResolvedValue({ status: () => 500 });
+    service.fetchSelfProfileState = jest.fn().mockResolvedValue({
+      httpStatus: 500,
+      statusCode: 0,
+      hasStableUserId: true,
+      loginRequired: false,
+    });
+
+    const result = await service.probe(page);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        state: 'transient',
+        statusCode: 500,
+        reason: 'Douyin account endpoint returned HTTP 500',
+      })
+    );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
   });
 
   it.each([8, 2483])(
@@ -515,6 +575,7 @@ describe('DouyinBrowserProfileService', () => {
             createCookie('sessionid', 'stale', '.douyin.com'),
           ]),
       };
+      const validationPage = createValidationPage(browserContext);
       const page = {
         url: () => 'https://www.douyin.com/',
         browserContext: () => browserContext,
@@ -537,6 +598,7 @@ describe('DouyinBrowserProfileService', () => {
           authenticatedCookieNames: ['sessionid'],
         })
       );
+      expect(validationPage.close).toHaveBeenCalledTimes(1);
     }
   );
 
@@ -549,6 +611,7 @@ describe('DouyinBrowserProfileService', () => {
           createCookie('sessionid', 'secret', '.douyin.com'),
         ]),
     };
+    const validationPage = createValidationPage(browserContext);
     const page = {
       url: () => 'https://www.douyin.com/',
       browserContext: () => browserContext,
@@ -571,6 +634,7 @@ describe('DouyinBrowserProfileService', () => {
         reason: 'Douyin account endpoint did not confirm a stable identity',
       })
     );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
   });
 
   it('keeps account identifiers and profile fields inside the browser process', async () => {
@@ -602,11 +666,49 @@ describe('DouyinBrowserProfileService', () => {
           httpStatus: 200,
           statusCode: 0,
           hasStableUserId: true,
+          accountFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
           loginRequired: false,
         })
       );
       expect(JSON.stringify(result)).not.toContain('private-stable-id');
       expect(JSON.stringify(result)).not.toContain('private-profile-name');
+    } finally {
+      (globalThis as any).fetch = originalFetch;
+    }
+  });
+
+  it('does not use the editable unique_id handle as an account identity', async () => {
+    const service = createService();
+    const originalFetch = (globalThis as any).fetch;
+    const page = {
+      evaluate: jest.fn(async (callback, timeoutMs) => {
+        (globalThis as any).fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          text: jest.fn().mockResolvedValue(
+            JSON.stringify({
+              status_code: 0,
+              user: {
+                unique_id: 'editable-handle',
+              },
+            })
+          ),
+        });
+        return callback(timeoutMs);
+      }),
+    };
+
+    try {
+      const result = await service.fetchSelfProfileState(page);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          httpStatus: 200,
+          statusCode: 0,
+          hasStableUserId: false,
+          accountFingerprint: undefined,
+        })
+      );
+      expect(JSON.stringify(result)).not.toContain('editable-handle');
     } finally {
       (globalThis as any).fetch = originalFetch;
     }
@@ -716,6 +818,149 @@ describe('DouyinBrowserProfileService', () => {
     ).rejects.toThrow('must contain 4 to 8 digits');
   });
 
+  it('ignores hidden duplicate verification options and clicks the active panel', async () => {
+    const service = createService();
+    const originalDocument = (globalThis as any).document;
+    const originalInnerWidth = (globalThis as any).innerWidth;
+    const originalInnerHeight = (globalThis as any).innerHeight;
+    const originalGetComputedStyle = (globalThis as any).getComputedStyle;
+    const defaultStyle = {
+      display: 'block',
+      visibility: 'visible',
+      opacity: '1',
+      pointerEvents: 'auto',
+    };
+    const body: any = {
+      parentElement: null,
+      style: defaultStyle,
+    };
+    const createNode = (
+      text: string,
+      left: number,
+      parentElement: any,
+      clickable = false,
+      style = defaultStyle
+    ) => {
+      const node: any = {
+        innerText: text,
+        textContent: text,
+        parentElement,
+        style,
+        disabled: false,
+        className: '',
+        clickable,
+        click: jest.fn().mockResolvedValue(undefined),
+        getAttribute: jest.fn().mockReturnValue(null),
+        getBoundingClientRect: () => ({
+          left,
+          top: 100,
+          right: left + 120,
+          bottom: 140,
+          width: 120,
+          height: 40,
+        }),
+        contains(other: any) {
+          let current = other;
+          while (current) {
+            if (current === node) {
+              return true;
+            }
+            current = current.parentElement;
+          }
+          return false;
+        },
+        closest() {
+          let current: any = node;
+          while (current) {
+            if (current.clickable) {
+              return current;
+            }
+            current = current.parentElement;
+          }
+          return null;
+        },
+      };
+      return node;
+    };
+
+    const hiddenPanel = createNode('', 10, body, false, {
+      ...defaultStyle,
+      opacity: '0',
+    });
+    const labels = ['接收短信验证码', '手机刷脸认证', '发送短信验证'];
+    const hiddenButtons = labels.map((label, index) =>
+      createNode(label, 20 + index * 140, hiddenPanel, true)
+    );
+    const hiddenLabels = hiddenButtons.map((button, index) =>
+      createNode(labels[index], 20 + index * 140, button)
+    );
+    const activeButtons = labels.map((label, index) =>
+      createNode(label, 500 + index * 140, body, true)
+    );
+    const activeLabels = activeButtons.map((button, index) =>
+      createNode(labels[index], 500 + index * 140, button, false, {
+        ...defaultStyle,
+        pointerEvents: 'none',
+      })
+    );
+    const allLabels = [...hiddenLabels, ...activeLabels];
+    const document = {
+      querySelectorAll: jest.fn().mockReturnValue(allLabels),
+      elementFromPoint: jest.fn((x: number) => {
+        const index = Math.floor((x - 500) / 140);
+        return activeButtons[index] || null;
+      }),
+    };
+    const frame = {
+      evaluateHandle: jest.fn(async (callback, values) => {
+        const target = callback(values);
+        return {
+          asElement: jest.fn().mockReturnValue(target),
+          dispose: jest.fn().mockResolvedValue(undefined),
+        };
+      }),
+    };
+    const page = {
+      frames: () => [frame],
+    };
+    service.waitForActiveVerificationCodeInput = jest
+      .fn()
+      .mockResolvedValue(true);
+
+    try {
+      (globalThis as any).document = document;
+      (globalThis as any).innerWidth = 1280;
+      (globalThis as any).innerHeight = 800;
+      (globalThis as any).getComputedStyle = (node: any) =>
+        node.style || defaultStyle;
+
+      await expect(
+        service.getAvailableVerificationMethods(page)
+      ).resolves.toEqual(['receive_sms', 'face', 'send_sms']);
+      await expect(
+        service.selectVerificationMethod(page, 'receive_sms')
+      ).resolves.toBe(true);
+      await expect(
+        service.selectVerificationMethod(page, 'face')
+      ).resolves.toBe(true);
+      await expect(
+        service.selectVerificationMethod(page, 'send_sms')
+      ).resolves.toBe(true);
+
+      for (const button of hiddenButtons) {
+        expect(button.click).not.toHaveBeenCalled();
+      }
+      for (const button of activeButtons) {
+        expect(button.click).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      (globalThis as any).document = originalDocument;
+      (globalThis as any).innerWidth = originalInnerWidth;
+      (globalThis as any).innerHeight = originalInnerHeight;
+      (globalThis as any).getComputedStyle = originalGetComputedStyle;
+    }
+  });
+
   it('confirms SMS selection only after the active code input appears', async () => {
     const service = createService();
     service.clickVisibleTextAcrossFrames = jest.fn().mockResolvedValue(true);
@@ -751,7 +996,7 @@ describe('DouyinBrowserProfileService', () => {
     expect(JSON.stringify(diagnostics)).not.toContain('device-secret');
   });
 
-  it('clears ByteDance cookies and all persisted site storage on logout', async () => {
+  it('clears ByteDance cookies plus known and cookie-derived site storage', async () => {
     const service = createService();
     const byteDanceCookie = createCookie('sessionid', 'secret', '.douyin.com');
     const foreignCookie = createCookie('foreign', 'keep', '.example.com');
@@ -778,11 +1023,25 @@ describe('DouyinBrowserProfileService', () => {
 
     expect(browserContext.deleteCookie).toHaveBeenCalledWith(byteDanceCookie);
     expect(browserContext.deleteCookie).not.toHaveBeenCalledWith(foreignCookie);
-    expect(client.send).toHaveBeenCalledTimes(5);
+    expect(client.send.mock.calls.length).toBeGreaterThanOrEqual(8);
     expect(client.send).toHaveBeenCalledWith(
       'Storage.clearDataForOrigin',
       expect.objectContaining({
         origin: 'https://live.douyin.com',
+        storageTypes: 'all',
+      })
+    );
+    expect(client.send).toHaveBeenCalledWith(
+      'Storage.clearDataForOrigin',
+      expect.objectContaining({
+        origin: 'https://lf-zt.douyin.com',
+        storageTypes: 'all',
+      })
+    );
+    expect(client.send).toHaveBeenCalledWith(
+      'Storage.clearDataForOrigin',
+      expect.objectContaining({
+        origin: 'https://douyin.com',
         storageTypes: 'all',
       })
     );

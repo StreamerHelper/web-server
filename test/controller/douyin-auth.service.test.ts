@@ -40,13 +40,27 @@ describe('DouyinAuthService', () => {
     };
     service.credentialRepository = {
       findLatest: jest.fn(async () => credential),
-      beginOperation: jest.fn(async (operationId, transition) => {
-        generation = Math.max(generation, credential?.generation || 0) + 1;
-        return {
-          credential: applyTransition(transition, operationId, generation),
-          operation: { id: operationId, generation },
-        };
-      }),
+      beginOperation: jest.fn(
+        async (operationId, transition, options: any = {}) => {
+          if (!options.replaceActive) {
+            if (
+              options.expectedOperation &&
+              (credential?.operationId !== options.expectedOperation.id ||
+                credential?.generation !== options.expectedOperation.generation)
+            ) {
+              return null;
+            }
+            if (!options.expectedOperation && credential?.operationId) {
+              return null;
+            }
+          }
+          generation = Math.max(generation, credential?.generation || 0) + 1;
+          return {
+            credential: applyTransition(transition, operationId, generation),
+            operation: { id: operationId, generation },
+          };
+        }
+      ),
       transition: jest.fn(async (transition, operation, complete) => {
         if (
           operation &&
@@ -61,9 +75,15 @@ describe('DouyinAuthService', () => {
           credential?.generation ?? generation
         );
       }),
-      invalidateOperation: jest.fn(async transition => {
-        generation = Math.max(generation, credential?.generation || 0) + 1;
-        return applyTransition(transition, null, generation);
+      transitionWhenIdle: jest.fn(async transition => {
+        if (credential?.operationId) {
+          return null;
+        }
+        return applyTransition(
+          transition,
+          null,
+          credential?.generation ?? generation
+        );
       }),
     };
     service.browserProfileService = {
@@ -74,6 +94,7 @@ describe('DouyinAuthService', () => {
       openLoginPanel: jest.fn().mockResolvedValue(true),
       detectChallenge: jest.fn().mockResolvedValue(undefined),
       detectVerificationState: jest.fn().mockResolvedValue(undefined),
+      isLoginRequired: jest.fn().mockResolvedValue(false),
       getCookieDiagnostics: jest.fn(),
       getAvailableVerificationMethods: jest
         .fn()
@@ -161,6 +182,7 @@ describe('DouyinAuthService', () => {
     service.setCredential({
       ...service.getCredential(),
       state: 'valid',
+      verifiedAt: new Date(),
       lastValidationCode: null,
       lastValidationError: null,
     });
@@ -198,6 +220,7 @@ describe('DouyinAuthService', () => {
       cookieNames: ['sessionid', 'ttwid'],
       authenticatedCookieNames: ['sessionid'],
       authExpiresAt: new Date('2026-09-25T00:00:00.000Z'),
+      accountFingerprint: 'a'.repeat(64),
     });
 
     const result = await service.verifyCookie(undefined, '123456');
@@ -217,6 +240,43 @@ describe('DouyinAuthService', () => {
     );
     expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
       target
+    );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not persist a profile when consecutive account identities differ', async () => {
+    const service = createService();
+    const target = createTarget();
+    service.browserProfileService.createLoginTarget.mockResolvedValue(target);
+    service.browserProfileService.probe
+      .mockResolvedValueOnce({
+        state: 'valid',
+        finalUrl: 'https://www.douyin.com/',
+        cookieNames: ['sessionid'],
+        authenticatedCookieNames: ['sessionid'],
+        accountFingerprint: 'a'.repeat(64),
+      })
+      .mockResolvedValueOnce({
+        state: 'valid',
+        finalUrl: 'https://www.douyin.com/',
+        cookieNames: ['sessionid'],
+        authenticatedCookieNames: ['sessionid'],
+        accountFingerprint: 'b'.repeat(64),
+      });
+
+    const result = await service.verifyCookie();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: false,
+        error: expect.stringContaining('changed between consecutive'),
+      })
+    );
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'unknown',
+        lastValidationCode: 'TRANSIENT_ERROR',
+      })
     );
   });
 
@@ -382,6 +442,76 @@ describe('DouyinAuthService', () => {
     expect(service.browserProfileService.closeTarget).not.toHaveBeenCalled();
   });
 
+  it('uses Cookie names only as diagnostics and still validates unknown names', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    service.browserProfileService.getCookieDiagnostics.mockResolvedValue({
+      cookieNames: ['future_auth_cookie'],
+      authenticatedCookieNames: [],
+    });
+    service.browserProfileService.probe.mockResolvedValue({
+      state: 'valid',
+      finalUrl: 'https://www.douyin.com/',
+      statusCode: 200,
+      cookieNames: ['future_auth_cookie'],
+      authenticatedCookieNames: [],
+      accountFingerprint: 'a'.repeat(64),
+    });
+
+    await service.checkBrowserLoginSession(session);
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('authenticated');
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'valid',
+        cookieNames: ['future_auth_cookie'],
+      })
+    );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects provisional login Cookies when the account endpoint does not confirm an identity', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    service.browserProfileService.getCookieDiagnostics.mockResolvedValue({
+      cookieNames: ['sessionid', 'sid_guard'],
+      authenticatedCookieNames: ['sessionid', 'sid_guard'],
+    });
+    service.browserProfileService.probe.mockResolvedValue({
+      state: 'expired',
+      finalUrl: 'https://www.douyin.com/',
+      statusCode: 200,
+      cookieNames: ['sessionid', 'sid_guard'],
+      authenticatedCookieNames: ['sessionid', 'sid_guard'],
+      reason: 'Douyin account session is not authenticated',
+    });
+
+    await service.checkBrowserLoginSession(session);
+    expect(session.status).toBe('validating');
+    expect(service.getCredential().state).toBe('validating');
+    expect(service.browserProfileService.openLoginPanel).not.toHaveBeenCalled();
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('waiting');
+    expect(session.verifiedAt).toBeUndefined();
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'expired',
+        verifiedAt: null,
+        lastValidationCode: 'SESSION_EXPIRED',
+      })
+    );
+    expect(service.browserProfileService.closeTarget).not.toHaveBeenCalled();
+    expect(service.browserProfileService.openLoginPanel).toHaveBeenCalledWith(
+      session.target.page
+    );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
+  });
+
   it('completes login only after the persisted profile probe succeeds', async () => {
     const service = createService();
     const target = createTarget();
@@ -397,12 +527,63 @@ describe('DouyinAuthService', () => {
       statusCode: 200,
       cookieNames: ['sessionid', 'ttwid'],
       authenticatedCookieNames: ['sessionid'],
+      accountFingerprint: 'a'.repeat(64),
     });
+
+    await service.checkBrowserLoginSession(session);
+    expect(session.status).toBe('validating');
+    expect(service.getCredential().state).toBe('validating');
+    expect(service.browserProfileService.closeTarget).not.toHaveBeenCalled();
 
     await service.checkBrowserLoginSession(session);
 
     expect(session.status).toBe('authenticated');
     expect(service.getCredential().state).toBe('valid');
+    expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
+      target
+    );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires consecutive confirmations for the same Douyin account', async () => {
+    const service = createService();
+    const target = createTarget();
+    const session = createSession(target);
+    service.activateSession(session);
+    service.browserProfileService.getCookieDiagnostics.mockResolvedValue({
+      cookieNames: ['sessionid'],
+      authenticatedCookieNames: ['sessionid'],
+    });
+    service.browserProfileService.probe
+      .mockResolvedValueOnce({
+        state: 'valid',
+        finalUrl: 'https://www.douyin.com/',
+        statusCode: 200,
+        cookieNames: ['sessionid'],
+        authenticatedCookieNames: ['sessionid'],
+        accountFingerprint: 'a'.repeat(64),
+      })
+      .mockResolvedValue({
+        state: 'valid',
+        finalUrl: 'https://www.douyin.com/',
+        statusCode: 200,
+        cookieNames: ['sessionid'],
+        authenticatedCookieNames: ['sessionid'],
+        accountFingerprint: 'b'.repeat(64),
+      });
+
+    await service.checkBrowserLoginSession(session);
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('validating');
+    expect(service.getCredential().state).toBe('validating');
+    expect(service.browserProfileService.closeTarget).not.toHaveBeenCalled();
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('authenticated');
+    expect(service.getCredential().state).toBe('valid');
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(3);
     expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
       target
     );
@@ -495,9 +676,32 @@ describe('DouyinAuthService', () => {
     expect(order).toEqual(['check-start', 'check-end', 'select']);
   });
 
+  it('waits for an in-flight probe before disconnecting its browser target', async () => {
+    const service = createService();
+    const target = createTarget();
+    const session = createSession(target);
+    let releaseCheck!: () => void;
+    session.checkPromise = new Promise<void>(resolve => {
+      releaseCheck = resolve;
+    });
+
+    const closing = service.closeBrowserLoginSession(session, true);
+    await Promise.resolve();
+
+    expect(service.browserProfileService.closeTarget).not.toHaveBeenCalled();
+
+    releaseCheck();
+    await closing;
+
+    expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
+      target
+    );
+  });
+
   it('returns the active browser login session so the UI can reattach', async () => {
     const service = createService();
     const session = createSession();
+    service.activateSession(session);
     service.browserLoginSessions.set(session.id, session);
     service.checkBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
 
@@ -508,6 +712,287 @@ describe('DouyinAuthService', () => {
     expect(
       service.browserProfileService.createLoginTarget
     ).not.toHaveBeenCalled();
+  });
+
+  it('replaces an active challenged session for an explicit fresh login', async () => {
+    const service = createService();
+    const session = createSession();
+    const target = session.target;
+    service.activateSession(session);
+    session.status = 'verification_required';
+    service.browserLoginSessions.set(session.id, session);
+    service.checkBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+    service.prepareBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.startBrowserLogin(undefined, { fresh: true });
+
+    expect(result.sessionId).not.toBe(session.id);
+    expect(result.status).toBe('initializing');
+    expect(service.browserLoginSessions.has(session.id)).toBe(false);
+    expect(service.browserProfileService.logout).toHaveBeenCalledTimes(1);
+    expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
+      target
+    );
+    clearTimeout(
+      service.browserLoginSessions.get(result.sessionId)?.expireTimer
+    );
+  });
+
+  it('returns a login session that becomes authenticated during reattachment', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    service.browserLoginSessions.set(session.id, session);
+    service.checkBrowserLoginSession = jest.fn(async current => {
+      current.status = 'authenticated';
+      current.verifiedAt = new Date();
+      service.releaseOperation(current.operation);
+      service.setCredential({
+        ...service.getCredential(),
+        state: 'valid',
+        operationId: null,
+        verifiedAt: current.verifiedAt,
+      });
+    });
+
+    const result = await service.startBrowserLogin();
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        sessionId: session.id,
+        status: 'authenticated',
+      })
+    );
+    expect(service.browserProfileService.logout).not.toHaveBeenCalled();
+    expect(service.credentialRepository.beginOperation).not.toHaveBeenCalled();
+  });
+
+  it('serializes concurrent login starts without retiring the acquiring session', async () => {
+    const service = createService();
+    service.setCredential({
+      slot: 'default',
+      state: 'challenged',
+      cookieNames: ['sessionid'],
+      operationId: null,
+      generation: 3,
+      stateChangedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    service.prepareBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+    const originalBegin = service.credentialRepository.beginOperation;
+    let acquisitionStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      acquisitionStarted = resolve;
+    });
+    let releaseAcquisition!: () => void;
+    const gate = new Promise<void>(resolve => {
+      releaseAcquisition = resolve;
+    });
+    service.credentialRepository.beginOperation = jest.fn(
+      async (operationId, transition, options) => {
+        acquisitionStarted();
+        await gate;
+        return originalBegin(operationId, transition, options);
+      }
+    );
+
+    const first = service.startBrowserLogin(undefined, { fresh: false });
+    await started;
+    const second = service.startBrowserLogin(undefined, { fresh: false });
+    releaseAcquisition();
+
+    const firstResult = await first;
+    await expect(second).rejects.toMatchObject({ status: 409 });
+
+    expect(firstResult.status).toBe('initializing');
+    expect(service.browserLoginSessions.get(firstResult.sessionId)).toEqual(
+      expect.objectContaining({
+        status: 'initializing',
+        operation: expect.objectContaining({
+          id: expect.any(String),
+        }),
+      })
+    );
+    expect(service.credentialRepository.beginOperation).toHaveBeenCalledTimes(
+      1
+    );
+    clearTimeout(
+      service.browserLoginSessions.get(firstResult.sessionId)?.expireTimer
+    );
+  });
+
+  it('clears an existing account before starting a real account-switch login', async () => {
+    const service = createService();
+    service.setCredential({
+      slot: 'default',
+      state: 'valid',
+      cookieNames: ['sessionid'],
+      operationId: null,
+      generation: 3,
+      verifiedAt: new Date(),
+      stateChangedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    service.prepareBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.startBrowserLogin();
+
+    expect(result.status).toBe('initializing');
+    expect(service.browserProfileService.logout).toHaveBeenCalledTimes(1);
+    expect(service.credentialRepository.beginOperation).toHaveBeenCalledTimes(
+      2
+    );
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'validating',
+        operationId: expect.any(String),
+        generation: 5,
+      })
+    );
+    clearTimeout(
+      service.browserLoginSessions.get(result.sessionId)?.expireTimer
+    );
+  });
+
+  it('continues an explicit challenged profile without clearing it', async () => {
+    const service = createService();
+    service.setCredential({
+      slot: 'default',
+      state: 'challenged',
+      cookieNames: ['sessionid'],
+      operationId: null,
+      generation: 3,
+      stateChangedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    service.prepareBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.startBrowserLogin(undefined, { fresh: false });
+
+    expect(result.status).toBe('initializing');
+    expect(service.browserProfileService.logout).not.toHaveBeenCalled();
+    expect(service.credentialRepository.beginOperation).toHaveBeenCalledTimes(
+      1
+    );
+    clearTimeout(
+      service.browserLoginSessions.get(result.sessionId)?.expireTimer
+    );
+  });
+
+  it('does not let fresh false reuse a profile that is not challenged', async () => {
+    const service = createService();
+    service.setCredential({
+      slot: 'default',
+      state: 'valid',
+      cookieNames: ['sessionid'],
+      operationId: null,
+      generation: 3,
+      verifiedAt: new Date(),
+      stateChangedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    service.prepareBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.startBrowserLogin(undefined, { fresh: false });
+
+    expect(result.status).toBe('initializing');
+    expect(service.browserProfileService.logout).toHaveBeenCalledTimes(1);
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'validating',
+        generation: 5,
+      })
+    );
+    clearTimeout(
+      service.browserLoginSessions.get(result.sessionId)?.expireTimer
+    );
+  });
+
+  it('retires an in-memory login session after it loses operation ownership', async () => {
+    const service = createService();
+    const target = createTarget();
+    const session = createSession(target);
+    service.activateSession(session);
+    service.browserLoginSessions.set(session.id, session);
+    service.releaseOperation(session.operation);
+
+    const result = await service.getBrowserLoginStatus(session.id);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: 'failed',
+        error: expect.stringContaining('superseded'),
+      })
+    );
+    expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
+      target
+    );
+  });
+
+  it('does not let a stale session timeout invalidate a newer operation', async () => {
+    const service = createService();
+    const session = createSession();
+    const staleOperation = service.activateSession(session);
+    service.browserLoginSessions.set(session.id, session);
+    const newerOperation = {
+      id: 'newer-operation',
+      generation: staleOperation.generation + 1,
+    };
+    service.setCredential({
+      ...service.getCredential(),
+      state: 'validating',
+      operationId: newerOperation.id,
+      generation: newerOperation.generation,
+    });
+    service.activeOperations.clear();
+    service.activeOperations.add(
+      `${newerOperation.generation}:${newerOperation.id}`
+    );
+
+    await service.expireBrowserLoginSession(session.id);
+
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        operationId: newerOperation.id,
+        generation: newerOperation.generation,
+      })
+    );
+    expect(service.activeOperations).toContain(
+      `${newerOperation.generation}:${newerOperation.id}`
+    );
+    expect(
+      service.browserProfileService.createLoginTarget
+    ).not.toHaveBeenCalled();
+  });
+
+  it('does not let status or verification replace an active browser-login operation', async () => {
+    const service = createService();
+    const session = createSession();
+    const operation = service.activateSession(session);
+    service.browserLoginSessions.set(session.id, session);
+
+    const status = await service.getStatus();
+    await service.verifyCookie().catch(() => undefined);
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        state: 'validating',
+        isAuthenticated: false,
+      })
+    );
+    expect(service.credentialRepository.beginOperation).not.toHaveBeenCalled();
+    expect(
+      service.browserProfileService.createLoginTarget
+    ).not.toHaveBeenCalled();
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        operationId: operation.id,
+        generation: operation.generation,
+      })
+    );
+    expect(service.activeOperations).toContain(
+      `${operation.generation}:${operation.id}`
+    );
   });
 
   it('rejects a stale in-flight probe after cancellation and restores the persisted profile state', async () => {
@@ -535,7 +1020,7 @@ describe('DouyinAuthService', () => {
         probeStarted();
         return pendingProbe;
       })
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         state: 'expired',
         finalUrl: 'https://www.douyin.com/',
         cookieNames: [],
@@ -623,6 +1108,7 @@ describe('DouyinAuthService', () => {
       cookieNames: ['sessionid'],
       authenticatedCookieNames: ['sessionid'],
       authExpiresAt: new Date('2026-09-25T00:00:00.000Z'),
+      accountFingerprint: 'a'.repeat(64),
     });
 
     const status = await service.getStatus();
@@ -642,6 +1128,7 @@ describe('DouyinAuthService', () => {
     expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
       target
     );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
   });
 
   it('uses Cookie expiry only as a revalidation hint when the account endpoint remains valid', async () => {
@@ -665,6 +1152,7 @@ describe('DouyinAuthService', () => {
       cookieNames: ['sessionid'],
       authenticatedCookieNames: ['sessionid'],
       authExpiresAt: new Date('2026-09-25T00:00:00.000Z'),
+      accountFingerprint: 'a'.repeat(64),
     });
 
     const status = await service.getStatus();
@@ -683,8 +1171,10 @@ describe('DouyinAuthService', () => {
       })
     );
     expect(service.browserProfileService.probe).toHaveBeenCalledWith(
-      target.page
+      target.page,
+      undefined
     );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(2);
     expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
       target
     );
@@ -764,6 +1254,77 @@ describe('DouyinAuthService', () => {
     ).toHaveBeenCalledWith(session.target.page, '123456');
   });
 
+  it('lets an SMS callback settle without an immediate fixed-delay login probe', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    session.status = 'verification_required';
+    session.verification = {
+      challenge: 'second_verification',
+      stage: 'awaiting_code',
+      method: 'receive_sms',
+      availableMethods: ['receive_sms'],
+    };
+    service.browserLoginSessions.set(session.id, session);
+    service.checkBrowserLoginSession = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.interactWithBrowserLogin(session.id, {
+      type: 'submit_verification_code',
+      code: '123456',
+    });
+
+    expect(result.verification).toEqual(
+      expect.objectContaining({
+        method: 'receive_sms',
+        stage: 'processing',
+      })
+    );
+    expect(service.checkBrowserLoginSession).not.toHaveBeenCalled();
+    expect(service.browserProfileService.probe).not.toHaveBeenCalled();
+  });
+
+  it('waits for a cleared verification page to settle before probing the profile', async () => {
+    const service = createService();
+    const session = createSession();
+    service.activateSession(session);
+    session.status = 'verification_required';
+    session.verification = {
+      challenge: 'second_verification',
+      stage: 'processing',
+      method: 'receive_sms',
+      availableMethods: ['receive_sms'],
+    };
+    session.verificationClearedAt = new Date(Date.now() - 5_000);
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(session.status).toBe('verification_required');
+    expect(
+      service.browserProfileService.isLoginRequired
+    ).not.toHaveBeenCalled();
+    expect(service.browserProfileService.probe).not.toHaveBeenCalled();
+
+    session.verificationClearedAt = new Date(Date.now() - 7_000);
+    service.browserProfileService.getCookieDiagnostics.mockResolvedValue({
+      cookieNames: ['sessionid'],
+      authenticatedCookieNames: ['sessionid'],
+    });
+    service.browserProfileService.probe.mockResolvedValue({
+      state: 'transient',
+      finalUrl: 'https://www.douyin.com/',
+      cookieNames: ['sessionid'],
+      authenticatedCookieNames: ['sessionid'],
+      reason: 'still settling',
+    });
+
+    await service.checkBrowserLoginSession(session);
+
+    expect(service.browserProfileService.isLoginRequired).toHaveBeenCalledTimes(
+      1
+    );
+    expect(service.browserProfileService.probe).toHaveBeenCalledTimes(1);
+  });
+
   it('logs out the browser profile and records an explicit expired state', async () => {
     const service = createService();
 
@@ -776,6 +1337,96 @@ describe('DouyinAuthService', () => {
         cookieNames: [],
         lastValidationCode: 'SESSION_EXPIRED',
       })
+    );
+  });
+
+  it('orders a delayed runtime challenge before a newer logout operation', async () => {
+    const service = createService();
+    const transitionWhenIdle = service.credentialRepository.transitionWhenIdle;
+    let runtimeStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      runtimeStarted = resolve;
+    });
+    let releaseRuntime!: () => void;
+    const gate = new Promise<void>(resolve => {
+      releaseRuntime = resolve;
+    });
+    service.credentialRepository.transitionWhenIdle = jest.fn(
+      async transition => {
+        runtimeStarted();
+        await gate;
+        return transitionWhenIdle(transition);
+      }
+    );
+
+    const runtime = service.markRuntimeChallenge('old challenge');
+    await started;
+    let logoutFinished = false;
+    const logout = service.clear().then(() => {
+      logoutFinished = true;
+    });
+    await Promise.resolve();
+
+    expect(logoutFinished).toBe(false);
+
+    releaseRuntime();
+    await Promise.all([runtime, logout]);
+
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'expired',
+        operationId: null,
+        lastValidationError: 'Signed out by user',
+      })
+    );
+  });
+
+  it('rejects a valid profile probe that finishes after logout', async () => {
+    const service = createService();
+    const target = createTarget();
+    service.browserProfileService.createLoginTarget.mockResolvedValue(target);
+    let probeStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      probeStarted = resolve;
+    });
+    let releaseProbe!: (value: any) => void;
+    const pendingProbe = new Promise<any>(resolve => {
+      releaseProbe = resolve;
+    });
+    const validProbe = {
+      state: 'valid',
+      finalUrl: 'https://www.douyin.com/',
+      cookieNames: ['sessionid'],
+      authenticatedCookieNames: ['sessionid'],
+      accountFingerprint: 'a'.repeat(64),
+    };
+    service.browserProfileService.probe
+      .mockImplementationOnce(async () => {
+        probeStarted();
+        return pendingProbe;
+      })
+      .mockResolvedValueOnce(validProbe);
+
+    const verification = service.verifyCookie();
+    await started;
+    await service.clear();
+    releaseProbe(validProbe);
+
+    await expect(verification).resolves.toEqual(
+      expect.objectContaining({
+        ok: false,
+        error: 'Douyin account validation was superseded',
+      })
+    );
+    expect(service.getCredential()).toEqual(
+      expect.objectContaining({
+        state: 'expired',
+        operationId: null,
+        lastValidationError: 'Signed out by user',
+      })
+    );
+    expect(service.browserProfileService.closeTarget).toHaveBeenCalledWith(
+      target
     );
   });
 

@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import { DouyinAuthState } from '../interface';
 import {
   DouyinCredentialOperation,
+  DouyinCredentialOperationAcquireOptions,
   DouyinCredentialRepository,
   DouyinCredentialTransition,
 } from '../repository/douyin-credential.repository';
@@ -22,6 +23,11 @@ import {
 
 const BROWSER_LOGIN_TTL_MS = 10 * 60 * 1000;
 const BROWSER_LOGIN_POLL_MS = 2_000;
+const BROWSER_LOGIN_VERIFICATION_SETTLE_MS = 6_000;
+const BROWSER_LOGIN_REQUIRED_CONFIRMATIONS = 2;
+const BROWSER_LOGIN_CLOSE_WAIT_MS = 30_000;
+const BROWSER_LOGIN_PREPARE_CLOSE_WAIT_MS = 2_500;
+const AUTH_REVALIDATION_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const VERIFICATION_METHODS: DouyinVerificationMethod[] = [
   'receive_sms',
   'face',
@@ -81,6 +87,11 @@ interface DouyinBrowserLoginSession {
   verifiedAt?: Date;
   error?: string;
   verification?: DouyinBrowserLoginVerification;
+  verificationSubmittedAt?: Date;
+  verificationClearedAt?: Date;
+  successfulProbeCount?: number;
+  rejectedProbeCount?: number;
+  confirmedAccountFingerprint?: string;
   operation?: DouyinCredentialOperation;
 }
 
@@ -146,6 +157,7 @@ export class DouyinAuthService {
   private activeOperations = new Set<string>();
   private reconciliationPromise?: Promise<void>;
   private logoutInProgress = false;
+  private operationAcquisitionTail: Promise<void> = Promise.resolve();
 
   async getStatus(): Promise<DouyinAuthStatus> {
     let credential = await this.credentialRepository.findLatest();
@@ -158,23 +170,23 @@ export class DouyinAuthService {
       };
     }
 
-    if (
-      credential.state === 'validating' &&
-      !this.isOperationActive({
-        id: credential.operationId || '',
-        generation: credential.generation || 0,
-      })
-    ) {
-      await this.reconcileProfileState();
+    const persistedOperation = this.persistedOperation(credential);
+    if (persistedOperation && !this.isOperationActive(persistedOperation)) {
+      await this.reconcileProfileState(persistedOperation);
       credential = await this.credentialRepository.findLatest();
     } else if (
       credential.state === 'valid' &&
-      credential.authExpiresAt &&
-      credential.authExpiresAt.getTime() <= Date.now()
+      this.activeOperations.size === 0 &&
+      ((credential.authExpiresAt &&
+        credential.authExpiresAt.getTime() <= Date.now()) ||
+        !credential.verifiedAt ||
+        Date.now() - credential.verifiedAt.getTime() >=
+          AUTH_REVALIDATION_INTERVAL_MS)
     ) {
       // This is the earliest persistent expiry across several authentication-
       // related cookies, including auxiliary passport cookies. Treat it as a
-      // revalidation hint; only the account endpoint may expire the session.
+      // revalidation hint. Independently refresh the server-side verdict at a
+      // low frequency because Douyin may revoke a session before Cookie expiry.
       await this.reconcileProfileState();
       credential = await this.credentialRepository.findLatest();
     }
@@ -237,6 +249,12 @@ export class DouyinAuthService {
     if (this.logoutInProgress) {
       throw new DouyinCredentialError('Douyin logout is in progress', 409);
     }
+    if (this.getActiveBrowserLoginSession() || this.activeOperations.size > 0) {
+      throw new DouyinCredentialError(
+        'Douyin browser login is in progress; wait for it to finish before checking the profile',
+        409
+      );
+    }
 
     const operation = await this.beginOperation({
       lastValidationCode: null,
@@ -246,7 +264,7 @@ export class DouyinAuthService {
     let target: DouyinBrowserLoginTarget | undefined;
     try {
       target = await this.browserProfileService.createLoginTarget(roomId);
-      const probe = await this.browserProfileService.probe(target.page, roomId);
+      const probe = await this.probePersistedProfile(target.page, roomId);
       const persisted = await this.persistProbe(probe, operation, true);
       return persisted
         ? this.toVerification(probe)
@@ -290,10 +308,6 @@ export class DouyinAuthService {
     let operation: DouyinCredentialOperation | undefined;
 
     try {
-      operation = await this.beginOperation({
-        lastValidationCode: null,
-        lastValidationError: null,
-      });
       const sessions = Array.from(this.browserLoginSessions.values());
       for (const session of sessions) {
         session.status = 'cancelled';
@@ -303,6 +317,13 @@ export class DouyinAuthService {
       }
       this.browserLoginSessions.clear();
 
+      operation = await this.beginOperation(
+        {
+          lastValidationCode: null,
+          lastValidationError: null,
+        },
+        { replaceActive: true }
+      );
       await this.browserProfileService.logout();
       await this.transitionForOperation(
         operation,
@@ -339,19 +360,41 @@ export class DouyinAuthService {
     }
   }
 
-  async startBrowserLogin(roomId?: string): Promise<DouyinBrowserLoginStatus> {
+  async startBrowserLogin(
+    roomId?: string,
+    options: { fresh?: boolean } = {}
+  ): Promise<DouyinBrowserLoginStatus> {
     if (this.logoutInProgress) {
       throw new DouyinCredentialError('Douyin logout is in progress', 409);
     }
     this.pruneBrowserLoginSessions();
-    const activeSession = Array.from(this.browserLoginSessions.values()).find(
-      session => this.isActiveSession(session.status)
-    );
+    await this.retireSupersededBrowserLoginSessions();
+    const activeSession = this.getActiveBrowserLoginSession();
     if (activeSession) {
       await this.checkBrowserLoginSession(activeSession);
-      if (this.isActiveSession(activeSession.status)) {
+      if (options.fresh !== true) {
         return this.serializeBrowserLoginSession(activeSession);
       }
+    }
+
+    let shouldClearProfile = options.fresh !== false;
+    if (!shouldClearProfile) {
+      let credential = await this.credentialRepository.findLatest();
+      const persistedOperation = this.persistedOperation(credential);
+      if (persistedOperation && !this.isOperationActive(persistedOperation)) {
+        await this.reconcileProfileState(persistedOperation);
+        credential = await this.credentialRepository.findLatest();
+      }
+      // `fresh: false` is only a continuation hint. The server remains the
+      // authority and permits it solely for a profile already known to be in
+      // an interactive challenge.
+      shouldClearProfile = credential?.state !== 'challenged';
+    }
+
+    if (shouldClearProfile) {
+      // A fresh login must not silently accept whichever account is already in
+      // the persistent profile, even when database metadata was lost.
+      await this.clear();
     }
 
     const now = new Date();
@@ -363,6 +406,11 @@ export class DouyinAuthService {
       expiresAt: new Date(now.getTime() + BROWSER_LOGIN_TTL_MS),
       roomId: roomId?.trim() || undefined,
     };
+
+    session.operation = await this.beginOperation({
+      lastValidationCode: null,
+      lastValidationError: null,
+    });
     session.expireTimer = setTimeout(() => {
       void this.expireBrowserLoginSession(session.id).catch(error => {
         this.logger?.warn('Failed to expire Douyin browser login', {
@@ -372,19 +420,6 @@ export class DouyinAuthService {
       });
     }, BROWSER_LOGIN_TTL_MS);
     this.browserLoginSessions.set(session.id, session);
-
-    try {
-      session.operation = await this.beginOperation({
-        lastValidationCode: null,
-        lastValidationError: null,
-      });
-    } catch (error) {
-      if (session.expireTimer) {
-        clearTimeout(session.expireTimer);
-      }
-      this.browserLoginSessions.delete(session.id);
-      throw error;
-    }
     const preparePromise = this.prepareBrowserLoginSession(session);
     session.preparePromise = preparePromise;
     const clearPreparePromise = () => {
@@ -400,6 +435,13 @@ export class DouyinAuthService {
     sessionId: string
   ): Promise<DouyinBrowserLoginStatus> {
     const session = this.getBrowserLoginSession(sessionId);
+    if (
+      this.isActiveSession(session.status) &&
+      !this.isSessionOperationActive(session)
+    ) {
+      await this.retireSupersededBrowserLoginSession(session);
+      return this.serializeBrowserLoginSession(session);
+    }
     if (this.isActiveSession(session.status)) {
       await this.checkBrowserLoginSession(session);
     }
@@ -425,7 +467,6 @@ export class DouyinAuthService {
     interaction: DouyinBrowserLoginInteraction
   ): Promise<DouyinBrowserLoginStatus> {
     const session = this.getBrowserLoginSession(sessionId);
-    let shouldCheck = false;
 
     await this.withBrowserPageOperation(session, async () => {
       const page = session.target?.page;
@@ -505,6 +546,11 @@ export class DouyinAuthService {
               ? '请在手机端完成刷脸认证，系统会自动继续。'
               : '请按抖音提示使用绑定手机发送短信，系统会自动继续。',
         };
+        session.verificationSubmittedAt = undefined;
+        session.verificationClearedAt = undefined;
+        session.successfulProbeCount = 0;
+        session.rejectedProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
       } else if (interaction?.type === 'submit_verification_code') {
         if (session.verification?.method !== 'receive_sms') {
           throw new DouyinCredentialError(
@@ -526,8 +572,13 @@ export class DouyinAuthService {
         session.verification = {
           ...session.verification,
           stage: 'processing',
+          prompt: '验证码已提交，正在等待抖音完成登录确认。',
         };
-        shouldCheck = true;
+        session.verificationSubmittedAt = new Date();
+        session.verificationClearedAt = undefined;
+        session.successfulProbeCount = 0;
+        session.rejectedProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
       } else {
         throw new DouyinCredentialError(
           'Douyin verification interaction type is invalid'
@@ -535,11 +586,6 @@ export class DouyinAuthService {
       }
       session.updatedAt = new Date();
     });
-
-    if (shouldCheck) {
-      await this.sleep(500);
-      await this.checkBrowserLoginSession(session);
-    }
 
     session.updatedAt = new Date();
     return this.serializeBrowserLoginSession(session);
@@ -549,14 +595,22 @@ export class DouyinAuthService {
     const session = this.getBrowserLoginSession(sessionId);
     session.status = 'cancelled';
     session.updatedAt = new Date();
-    await this.invalidateOperation('unknown', {
-      lastValidationCode: 'TRANSIENT_ERROR',
-      lastValidationError: 'Douyin browser login was cancelled',
-    });
-    this.releaseOperation(session.operation);
+    const cancelled = session.operation
+      ? await this.transitionForOperation(
+          session.operation,
+          'unknown',
+          {
+            lastValidationCode: 'TRANSIENT_ERROR',
+            lastValidationError: 'Douyin browser login was cancelled',
+          },
+          true
+        )
+      : null;
     await this.closeBrowserLoginSession(session, true);
     this.browserLoginSessions.delete(sessionId);
-    await this.reconcileProfileState();
+    if (cancelled) {
+      await this.reconcileProfileState();
+    }
   }
 
   /**
@@ -568,7 +622,7 @@ export class DouyinAuthService {
     if (this.activeOperations.size > 0 || this.logoutInProgress) {
       return;
     }
-    await this.invalidateOperation('challenged', {
+    await this.transitionRuntimeState('challenged', {
       lastValidationCode: 'CAPTCHA_REQUIRED',
       lastValidationError:
         error || 'Douyin browser profile requires verification',
@@ -579,7 +633,7 @@ export class DouyinAuthService {
     if (this.activeOperations.size > 0 || this.logoutInProgress) {
       return;
     }
-    await this.invalidateOperation('expired', {
+    await this.transitionRuntimeState('expired', {
       verifiedAt: null,
       authExpiresAt: null,
       lastValidationCode: 'SESSION_EXPIRED',
@@ -675,6 +729,20 @@ export class DouyinAuthService {
         return;
       }
       if (verificationState) {
+        session.verificationClearedAt = undefined;
+        session.successfulProbeCount = 0;
+        session.rejectedProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
+        if (
+          session.verification?.stage === 'processing' &&
+          session.verificationSubmittedAt &&
+          Date.now() - session.verificationSubmittedAt.getTime() <
+            BROWSER_LOGIN_VERIFICATION_SETTLE_MS
+        ) {
+          session.status = 'verification_required';
+          session.updatedAt = new Date();
+          return;
+        }
         await this.enterVerificationRequired(
           session,
           verificationState.challenge,
@@ -684,19 +752,47 @@ export class DouyinAuthService {
         return;
       }
 
+      if (session.verification) {
+        if (!session.verificationClearedAt) {
+          session.verificationClearedAt = new Date();
+          session.verification = {
+            ...session.verification,
+            stage: 'processing',
+            prompt: '验证页面已完成，正在等待抖音确认账号登录态。',
+          };
+          session.status = 'verification_required';
+          session.updatedAt = new Date();
+          return;
+        }
+        if (
+          Date.now() - session.verificationClearedAt.getTime() <
+          BROWSER_LOGIN_VERIFICATION_SETTLE_MS
+        ) {
+          session.status = 'verification_required';
+          session.updatedAt = new Date();
+          return;
+        }
+      }
+
+      if (await this.browserProfileService.isLoginRequired(page)) {
+        session.status = 'waiting';
+        session.verification = undefined;
+        session.verificationSubmittedAt = undefined;
+        session.verificationClearedAt = undefined;
+        session.successfulProbeCount = 0;
+        session.rejectedProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
+        session.error = undefined;
+        session.updatedAt = new Date();
+        return;
+      }
+
       const diagnostics = await this.browserProfileService.getCookieDiagnostics(
         session.target!.browserContext
       );
       if (!this.isSessionOperationActive(session)) {
         return;
       }
-      if (diagnostics.authenticatedCookieNames.length === 0) {
-        session.status = 'waiting';
-        session.verification = undefined;
-        session.updatedAt = new Date();
-        return;
-      }
-
       session.status = 'validating';
       session.updatedAt = new Date();
       const operation = session.operation;
@@ -725,22 +821,48 @@ export class DouyinAuthService {
         return;
       }
       if (probe.state === 'challenged') {
-        await this.enterVerificationRequired(
-          session,
-          probe.challenge || 'captcha',
-          probe
-        );
+        const interactiveVerification =
+          await this.browserProfileService.detectVerificationState(page);
+        if (interactiveVerification) {
+          await this.enterVerificationRequired(
+            session,
+            interactiveVerification.challenge,
+            probe,
+            interactiveVerification.awaitingCode
+          );
+        } else {
+          session.status = 'validating';
+          session.error =
+            probe.reason || 'Douyin verification is still being prepared';
+          session.updatedAt = new Date();
+        }
         return;
       }
       if (probe.state === 'expired') {
+        session.successfulProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
+        session.rejectedProbeCount = (session.rejectedProbeCount || 0) + 1;
+        if (session.rejectedProbeCount < BROWSER_LOGIN_REQUIRED_CONFIRMATIONS) {
+          session.status = 'validating';
+          session.error = '正在再次确认抖音服务端的登录结果。';
+          session.updatedAt = new Date();
+          return;
+        }
         session.status = 'waiting';
         session.verification = undefined;
+        session.verificationSubmittedAt = undefined;
+        session.verificationClearedAt = undefined;
+        session.rejectedProbeCount = 0;
+        session.error = undefined;
         session.updatedAt = new Date();
         await this.persistProbe(probe, operation);
         await this.browserProfileService.openLoginPanel(page);
         return;
       }
       if (probe.state === 'transient') {
+        session.successfulProbeCount = 0;
+        session.rejectedProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
         session.status = 'validating';
         session.error = probe.reason;
         session.updatedAt = new Date();
@@ -748,6 +870,27 @@ export class DouyinAuthService {
         return;
       }
 
+      session.rejectedProbeCount = 0;
+      if (!probe.accountFingerprint) {
+        session.successfulProbeCount = 0;
+        session.confirmedAccountFingerprint = undefined;
+        session.status = 'validating';
+        session.error = '抖音服务端未返回可确认的账号身份，正在重试。';
+        session.updatedAt = new Date();
+        return;
+      }
+      if (session.confirmedAccountFingerprint !== probe.accountFingerprint) {
+        session.confirmedAccountFingerprint = probe.accountFingerprint;
+        session.successfulProbeCount = 1;
+      } else {
+        session.successfulProbeCount = (session.successfulProbeCount || 0) + 1;
+      }
+      if (session.successfulProbeCount < BROWSER_LOGIN_REQUIRED_CONFIRMATIONS) {
+        session.status = 'validating';
+        session.error = undefined;
+        session.updatedAt = new Date();
+        return;
+      }
       if (!(await this.persistProbe(probe, operation, true))) {
         return;
       }
@@ -755,6 +898,8 @@ export class DouyinAuthService {
       session.cookieNames = probe.cookieNames;
       session.verifiedAt = new Date();
       session.verification = undefined;
+      session.verificationSubmittedAt = undefined;
+      session.verificationClearedAt = undefined;
       session.error = undefined;
       session.updatedAt = new Date();
       this.releaseOperation(operation);
@@ -804,6 +949,9 @@ export class DouyinAuthService {
     const previousVerification = session.verification;
     session.status = 'verification_required';
     session.error = undefined;
+    session.successfulProbeCount = 0;
+    session.rejectedProbeCount = 0;
+    session.confirmedAccountFingerprint = undefined;
     if (awaitingCode) {
       session.verification = {
         challenge: 'second_verification',
@@ -935,17 +1083,51 @@ export class DouyinAuthService {
   }
 
   private async beginOperation(
-    details: Omit<DouyinCredentialTransition, 'state'>
+    details: Omit<DouyinCredentialTransition, 'state'>,
+    acquireOptions: DouyinCredentialOperationAcquireOptions = {}
   ): Promise<DouyinCredentialOperation> {
-    const started = await this.credentialRepository.beginOperation(
-      randomUUID(),
-      {
-        state: 'validating',
-        ...details,
+    return this.withOperationAcquisitionLock(async () => {
+      if (!acquireOptions.replaceActive && this.activeOperations.size > 0) {
+        throw new DouyinCredentialError(
+          'Another Douyin authentication operation is already in progress',
+          409
+        );
       }
-    );
-    this.activeOperations.add(this.operationKey(started.operation));
-    return started.operation;
+      const started = await this.credentialRepository.beginOperation(
+        randomUUID(),
+        {
+          state: 'validating',
+          ...details,
+        },
+        acquireOptions
+      );
+      if (!started) {
+        throw new DouyinCredentialError(
+          'Another Douyin authentication operation is already in progress',
+          409
+        );
+      }
+      this.activeOperations.clear();
+      this.activeOperations.add(this.operationKey(started.operation));
+      return started.operation;
+    });
+  }
+
+  private async withOperationAcquisitionLock<T>(
+    task: () => Promise<T>
+  ): Promise<T> {
+    let releaseAcquisition!: () => void;
+    const previousAcquisition = this.operationAcquisitionTail;
+    this.operationAcquisitionTail = new Promise<void>(resolve => {
+      releaseAcquisition = resolve;
+    });
+    await previousAcquisition;
+
+    try {
+      return await task();
+    } finally {
+      releaseAcquisition();
+    }
   }
 
   private async transitionForOperation(
@@ -968,39 +1150,63 @@ export class DouyinAuthService {
     return credential;
   }
 
-  private async invalidateOperation(
+  private async transitionRuntimeState(
     state: DouyinAuthState,
     details: Omit<DouyinCredentialTransition, 'state'>
   ): Promise<void> {
-    this.activeOperations.clear();
-    await this.credentialRepository.invalidateOperation({
-      state,
-      ...details,
+    await this.withOperationAcquisitionLock(async () => {
+      // Recheck inside the same local critical section as operation acquire.
+      // A runtime event that started earlier is committed before a new auth
+      // operation; one queued later observes the new owner and becomes a no-op.
+      if (this.logoutInProgress || this.activeOperations.size > 0) {
+        return;
+      }
+      await this.credentialRepository.transitionWhenIdle({
+        state,
+        ...details,
+      });
     });
   }
 
-  private async reconcileProfileState(): Promise<void> {
-    if (this.logoutInProgress) {
+  private async reconcileProfileState(
+    expectedOperation?: DouyinCredentialOperation
+  ): Promise<void> {
+    if (this.logoutInProgress || this.activeOperations.size > 0) {
       return;
     }
     if (this.reconciliationPromise) {
       return this.reconciliationPromise;
     }
-    this.reconciliationPromise = this.doReconcileProfileState().finally(() => {
+    this.reconciliationPromise = this.doReconcileProfileState(
+      expectedOperation
+    ).finally(() => {
       this.reconciliationPromise = undefined;
     });
     return this.reconciliationPromise;
   }
 
-  private async doReconcileProfileState(): Promise<void> {
-    const operation = await this.beginOperation({
-      lastValidationCode: null,
-      lastValidationError: null,
-    });
+  private async doReconcileProfileState(
+    expectedOperation?: DouyinCredentialOperation
+  ): Promise<void> {
+    let operation: DouyinCredentialOperation;
+    try {
+      operation = await this.beginOperation(
+        {
+          lastValidationCode: null,
+          lastValidationError: null,
+        },
+        expectedOperation ? { expectedOperation } : {}
+      );
+    } catch (error) {
+      if (error instanceof DouyinCredentialError && error.status === 409) {
+        return;
+      }
+      throw error;
+    }
     let target: DouyinBrowserLoginTarget | undefined;
     try {
       target = await this.browserProfileService.createLoginTarget();
-      const probe = await this.browserProfileService.probe(target.page);
+      const probe = await this.probePersistedProfile(target.page);
       await this.persistProbe(probe, operation, true);
     } catch (error) {
       await this.transitionForOperation(
@@ -1018,6 +1224,44 @@ export class DouyinAuthService {
         await this.browserProfileService.closeTarget(target);
       }
     }
+  }
+
+  private async probePersistedProfile(
+    page: DouyinBrowserLoginTarget['page'],
+    roomId?: string
+  ): Promise<DouyinProfileProbeResult> {
+    const first = await this.browserProfileService.probe(page, roomId);
+    if (first.state !== 'valid' && first.state !== 'expired') {
+      return first;
+    }
+    if (first.state === 'valid' && !first.accountFingerprint) {
+      return {
+        ...first,
+        state: 'transient',
+        reason: 'Douyin account endpoint did not confirm a stable identity',
+      };
+    }
+
+    const second = await this.browserProfileService.probe(page, roomId);
+    if (second.state === 'challenged') {
+      return second;
+    }
+    if (
+      first.state === 'valid' &&
+      second.state === 'valid' &&
+      first.accountFingerprint === second.accountFingerprint
+    ) {
+      return second;
+    }
+    if (first.state === 'expired' && second.state === 'expired') {
+      return second;
+    }
+    return {
+      ...second,
+      state: 'transient',
+      reason:
+        'Douyin account state changed between consecutive server confirmations',
+    };
   }
 
   private isSessionOperationActive(
@@ -1047,12 +1291,51 @@ export class DouyinAuthService {
     return `${operation.generation}:${operation.id}`;
   }
 
+  private persistedOperation(
+    credential: Awaited<ReturnType<DouyinCredentialRepository['findLatest']>>
+  ): DouyinCredentialOperation | undefined {
+    return credential?.operationId && (credential.generation || 0) > 0
+      ? {
+          id: credential.operationId,
+          generation: credential.generation || 0,
+        }
+      : undefined;
+  }
+
   private getBrowserLoginSession(sessionId: string): DouyinBrowserLoginSession {
     const session = this.browserLoginSessions.get(sessionId);
     if (!session) {
       throw new DouyinCredentialError('Douyin login session not found', 404);
     }
     return session;
+  }
+
+  private getActiveBrowserLoginSession():
+    | DouyinBrowserLoginSession
+    | undefined {
+    return Array.from(this.browserLoginSessions.values()).find(session =>
+      this.isSessionOperationActive(session)
+    );
+  }
+
+  private async retireSupersededBrowserLoginSessions(): Promise<void> {
+    for (const session of this.browserLoginSessions.values()) {
+      if (
+        this.isActiveSession(session.status) &&
+        !this.isSessionOperationActive(session)
+      ) {
+        await this.retireSupersededBrowserLoginSession(session);
+      }
+    }
+  }
+
+  private async retireSupersededBrowserLoginSession(
+    session: DouyinBrowserLoginSession
+  ): Promise<void> {
+    session.status = 'failed';
+    session.error = 'Douyin login session was superseded; start a new login';
+    session.updatedAt = new Date();
+    await this.closeBrowserLoginSession(session, true);
   }
 
   private serializeBrowserLoginSession(
@@ -1088,15 +1371,25 @@ export class DouyinAuthService {
     if (this.isActiveSession(session.status)) {
       session.status = 'expired';
       session.updatedAt = new Date();
-      await this.invalidateOperation('unknown', {
-        lastValidationCode: 'TRANSIENT_ERROR',
-        lastValidationError:
-          'Douyin browser login timed out; profile recheck started',
-      });
-      this.releaseOperation(session.operation);
+      const expired = session.operation
+        ? await this.transitionForOperation(
+            session.operation,
+            'unknown',
+            {
+              lastValidationCode: 'TRANSIENT_ERROR',
+              lastValidationError:
+                'Douyin browser login timed out; profile recheck started',
+            },
+            true
+          )
+        : null;
+      await this.closeBrowserLoginSession(session, !calledFromCheck);
+      if (expired) {
+        await this.reconcileProfileState();
+      }
+      return;
     }
     await this.closeBrowserLoginSession(session, !calledFromCheck);
-    await this.reconcileProfileState();
   }
 
   private async closeBrowserLoginSession(
@@ -1111,16 +1404,16 @@ export class DouyinAuthService {
       clearTimeout(session.expireTimer);
       session.expireTimer = undefined;
     }
+    if (waitForWork && session.checkPromise) {
+      await this.waitAtMost(session.checkPromise, BROWSER_LOGIN_CLOSE_WAIT_MS);
+    }
     await this.closeBrowserLoginTarget(session);
     if (waitForWork && session.preparePromise) {
-      await session.preparePromise.catch(() => undefined);
+      await this.waitAtMost(
+        session.preparePromise,
+        BROWSER_LOGIN_PREPARE_CLOSE_WAIT_MS
+      );
       await this.closeBrowserLoginTarget(session);
-    }
-    if (waitForWork && session.checkPromise) {
-      await Promise.race([
-        session.checkPromise.catch(() => undefined),
-        this.sleep(2_500),
-      ]);
     }
   }
 
@@ -1191,8 +1484,23 @@ export class DouyinAuthService {
     return error instanceof Error ? error.message : String(error);
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  private async waitAtMost(
+    promise: Promise<unknown>,
+    timeoutMs: number
+  ): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        promise.catch(() => undefined),
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
   }
 }
 

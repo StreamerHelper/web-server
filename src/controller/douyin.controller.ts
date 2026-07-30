@@ -63,10 +63,13 @@ export class DouyinController {
     @Body()
     body: {
       roomId?: string;
+      fresh?: boolean;
     }
   ) {
     try {
-      return await this.douyinAuthService.startBrowserLogin(body?.roomId);
+      return await this.douyinAuthService.startBrowserLogin(body?.roomId, {
+        fresh: body?.fresh,
+      });
     } catch (error) {
       this.ctx.status =
         error instanceof DouyinCredentialError ? error.status : 500;

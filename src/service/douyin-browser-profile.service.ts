@@ -29,6 +29,7 @@ const DOUYIN_ORIGINS = [
   'https://live.douyin.com',
   'https://passport.douyin.com',
   'https://sso.douyin.com',
+  'https://lf-zt.douyin.com',
   'https://auth.zijieapi.com',
 ];
 
@@ -91,6 +92,7 @@ export interface DouyinProfileProbeResult extends DouyinCookieDiagnostics {
   state: DouyinProfileProbeState;
   finalUrl: string;
   statusCode?: number;
+  accountFingerprint?: string;
   challenge?: DouyinProfileChallenge;
   reason?: string;
 }
@@ -115,10 +117,16 @@ interface FrameSnapshot {
   isTopLevel: boolean;
 }
 
+interface DouyinManagedPage {
+  page: Page;
+  pageMarker: string;
+}
+
 interface DouyinSelfProfileState {
   httpStatus?: number;
   statusCode?: number;
   hasStableUserId: boolean;
+  accountFingerprint?: string;
   loginRequired: boolean;
   challenge?: DouyinProfileChallenge;
   errorCode?: 'timeout' | 'request_failed' | 'invalid_response';
@@ -162,15 +170,10 @@ export class DouyinBrowserProfileService {
    * owned by this service; its user-data-dir remains on disk.
    */
   async closeTarget(target: DouyinBrowserLoginTarget): Promise<void> {
-    try {
-      if (!target.page.isClosed()) {
-        await target.page.close();
-      }
-    } catch (error) {
-      this.logger?.debug('Failed to close Douyin browser page', {
-        error: this.errorMessage(error),
-      });
-    }
+    await this.closeManagedPage({
+      page: target.page,
+      pageMarker: target.pageMarker,
+    });
 
     try {
       if (target.ownsBrowser) {
@@ -183,7 +186,6 @@ export class DouyinBrowserProfileService {
         error: this.errorMessage(error),
       });
     } finally {
-      this.activePageMarkers.delete(target.pageMarker);
       if (target.ownsLocalProfileLease) {
         this.localProfileLease = false;
       }
@@ -193,12 +195,18 @@ export class DouyinBrowserProfileService {
   /**
    * Probes the persisted authenticated profile. Cookie names are diagnostics,
    * never the success criterion by themselves. A challenge/login page is
-   * classified before any navigation so a provisional login cookie cannot
-   * skip secondary verification.
+   * classified on the interactive page before validation so a provisional
+   * login cookie cannot skip secondary verification.
+   *
+   * Account validation always runs in a short-lived sibling page that shares
+   * the same persistent BrowserContext. The interactive login page must be
+   * left untouched while Douyin finishes its redirect, postMessage and token
+   * exchange callbacks.
    */
   async probe(page: Page, _roomId?: string): Promise<DouyinProfileProbeResult> {
     void _roomId;
     let diagnostics = await this.safeCookieDiagnostics(page.browserContext());
+    let validationTarget: DouyinManagedPage | undefined;
 
     try {
       const initialChallenge = await this.detectChallenge(page);
@@ -218,34 +226,48 @@ export class DouyinBrowserProfileService {
         });
       }
 
+      validationTarget = await this.createManagedPage(page.browserContext());
+      const validationPage = validationTarget.page;
       await this.navigate(
-        page,
+        validationPage,
         'https://www.douyin.com/',
         SELF_PROFILE_NAVIGATION_TIMEOUT_MS
       );
 
-      const navigatedChallenge = await this.detectChallenge(page);
+      const navigatedChallenge = await this.detectChallenge(validationPage);
       if (navigatedChallenge) {
-        return this.probeResult(page, diagnostics, 'challenged', undefined, {
-          challenge: navigatedChallenge,
-          reason:
-            navigatedChallenge === 'second_verification'
-              ? 'Douyin secondary verification is required'
-              : 'Douyin captcha verification is required',
-        });
+        return this.probeResult(
+          validationPage,
+          diagnostics,
+          'challenged',
+          undefined,
+          {
+            challenge: navigatedChallenge,
+            reason:
+              navigatedChallenge === 'second_verification'
+                ? 'Douyin secondary verification is required'
+                : 'Douyin captcha verification is required',
+          }
+        );
       }
 
-      if (await this.isLoginRequired(page)) {
-        return this.probeResult(page, diagnostics, 'expired', undefined, {
-          reason: 'Douyin login is required',
-        });
+      if (await this.isLoginRequired(validationPage)) {
+        return this.probeResult(
+          validationPage,
+          diagnostics,
+          'expired',
+          undefined,
+          {
+            reason: 'Douyin login is required',
+          }
+        );
       }
 
-      const profile = await this.fetchSelfProfileState(page);
+      const profile = await this.fetchSelfProfileState(validationPage);
       diagnostics = await this.safeCookieDiagnostics(page.browserContext());
       if (profile.challenge) {
         return this.probeResult(
-          page,
+          validationPage,
           diagnostics,
           'challenged',
           profile.httpStatus,
@@ -265,7 +287,7 @@ export class DouyinBrowserProfileService {
         profile.statusCode === 2483
       ) {
         return this.probeResult(
-          page,
+          validationPage,
           diagnostics,
           'expired',
           profile.httpStatus,
@@ -274,12 +296,28 @@ export class DouyinBrowserProfileService {
           }
         );
       }
-      if (profile.statusCode === 0 && profile.hasStableUserId) {
-        return this.probeResult(page, diagnostics, 'valid', profile.httpStatus);
+      if (
+        profile.httpStatus !== undefined &&
+        profile.httpStatus >= 200 &&
+        profile.httpStatus < 300 &&
+        profile.statusCode === 0 &&
+        profile.hasStableUserId &&
+        profile.accountFingerprint
+      ) {
+        return this.probeResult(
+          validationPage,
+          diagnostics,
+          'valid',
+          profile.httpStatus,
+          { accountFingerprint: profile.accountFingerprint }
+        );
       }
 
       const reason = profile.errorCode
         ? `Douyin account validation ${profile.errorCode.replace('_', ' ')}`
+        : profile.httpStatus !== undefined &&
+          (profile.httpStatus < 200 || profile.httpStatus >= 300)
+        ? `Douyin account endpoint returned HTTP ${profile.httpStatus}`
         : profile.statusCode === 0
         ? 'Douyin account endpoint did not confirm a stable identity'
         : profile.statusCode !== undefined
@@ -288,7 +326,7 @@ export class DouyinBrowserProfileService {
             profile.httpStatus ?? 'unknown'
           }`;
       return this.probeResult(
-        page,
+        validationPage,
         diagnostics,
         'transient',
         profile.httpStatus,
@@ -298,9 +336,19 @@ export class DouyinBrowserProfileService {
       this.logger?.debug('Douyin browser profile probe was inconclusive', {
         error: this.errorMessage(error),
       });
-      return this.probeResult(page, diagnostics, 'transient', undefined, {
-        reason: this.transientReason(error),
-      });
+      return this.probeResult(
+        validationTarget?.page || page,
+        diagnostics,
+        'transient',
+        undefined,
+        {
+          reason: this.transientReason(error),
+        }
+      );
+    } finally {
+      if (validationTarget) {
+        await this.closeManagedPage(validationTarget);
+      }
     }
   }
 
@@ -369,6 +417,7 @@ export class DouyinBrowserProfileService {
   async logout(): Promise<void> {
     const target = await this.createBrowserTarget();
     const failures: string[] = [];
+    const storageOrigins = new Set(DOUYIN_ORIGINS);
     let client: Awaited<ReturnType<Page['createCDPSession']>> | undefined;
 
     try {
@@ -376,6 +425,13 @@ export class DouyinBrowserProfileService {
         const cookies = (await target.browserContext.cookies()).filter(cookie =>
           this.isByteDanceCookieDomain(cookie.domain)
         );
+        for (const cookie of cookies) {
+          const hostname = cookie.domain.replace(/^\./, '').trim();
+          if (hostname) {
+            storageOrigins.add(`https://${hostname}`);
+            storageOrigins.add(`http://${hostname}`);
+          }
+        }
         if (cookies.length > 0) {
           await target.browserContext.deleteCookie(...cookies);
         }
@@ -385,7 +441,7 @@ export class DouyinBrowserProfileService {
 
       try {
         client = await target.page.createCDPSession();
-        for (const origin of DOUYIN_ORIGINS) {
+        for (const origin of storageOrigins) {
           try {
             await client.send('Storage.clearDataForOrigin', {
               origin,
@@ -607,8 +663,9 @@ export class DouyinBrowserProfileService {
 
   /**
    * Calls Douyin's account-only endpoint inside the persisted browser profile.
-   * The page returns only authentication signals; no user field or identifier
-   * crosses the browser boundary.
+   * The page returns only authentication signals and a one-way continuity
+   * fingerprint; no raw account identifier or profile field crosses the
+   * browser boundary.
    */
   private async fetchSelfProfileState(
     page: Page
@@ -662,16 +719,40 @@ export class DouyinBrowserProfileService {
             ? rawStatusCode
             : undefined;
         const user = payload?.user || payload?.data?.user;
-        const hasStableUserId = Boolean(
-          user &&
-            [user.sec_uid, user.uid, user.unique_id].some(
-              value =>
-                (typeof value === 'string' && value.trim().length > 0) ||
-                (typeof value === 'number' &&
-                  Number.isFinite(value) &&
-                  value > 0)
+        const normalizeStableId = (value: unknown) =>
+          typeof value === 'string' && value.trim().length > 0
+            ? value.trim()
+            : typeof value === 'number' &&
+              Number.isSafeInteger(value) &&
+              value > 0
+            ? String(value)
+            : undefined;
+        const secUid = normalizeStableId(user?.sec_uid);
+        const uid = normalizeStableId(user?.uid);
+        // unique_id is a user-editable handle, so it must never anchor account
+        // continuity. Tag the selected field to avoid cross-namespace clashes.
+        const stableAccountKey = secUid
+          ? `sec_uid:${secUid}`
+          : uid
+          ? `uid:${uid}`
+          : undefined;
+        const hasStableUserId = stableAccountKey !== undefined;
+        let accountFingerprint: string | undefined;
+        if (hasStableUserId) {
+          try {
+            const input = new scope.TextEncoder().encode(
+              `douyin:${stableAccountKey}`
+            );
+            const digest = await scope.crypto.subtle.digest('SHA-256', input);
+            accountFingerprint = Array.from(
+              new scope.Uint8Array(digest) as Uint8Array
             )
-        );
+              .map(value => value.toString(16).padStart(2, '0'))
+              .join('');
+          } catch {
+            accountFingerprint = undefined;
+          }
+        }
         const statusMessage =
           typeof payload?.status_msg === 'string' ? payload.status_msg : '';
 
@@ -679,6 +760,7 @@ export class DouyinBrowserProfileService {
           httpStatus: response.status,
           statusCode,
           hasStableUserId,
+          accountFingerprint,
           loginRequired:
             statusCode === 8 ||
             statusCode === 2483 ||
@@ -770,6 +852,7 @@ export class DouyinBrowserProfileService {
     state: DouyinProfileProbeState,
     statusCode?: number,
     details?: {
+      accountFingerprint?: string;
       challenge?: DouyinProfileChallenge;
       reason?: string;
     }
@@ -778,6 +861,7 @@ export class DouyinBrowserProfileService {
       state,
       finalUrl: page.url(),
       statusCode,
+      accountFingerprint: details?.accountFingerprint,
       challenge: details?.challenge,
       reason: details?.reason,
       ...diagnostics,
@@ -1145,43 +1229,97 @@ export class DouyinBrowserProfileService {
                 .replace(/\s+/g, '')
                 .trim();
             const normalizedLabels = new Set(values.map(normalize));
+            const isRendered = (node: any) => {
+              if (!node) {
+                return false;
+              }
+              const rect = node.getBoundingClientRect();
+              if (
+                rect.width < 2 ||
+                rect.height < 2 ||
+                rect.right <= 0 ||
+                rect.bottom <= 0 ||
+                rect.left >= scope.innerWidth ||
+                rect.top >= scope.innerHeight
+              ) {
+                return false;
+              }
+              let current = node;
+              while (current) {
+                const style = scope.getComputedStyle(current);
+                if (
+                  style.display === 'none' ||
+                  style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' ||
+                  Number(style.opacity) <= 0.01
+                ) {
+                  return false;
+                }
+                current = current.parentElement;
+              }
+              return true;
+            };
+            const isInteractive = (node: any) => {
+              if (
+                !isRendered(node) ||
+                node.disabled ||
+                node.getAttribute?.('aria-disabled') === 'true' ||
+                node.getAttribute?.('data-disabled') === 'true'
+              ) {
+                return false;
+              }
+              const className = String(
+                node.getAttribute?.('class') || node.className || ''
+              );
+              if (/(^|[-_\s])disabled(?:[-_\s]|$)/i.test(className)) {
+                return false;
+              }
+              let current = node;
+              while (current) {
+                if (scope.getComputedStyle(current).pointerEvents === 'none') {
+                  return false;
+                }
+                current = current.parentElement;
+              }
+              const rect = node.getBoundingClientRect();
+              const x = Math.min(
+                Math.max(rect.left + rect.width / 2, 0),
+                Math.max(scope.innerWidth - 1, 0)
+              );
+              const y = Math.min(
+                Math.max(rect.top + rect.height / 2, 0),
+                Math.max(scope.innerHeight - 1, 0)
+              );
+              const hitTarget = doc.elementFromPoint(x, y);
+              return (
+                !hitTarget ||
+                hitTarget === node ||
+                (typeof node.contains === 'function' &&
+                  node.contains(hitTarget))
+              );
+            };
             const matches = Array.from(
               doc.querySelectorAll(
                 'button, a, [role="button"], [tabindex], label, div, span'
               )
             ).filter(element => {
               const node = element as any;
-              const rect = node.getBoundingClientRect();
-              const style = scope.getComputedStyle(node);
               return (
                 normalizedLabels.has(
                   normalize(node.innerText || node.textContent)
-                ) &&
-                rect.width > 0 &&
-                rect.height > 0 &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none'
+                ) && isRendered(node)
               );
             }) as any[];
-            const labelElement =
-              matches.find(
-                element =>
-                  !matches.some(
-                    other => other !== element && element.contains(other)
-                  )
-              ) || matches[0];
-            const target =
-              labelElement?.closest(
-                'button, a, [role="button"], [tabindex], label'
-              ) || labelElement;
-            if (
-              !target ||
-              target.disabled ||
-              target.getAttribute?.('aria-disabled') === 'true'
-            ) {
-              return null;
+            for (const labelElement of matches) {
+              const target =
+                labelElement.closest(
+                  'button, a, [role="button"], [tabindex], label'
+                ) || labelElement;
+              if (isInteractive(target)) {
+                return target;
+              }
             }
-            return target;
+            return null;
           },
           [...labels]
         );
@@ -1325,12 +1463,43 @@ export class DouyinBrowserProfileService {
       ownsBrowser = true;
     }
 
-    const pageMarker = `${MANAGED_PAGE_MARKER_PREFIX}${Date.now()}:${randomUUID()}`;
-    this.activePageMarkers.add(pageMarker);
+    let managedPage: DouyinManagedPage | undefined;
     try {
       const browserContext = browser.defaultBrowserContext();
       await this.cleanupOrphanedPages(browserContext);
-      const page = await browserContext.newPage();
+      managedPage = await this.createManagedPage(browserContext);
+      return {
+        browser,
+        browserContext,
+        page: managedPage.page,
+        ownsBrowser,
+        pageMarker: managedPage.pageMarker,
+        ownsLocalProfileLease,
+      };
+    } catch (error) {
+      if (managedPage) {
+        await this.closeManagedPage(managedPage);
+      }
+      if (ownsBrowser) {
+        await browser.close().catch(() => undefined);
+      } else {
+        await browser.disconnect().catch(() => undefined);
+      }
+      if (ownsLocalProfileLease) {
+        this.localProfileLease = false;
+      }
+      throw error;
+    }
+  }
+
+  private async createManagedPage(
+    browserContext: BrowserContext
+  ): Promise<DouyinManagedPage> {
+    const pageMarker = `${MANAGED_PAGE_MARKER_PREFIX}${Date.now()}:${randomUUID()}`;
+    this.activePageMarkers.add(pageMarker);
+    let page: Page | undefined;
+    try {
+      page = await browserContext.newPage();
       await page.evaluateOnNewDocument(marker => {
         (globalThis as any).window.name = marker;
       }, pageMarker);
@@ -1342,25 +1511,27 @@ export class DouyinBrowserProfileService {
         height: 800,
         deviceScaleFactor: 1,
       });
-      return {
-        browser,
-        browserContext,
-        page,
-        ownsBrowser,
-        pageMarker,
-        ownsLocalProfileLease,
-      };
+      return { page, pageMarker };
     } catch (error) {
+      if (page && !page.isClosed()) {
+        await page.close().catch(() => undefined);
+      }
       this.activePageMarkers.delete(pageMarker);
-      if (ownsBrowser) {
-        await browser.close().catch(() => undefined);
-      } else {
-        await browser.disconnect().catch(() => undefined);
-      }
-      if (ownsLocalProfileLease) {
-        this.localProfileLease = false;
-      }
       throw error;
+    }
+  }
+
+  private async closeManagedPage(target: DouyinManagedPage): Promise<void> {
+    try {
+      if (!target.page.isClosed()) {
+        await target.page.close();
+      }
+    } catch (error) {
+      this.logger?.debug('Failed to close Douyin browser page', {
+        error: this.errorMessage(error),
+      });
+    } finally {
+      this.activePageMarkers.delete(target.pageMarker);
     }
   }
 
