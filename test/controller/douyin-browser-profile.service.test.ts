@@ -496,9 +496,9 @@ describe('DouyinBrowserProfileService', () => {
     jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
     jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
     service.navigate = jest.fn().mockResolvedValue(response);
-    service.fetchSelfProfileState = jest.fn().mockResolvedValue({
+    service.fetchAccountState = jest.fn().mockResolvedValue({
       httpStatus: 200,
-      statusCode: 0,
+      authenticated: true,
       hasStableUserId: true,
       accountFingerprint: 'a'.repeat(64),
       loginRequired: false,
@@ -545,9 +545,9 @@ describe('DouyinBrowserProfileService', () => {
     jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
     jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
     service.navigate = jest.fn().mockResolvedValue({ status: () => 500 });
-    service.fetchSelfProfileState = jest.fn().mockResolvedValue({
+    service.fetchAccountState = jest.fn().mockResolvedValue({
       httpStatus: 500,
-      statusCode: 0,
+      authenticated: true,
       hasStableUserId: true,
       loginRequired: false,
     });
@@ -564,45 +564,80 @@ describe('DouyinBrowserProfileService', () => {
     expect(validationPage.close).toHaveBeenCalledTimes(1);
   });
 
-  it.each([8, 2483])(
-    'does not authenticate a stale Cookie when the account endpoint returns status %s',
-    async statusCode => {
-      const service = createService();
-      const browserContext = {
-        cookies: jest
-          .fn()
-          .mockResolvedValue([
-            createCookie('sessionid', 'stale', '.douyin.com'),
-          ]),
-      };
-      const validationPage = createValidationPage(browserContext);
-      const page = {
-        url: () => 'https://www.douyin.com/',
-        browserContext: () => browserContext,
-      };
-      jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
-      jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
-      service.navigate = jest.fn().mockResolvedValue({ status: () => 200 });
-      service.fetchSelfProfileState = jest.fn().mockResolvedValue({
-        httpStatus: 200,
-        statusCode,
-        hasStableUserId: false,
-        loginRequired: true,
-      });
+  it('does not expire the session from a Passport error body on HTTP failure', async () => {
+    const service = createService();
+    const browserContext = {
+      cookies: jest
+        .fn()
+        .mockResolvedValue([
+          createCookie('sessionid', 'secret', '.douyin.com'),
+        ]),
+    };
+    const validationPage = createValidationPage(browserContext);
+    const page = {
+      url: () => 'https://www.douyin.com/',
+      browserContext: () => browserContext,
+    };
+    jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
+    jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
+    service.navigate = jest.fn().mockResolvedValue({ status: () => 500 });
+    service.fetchAccountState = jest.fn().mockResolvedValue({
+      httpStatus: 500,
+      authenticated: false,
+      passportErrorCode: 13,
+      hasStableUserId: false,
+      loginRequired: true,
+    });
 
-      const result = await service.probe(page);
+    const result = await service.probe(page);
 
-      expect(result).toEqual(
-        expect.objectContaining({
-          state: 'expired',
-          authenticatedCookieNames: ['sessionid'],
-        })
-      );
-      expect(validationPage.close).toHaveBeenCalledTimes(1);
-    }
-  );
+    expect(result).toEqual(
+      expect.objectContaining({
+        state: 'transient',
+        statusCode: 500,
+        reason: 'Douyin account endpoint returned HTTP 500',
+      })
+    );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
+  });
 
-  it('treats status zero without a stable account identity as transient', async () => {
+  it('expires a stale Cookie only when Passport explicitly rejects the session', async () => {
+    const service = createService();
+    const browserContext = {
+      cookies: jest
+        .fn()
+        .mockResolvedValue([
+          createCookie('sessionid', 'stale', '.douyin.com'),
+        ]),
+    };
+    const validationPage = createValidationPage(browserContext);
+    const page = {
+      url: () => 'https://www.douyin.com/',
+      browserContext: () => browserContext,
+    };
+    jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
+    jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
+    service.navigate = jest.fn().mockResolvedValue({ status: () => 200 });
+    service.fetchAccountState = jest.fn().mockResolvedValue({
+      httpStatus: 200,
+      authenticated: false,
+      passportErrorCode: 13,
+      hasStableUserId: false,
+      loginRequired: true,
+    });
+
+    const result = await service.probe(page);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        state: 'expired',
+        authenticatedCookieNames: ['sessionid'],
+      })
+    );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an unknown Passport error as transient instead of expiring the session', async () => {
     const service = createService();
     const browserContext = {
       cookies: jest
@@ -619,9 +654,45 @@ describe('DouyinBrowserProfileService', () => {
     jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
     jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
     service.navigate = jest.fn().mockResolvedValue({ status: () => 200 });
-    service.fetchSelfProfileState = jest.fn().mockResolvedValue({
+    service.fetchAccountState = jest.fn().mockResolvedValue({
       httpStatus: 200,
-      statusCode: 0,
+      authenticated: false,
+      passportErrorCode: 999,
+      hasStableUserId: false,
+      loginRequired: false,
+    });
+
+    const result = await service.probe(page);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        state: 'transient',
+        reason: 'Douyin account endpoint returned error 999',
+      })
+    );
+    expect(validationPage.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats Passport success without a stable account identity as transient', async () => {
+    const service = createService();
+    const browserContext = {
+      cookies: jest
+        .fn()
+        .mockResolvedValue([
+          createCookie('sessionid', 'secret', '.douyin.com'),
+        ]),
+    };
+    const validationPage = createValidationPage(browserContext);
+    const page = {
+      url: () => 'https://www.douyin.com/',
+      browserContext: () => browserContext,
+    };
+    jest.spyOn(service, 'detectChallenge').mockResolvedValue(undefined);
+    jest.spyOn(service, 'isLoginRequired').mockResolvedValue(false);
+    service.navigate = jest.fn().mockResolvedValue({ status: () => 200 });
+    service.fetchAccountState = jest.fn().mockResolvedValue({
+      httpStatus: 200,
+      authenticated: true,
       hasStableUserId: false,
       loginRequired: false,
     });
@@ -646,9 +717,9 @@ describe('DouyinBrowserProfileService', () => {
           status: 200,
           text: jest.fn().mockResolvedValue(
             JSON.stringify({
-              status_code: 0,
-              user: {
-                sec_uid: 'private-stable-id',
+              message: 'success',
+              data: {
+                sec_user_id: 'private-stable-id',
                 nickname: 'private-profile-name',
               },
             })
@@ -659,16 +730,20 @@ describe('DouyinBrowserProfileService', () => {
     };
 
     try {
-      const result = await service.fetchSelfProfileState(page);
+      const result = await service.fetchAccountState(page);
 
       expect(result).toEqual(
         expect.objectContaining({
           httpStatus: 200,
-          statusCode: 0,
+          authenticated: true,
           hasStableUserId: true,
           accountFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
           loginRequired: false,
         })
+      );
+      expect((globalThis as any).fetch).toHaveBeenCalledWith(
+        '/passport/account/info/v2/',
+        expect.objectContaining({ credentials: 'include' })
       );
       expect(JSON.stringify(result)).not.toContain('private-stable-id');
       expect(JSON.stringify(result)).not.toContain('private-profile-name');
@@ -677,7 +752,7 @@ describe('DouyinBrowserProfileService', () => {
     }
   });
 
-  it('does not use the editable unique_id handle as an account identity', async () => {
+  it('recognizes only the explicit Passport session-expired error', async () => {
     const service = createService();
     const originalFetch = (globalThis as any).fetch;
     const page = {
@@ -686,8 +761,82 @@ describe('DouyinBrowserProfileService', () => {
           status: 200,
           text: jest.fn().mockResolvedValue(
             JSON.stringify({
-              status_code: 0,
-              user: {
+              message: 'error',
+              data: {
+                error_code: 13,
+                description: 'private localized error',
+              },
+            })
+          ),
+        });
+        return callback(timeoutMs);
+      }),
+    };
+
+    try {
+      const result = await service.fetchAccountState(page);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          httpStatus: 200,
+          authenticated: false,
+          passportErrorCode: 13,
+          hasStableUserId: false,
+          loginRequired: true,
+        })
+      );
+      expect(JSON.stringify(result)).not.toContain('private localized error');
+    } finally {
+      (globalThis as any).fetch = originalFetch;
+    }
+  });
+
+  it('keeps unknown Passport errors inconclusive', async () => {
+    const service = createService();
+    const originalFetch = (globalThis as any).fetch;
+    const page = {
+      evaluate: jest.fn(async (callback, timeoutMs) => {
+        (globalThis as any).fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          text: jest.fn().mockResolvedValue(
+            JSON.stringify({
+              message: 'error',
+              data: { error_code: 8 },
+            })
+          ),
+        });
+        return callback(timeoutMs);
+      }),
+    };
+
+    try {
+      const result = await service.fetchAccountState(page);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          authenticated: false,
+          passportErrorCode: 8,
+          hasStableUserId: false,
+          loginRequired: false,
+        })
+      );
+    } finally {
+      (globalThis as any).fetch = originalFetch;
+    }
+  });
+
+  it('does not use numeric IDs or editable handles as account identity', async () => {
+    const service = createService();
+    const originalFetch = (globalThis as any).fetch;
+    const page = {
+      evaluate: jest.fn(async (callback, timeoutMs) => {
+        (globalThis as any).fetch = jest.fn().mockResolvedValue({
+          status: 200,
+          text: jest.fn().mockResolvedValue(
+            JSON.stringify({
+              message: 'success',
+              data: {
+                user_id: 123456789,
                 unique_id: 'editable-handle',
               },
             })
@@ -698,12 +847,12 @@ describe('DouyinBrowserProfileService', () => {
     };
 
     try {
-      const result = await service.fetchSelfProfileState(page);
+      const result = await service.fetchAccountState(page);
 
       expect(result).toEqual(
         expect.objectContaining({
           httpStatus: 200,
-          statusCode: 0,
+          authenticated: true,
           hasStableUserId: false,
           accountFingerprint: undefined,
         })

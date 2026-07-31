@@ -17,8 +17,8 @@ import type {
 
 const PAGE_TIMEOUT_MS = 60_000;
 const BROWSER_ENDPOINT_TIMEOUT_MS = 5_000;
-const SELF_PROFILE_TIMEOUT_MS = 10_000;
-const SELF_PROFILE_NAVIGATION_TIMEOUT_MS = 15_000;
+const ACCOUNT_INFO_TIMEOUT_MS = 10_000;
+const ACCOUNT_INFO_NAVIGATION_TIMEOUT_MS = 15_000;
 const MANAGED_PAGE_MARKER_PREFIX = 'streamer-helper:douyin:';
 const MANAGED_PAGE_STALE_MS = 15 * 60 * 1000;
 const VERIFICATION_TRANSITION_TIMEOUT_MS = 5_000;
@@ -122,14 +122,15 @@ interface DouyinManagedPage {
   pageMarker: string;
 }
 
-interface DouyinSelfProfileState {
+interface DouyinAccountState {
   httpStatus?: number;
-  statusCode?: number;
+  authenticated: boolean;
+  passportErrorCode?: number;
   hasStableUserId: boolean;
   accountFingerprint?: string;
   loginRequired: boolean;
   challenge?: DouyinProfileChallenge;
-  errorCode?: 'timeout' | 'request_failed' | 'invalid_response';
+  requestError?: 'timeout' | 'request_failed' | 'invalid_response';
 }
 
 @Provide()
@@ -231,7 +232,7 @@ export class DouyinBrowserProfileService {
       await this.navigate(
         validationPage,
         'https://www.douyin.com/',
-        SELF_PROFILE_NAVIGATION_TIMEOUT_MS
+        ACCOUNT_INFO_NAVIGATION_TIMEOUT_MS
       );
 
       const navigatedChallenge = await this.detectChallenge(validationPage);
@@ -263,7 +264,7 @@ export class DouyinBrowserProfileService {
         );
       }
 
-      const profile = await this.fetchSelfProfileState(validationPage);
+      const profile = await this.fetchAccountState(validationPage);
       diagnostics = await this.safeCookieDiagnostics(page.browserContext());
       if (profile.challenge) {
         return this.probeResult(
@@ -280,12 +281,32 @@ export class DouyinBrowserProfileService {
           }
         );
       }
+      if (profile.httpStatus === 401) {
+        return this.probeResult(
+          validationPage,
+          diagnostics,
+          'expired',
+          profile.httpStatus,
+          {
+            reason: 'Douyin account session is not authenticated',
+          }
+        );
+      }
       if (
-        profile.loginRequired ||
-        profile.httpStatus === 401 ||
-        profile.statusCode === 8 ||
-        profile.statusCode === 2483
+        profile.httpStatus !== undefined &&
+        (profile.httpStatus < 200 || profile.httpStatus >= 300)
       ) {
+        return this.probeResult(
+          validationPage,
+          diagnostics,
+          'transient',
+          profile.httpStatus,
+          {
+            reason: `Douyin account endpoint returned HTTP ${profile.httpStatus}`,
+          }
+        );
+      }
+      if (profile.loginRequired) {
         return this.probeResult(
           validationPage,
           diagnostics,
@@ -300,7 +321,7 @@ export class DouyinBrowserProfileService {
         profile.httpStatus !== undefined &&
         profile.httpStatus >= 200 &&
         profile.httpStatus < 300 &&
-        profile.statusCode === 0 &&
+        profile.authenticated &&
         profile.hasStableUserId &&
         profile.accountFingerprint
       ) {
@@ -313,18 +334,13 @@ export class DouyinBrowserProfileService {
         );
       }
 
-      const reason = profile.errorCode
-        ? `Douyin account validation ${profile.errorCode.replace('_', ' ')}`
-        : profile.httpStatus !== undefined &&
-          (profile.httpStatus < 200 || profile.httpStatus >= 300)
-        ? `Douyin account endpoint returned HTTP ${profile.httpStatus}`
-        : profile.statusCode === 0
+      const reason = profile.requestError
+        ? `Douyin account validation ${profile.requestError.replace('_', ' ')}`
+        : profile.authenticated
         ? 'Douyin account endpoint did not confirm a stable identity'
-        : profile.statusCode !== undefined
-        ? `Douyin account endpoint returned status ${profile.statusCode}`
-        : `Douyin account endpoint returned HTTP ${
-            profile.httpStatus ?? 'unknown'
-          }`;
+        : profile.passportErrorCode !== undefined
+        ? `Douyin account endpoint returned error ${profile.passportErrorCode}`
+        : 'Douyin account endpoint did not confirm authentication';
       return this.probeResult(
         validationPage,
         diagnostics,
@@ -662,20 +678,18 @@ export class DouyinBrowserProfileService {
   }
 
   /**
-   * Calls Douyin's account-only endpoint inside the persisted browser profile.
-   * The page returns only authentication signals and a one-way continuity
-   * fingerprint; no raw account identifier or profile field crosses the
-   * browser boundary.
+   * Calls Douyin's same-origin Passport endpoint inside the persisted browser
+   * profile. Unlike signed Web APIs, this endpoint does not require a_bogus or
+   * device parameters. Only authentication signals and a one-way continuity
+   * fingerprint cross the browser boundary.
    */
-  private async fetchSelfProfileState(
-    page: Page
-  ): Promise<DouyinSelfProfileState> {
+  private async fetchAccountState(page: Page): Promise<DouyinAccountState> {
     const evaluation = page.evaluate(async timeoutMs => {
       const scope = globalThis as any;
       const controller = new scope.AbortController();
       const timer = scope.setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await scope.fetch('/aweme/v1/web/user/profile/self/', {
+        const response = await scope.fetch('/passport/account/info/v2/', {
           method: 'GET',
           credentials: 'include',
           headers: {
@@ -701,40 +715,39 @@ export class DouyinBrowserProfileService {
         } catch {
           return {
             httpStatus: response.status,
+            authenticated: false,
             hasStableUserId: false,
-            loginRequired:
-              /请先登录|登录后继续|用户未登录|登录已失效|重新登录/.test(body),
+            loginRequired: response.status === 401,
             challenge: secondaryVerification
               ? 'second_verification'
               : captcha
               ? 'captcha'
               : undefined,
-            errorCode: 'invalid_response',
+            requestError: 'invalid_response',
           };
         }
 
-        const rawStatusCode = payload?.status_code;
-        const statusCode =
-          typeof rawStatusCode === 'number' && Number.isFinite(rawStatusCode)
-            ? rawStatusCode
-            : undefined;
-        const user = payload?.user || payload?.data?.user;
+        const rawPassportErrorCode =
+          payload?.error_code ?? payload?.data?.error_code;
+        const parsedPassportErrorCode =
+          typeof rawPassportErrorCode === 'string' &&
+          /^\d+$/.test(rawPassportErrorCode.trim())
+            ? Number(rawPassportErrorCode)
+            : rawPassportErrorCode;
+        const passportErrorCode = Number.isSafeInteger(parsedPassportErrorCode)
+          ? (parsedPassportErrorCode as number)
+          : undefined;
+        const account = payload?.data?.user || payload?.data;
         const normalizeStableId = (value: unknown) =>
           typeof value === 'string' && value.trim().length > 0
             ? value.trim()
-            : typeof value === 'number' &&
-              Number.isSafeInteger(value) &&
-              value > 0
-            ? String(value)
             : undefined;
-        const secUid = normalizeStableId(user?.sec_uid);
-        const uid = normalizeStableId(user?.uid);
-        // unique_id is a user-editable handle, so it must never anchor account
-        // continuity. Tag the selected field to avoid cross-namespace clashes.
-        const stableAccountKey = secUid
-          ? `sec_uid:${secUid}`
-          : uid
-          ? `uid:${uid}`
+        const secUserId = normalizeStableId(account?.sec_user_id);
+        const userIdString = normalizeStableId(account?.user_id_str);
+        const stableAccountKey = secUserId
+          ? `sec_user_id:${secUserId}`
+          : userIdString
+          ? `user_id_str:${userIdString}`
           : undefined;
         const hasStableUserId = stableAccountKey !== undefined;
         let accountFingerprint: string | undefined;
@@ -753,20 +766,23 @@ export class DouyinBrowserProfileService {
             accountFingerprint = undefined;
           }
         }
-        const statusMessage =
-          typeof payload?.status_msg === 'string' ? payload.status_msg : '';
+        const message =
+          typeof payload?.message === 'string'
+            ? payload.message.trim().toLowerCase()
+            : '';
 
         return {
           httpStatus: response.status,
-          statusCode,
+          authenticated: message === 'success',
+          passportErrorCode,
           hasStableUserId,
           accountFingerprint,
           loginRequired:
-            statusCode === 8 ||
-            statusCode === 2483 ||
-            /请先登录|登录后继续|用户未登录|登录已失效|重新登录/.test(
-              statusMessage
-            ),
+            response.status === 401 ||
+            (response.status >= 200 &&
+              response.status < 300 &&
+              message === 'error' &&
+              passportErrorCode === 13),
           challenge: secondaryVerification
             ? 'second_verification'
             : captcha
@@ -775,9 +791,10 @@ export class DouyinBrowserProfileService {
         };
       } catch (error) {
         return {
+          authenticated: false,
           hasStableUserId: false,
           loginRequired: false,
-          errorCode:
+          requestError:
             error instanceof scope.DOMException && error.name === 'AbortError'
               ? 'timeout'
               : 'request_failed',
@@ -785,11 +802,11 @@ export class DouyinBrowserProfileService {
       } finally {
         scope.clearTimeout(timer);
       }
-    }, SELF_PROFILE_TIMEOUT_MS) as Promise<DouyinSelfProfileState>;
+    }, ACCOUNT_INFO_TIMEOUT_MS) as Promise<DouyinAccountState>;
 
     return await this.withTimeout(
       evaluation,
-      SELF_PROFILE_TIMEOUT_MS + 2_000,
+      ACCOUNT_INFO_TIMEOUT_MS + 2_000,
       'Douyin account validation timed out'
     );
   }
