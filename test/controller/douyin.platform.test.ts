@@ -1,5 +1,14 @@
 import { DouyinAdapter } from '../../src/platform/douyin';
 
+const FLV_PREFIX = new Uint8Array([
+  0x46, 0x4c, 0x56, 0x01, 0x05, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00,
+  0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+]);
+
+function flvResponse(): Response {
+  return new Response(FLV_PREFIX, { status: 200 });
+}
+
 function buildDouyinHtml() {
   const payload = JSON.stringify([
     {
@@ -56,6 +65,7 @@ describe('DouyinAdapter', () => {
     }
     (DouyinAdapter as any).guestCookieCache = undefined;
     (DouyinAdapter as any).resolverCache.clear();
+    (DouyinAdapter as any).resolverMediaCircuits.clear();
     (DouyinAdapter as any).circuits.clear();
   });
 
@@ -87,7 +97,7 @@ describe('DouyinAdapter', () => {
         if (url.startsWith('https://live.douyin.com/')) {
           return new Response(buildDouyinHtml(), { status: 200 });
         }
-        return new Response('', { status: 200 });
+        return flvResponse();
       });
 
     const adapter = new DouyinAdapter(logger);
@@ -176,31 +186,52 @@ describe('DouyinAdapter', () => {
 
   it('uses the pinned resolver sidecar as the primary anonymous path', async () => {
     process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
-    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          state: 'live',
-          roomId: '742000000000',
-          title: 'resolver title',
-          stream: {
-            url: 'https://pull.example/resolver.flv',
-            headers: {
-              'User-Agent': 'resolver-agent',
-              Cookie: 'ttwid=ephemeral',
-              Authorization: 'must-not-be-forwarded',
-            },
-            effectiveQuality: 'high',
-          },
-        }),
-        {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith('http://douyin-resolver:7100')) {
+            return new Response(
+              JSON.stringify({
+                state: 'live',
+                roomId: '742000000000',
+                title: 'resolver title',
+                stream: {
+                  url: 'https://pull.example/resolver.flv',
+                  headers: {
+                    'User-Agent': 'resolver-agent',
+                    Cookie: 'ttwid=ephemeral',
+                    Authorization: 'must-not-be-forwarded',
+                  },
+                  effectiveQuality: 'high',
+                },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }
+            );
+          }
+          expect(String(input)).toBe('https://pull.example/resolver.flv');
+          expect(init).toEqual(
+            expect.objectContaining({
+              method: 'GET',
+              redirect: 'manual',
+              headers: {
+                'User-Agent': 'resolver-agent',
+                Cookie: 'ttwid=ephemeral',
+              },
+            })
+          );
+          return flvResponse();
         }
-      )
-    );
+      );
 
     const adapter = new DouyinAdapter(logger);
     const status = await adapter.getStreamerStatus('douyin-web-rid');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
     const stream = await adapter.getStream('douyin-web-rid', 'high');
 
     expect(status).toEqual(
@@ -219,7 +250,96 @@ describe('DouyinAdapter', () => {
         },
       })
     );
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back immediately when resolver media has no FLV bytes', async () => {
+    process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
+    const badResolverUrl =
+      'https://pull.example/bad.flv?auth_key=private-resolver-secret';
+    let badMediaRequests = 0;
+    const localLogger = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('http://douyin-resolver:7100')) {
+          return new Response(
+            JSON.stringify({
+              state: 'live',
+              roomId: '742000000000',
+              title: 'resolver title',
+              stream: {
+                url: badResolverUrl,
+                effectiveQuality: 'high',
+              },
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        if (url === badResolverUrl) {
+          badMediaRequests += 1;
+          return new Response('', { status: 200 });
+        }
+        if (url.includes('/ttwid/union/register/')) {
+          return new Response('', {
+            status: 200,
+            headers: {
+              'set-cookie': 'ttwid=fallback-device; Path=/; HttpOnly',
+            },
+          });
+        }
+        if (url.startsWith('https://live.douyin.com/')) {
+          return new Response(buildDouyinHtml(), { status: 200 });
+        }
+        if (url.startsWith('https://pull.example/live_')) {
+          return flvResponse();
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+
+    const adapter = new DouyinAdapter(localLogger);
+    const first = await adapter.getStream('douyin-web-rid', 'high');
+    const second = await adapter.getStream('douyin-web-rid', 'high');
+
+    expect(first.url).toBe('https://pull.example/live_uhd.flv');
+    expect(second.url).toBe('https://pull.example/live_uhd.flv');
+    expect(badMediaRequests).toBe(1);
+    expect(
+      (DouyinAdapter as any).resolverMediaCircuits.get('douyin-web-rid:high')
+    ).toEqual(
+      expect.objectContaining({
+        failureCount: 1,
+        retryAt: expect.any(Number),
+      })
+    );
+    expect(JSON.stringify(localLogger.warn.mock.calls)).not.toContain(
+      'private-resolver-secret'
+    );
+  });
+
+  it('backs off resolver media validation exponentially after cooldowns', () => {
+    const now = 1_800_000_000_000;
+    jest.spyOn(Date, 'now').mockReturnValue(now);
+    const adapter = new DouyinAdapter(logger) as any;
+
+    expect(adapter.openResolverMediaCircuit('room-a', 'high')).toBe(30_000);
+    expect(adapter.isResolverMediaCircuitOpen('room-a', 'high')).toBe(true);
+
+    jest.spyOn(Date, 'now').mockReturnValue(now + 30_001);
+    expect(adapter.isResolverMediaCircuitOpen('room-a', 'high')).toBe(false);
+    expect(adapter.openResolverMediaCircuit('room-a', 'high')).toBe(60_000);
+    expect(
+      (DouyinAdapter as any).resolverMediaCircuits.get('room-a:high')
+    ).toEqual(expect.objectContaining({ failureCount: 2 }));
   });
 
   it('always tries the primary resolver before fallback circuit breakers', async () => {
@@ -240,9 +360,9 @@ describe('DouyinAdapter', () => {
     adapter.openCircuit('captcha', 'another-room');
     adapter.openCircuit('room-info', 'douyin-web-rid');
 
-    await expect(
-      adapter.getStreamerStatus('douyin-web-rid')
-    ).resolves.toEqual(expect.objectContaining({ isLive: false }));
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).resolves.toEqual(
+      expect.objectContaining({ isLive: false })
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((DouyinAdapter as any).circuits.has('*')).toBe(true);
@@ -269,9 +389,7 @@ describe('DouyinAdapter', () => {
       browserPageProvider,
     });
 
-    await expect(
-      adapter.getStreamerStatus('douyin-web-rid')
-    ).rejects.toEqual(
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).rejects.toEqual(
       expect.objectContaining({
         code: 'DOUYIN_BACKOFF',
       })
@@ -284,42 +402,44 @@ describe('DouyinAdapter', () => {
     process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
     let pageCookie = '';
     let validationCookie = '';
-    jest.spyOn(global, 'fetch').mockImplementation(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        const headers = init?.headers as Record<string, string> | undefined;
-        if (url.startsWith('http://douyin-resolver:7100')) {
-          return new Response(
-            JSON.stringify({
-              state: 'unavailable',
-              code: 'UPSTREAM_ERROR',
-              message: 'temporary failure',
-            }),
-            {
+    jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          const headers = init?.headers as Record<string, string> | undefined;
+          if (url.startsWith('http://douyin-resolver:7100')) {
+            return new Response(
+              JSON.stringify({
+                state: 'unavailable',
+                code: 'UPSTREAM_ERROR',
+                message: 'temporary failure',
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }
+            );
+          }
+          if (url.includes('/ttwid/union/register/')) {
+            return new Response('', {
               status: 200,
-              headers: { 'Content-Type': 'application/json' },
-            }
-          );
+              headers: {
+                'set-cookie': 'ttwid=stable-guest; Path=/; HttpOnly',
+              },
+            });
+          }
+          if (url.startsWith('https://live.douyin.com/')) {
+            pageCookie = headers?.Cookie || '';
+            return new Response(buildDouyinHtml(), { status: 200 });
+          }
+          if (url.startsWith('https://pull.example/')) {
+            validationCookie = headers?.Cookie || '';
+            return flvResponse();
+          }
+          throw new Error(`Unexpected URL: ${url}`);
         }
-        if (url.includes('/ttwid/union/register/')) {
-          return new Response('', {
-            status: 200,
-            headers: {
-              'set-cookie': 'ttwid=stable-guest; Path=/; HttpOnly',
-            },
-          });
-        }
-        if (url.startsWith('https://live.douyin.com/')) {
-          pageCookie = headers?.Cookie || '';
-          return new Response(buildDouyinHtml(), { status: 200 });
-        }
-        if (url.startsWith('https://pull.example/')) {
-          validationCookie = headers?.Cookie || '';
-          return new Response('', { status: 200 });
-        }
-        throw new Error(`Unexpected URL: ${url}`);
-      }
-    );
+      );
 
     const adapter = new DouyinAdapter(logger);
     const resolved = await adapter.getStream('douyin-web-rid', 'low');
@@ -344,7 +464,9 @@ describe('DouyinAdapter', () => {
     } as any;
     jest
       .spyOn(global, 'fetch')
-      .mockRejectedValue(new TypeError(`Failed to parse URL from ${signedUrl}`));
+      .mockRejectedValue(
+        new TypeError(`Failed to parse URL from ${signedUrl}`)
+      );
 
     const adapter = new DouyinAdapter(localLogger) as any;
     await expect(adapter.validateStreamUrl(signedUrl, {})).resolves.toBe(false);
@@ -353,13 +475,94 @@ describe('DouyinAdapter', () => {
       'Douyin stream URL validation failed',
       {
         url: 'https://pull.example:bad/live.flv',
-        error:
-          'Failed to parse URL from https://pull.example:bad/live.flv',
+        error: 'Failed to parse URL from https://pull.example:bad/live.flv',
       }
     );
     expect(JSON.stringify(localLogger.debug.mock.calls)).not.toContain(
       'private-url-secret'
     );
+  });
+
+  it('accepts an HLS manifest with a BOM and leading whitespace', async () => {
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(
+        new Response('\uFEFF  \n#EXTM3U\n#EXT-X-VERSION:3\n', { status: 200 })
+      );
+    const adapter = new DouyinAdapter(logger) as any;
+
+    await expect(
+      adapter.validateStreamUrl('https://pull.example/live.m3u8', {}, 'hls')
+    ).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://pull.example/live.m3u8',
+      expect.objectContaining({ redirect: 'manual' })
+    );
+  });
+
+  it('rejects a truncated FLV that ends after the container header', async () => {
+    jest.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(FLV_PREFIX.subarray(0, 13), {
+        status: 200,
+      })
+    );
+    const adapter = new DouyinAdapter(logger) as any;
+
+    await expect(
+      adapter.validateStreamUrl('https://pull.example/truncated.flv', {}, 'flv')
+    ).resolves.toBe(false);
+  });
+
+  it('bounds media validation reads and cancels an endless response', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(1024).fill(0x20));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response(body, { status: 200 }));
+    const adapter = new DouyinAdapter(logger) as any;
+
+    await expect(
+      adapter.validateStreamUrl('https://pull.example/endless.m3u8', {}, 'hls')
+    ).resolves.toBe(false);
+    expect(cancelled).toBe(true);
+  });
+
+  it('times out while waiting for the first media byte', async () => {
+    jest.useFakeTimers();
+    try {
+      jest
+        .spyOn(global, 'fetch')
+        .mockImplementation(
+          async (_input: RequestInfo | URL, init?: RequestInit) => {
+            const body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                init?.signal?.addEventListener('abort', () => {
+                  controller.error(new Error('media body aborted'));
+                });
+              },
+            });
+            return new Response(body, { status: 200 });
+          }
+        );
+      const adapter = new DouyinAdapter(logger) as any;
+      const request = adapter.validateStreamUrl(
+        'https://pull.example/stalled.flv',
+        {},
+        'flv'
+      );
+
+      await jest.advanceTimersByTimeAsync(8_000);
+      await expect(request).resolves.toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('rejects unknown resolver states instead of treating them as offline', () => {

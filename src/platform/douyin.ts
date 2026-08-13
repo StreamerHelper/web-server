@@ -87,12 +87,17 @@ type QualityBucket = 'origin' | 'high' | 'medium' | 'low' | 'unknown';
 const DOUYIN_LIVE_STATUS = 2;
 const REQUEST_TIMEOUT_MS = 15_000;
 const RESOLVER_REQUEST_TIMEOUT_MS = 25_000;
+const STREAM_VALIDATION_TIMEOUT_MS = 8_000;
+const STREAM_VALIDATION_MAX_BYTES = 4 * 1024;
 const RESOLVER_BUSY_RETRY_MS = 5_000;
 export const DOUYIN_CAPTCHA_ERROR_CODE = 'DOUYIN_CAPTCHA_REQUIRED';
 export const DOUYIN_BACKOFF_ERROR_CODE = 'DOUYIN_BACKOFF';
 const GUEST_COOKIE_TTL_MS = 24 * 60 * 60 * 1000;
 const RESOLVER_CACHE_TTL_MS = 5_000;
 const RESOLVER_CACHE_MAX_ENTRIES = 256;
+const RESOLVER_MEDIA_CIRCUIT_BASE_DELAY_MS = 30_000;
+const RESOLVER_MEDIA_CIRCUIT_MAX_DELAY_MS = 5 * 60 * 1000;
+const RESOLVER_MEDIA_CIRCUIT_MAX_ENTRIES = 256;
 const CIRCUIT_BASE_DELAY_MS = 30_000;
 const CIRCUIT_MAX_DELAY_MS = 5 * 60 * 1000;
 const CIRCUIT_MAX_ENTRIES = 256;
@@ -163,6 +168,10 @@ export class DouyinAdapter implements PlatformAdapter {
     string,
     { expiresAt: number; snapshot: DouyinRoomSnapshot }
   >();
+  private static resolverMediaCircuits = new Map<
+    string,
+    { failureCount: number; retryAt: number }
+  >();
 
   private readonly liveBaseUrl = 'https://live.douyin.com';
   private readonly reflowApis = [
@@ -196,8 +205,8 @@ export class DouyinAdapter implements PlatformAdapter {
     streamerId: string,
     quality: RecordingQuality = 'high'
   ): Promise<ResolvedStream> {
-    const snapshot = await this.fetchRoomSnapshot(streamerId, quality);
-    const { room, webRid } = snapshot;
+    let snapshot = await this.fetchRoomSnapshot(streamerId, quality);
+    let { room, webRid } = snapshot;
 
     if (!this.isLive(room)) {
       throw new PlatformError(
@@ -216,13 +225,64 @@ export class DouyinAdapter implements PlatformAdapter {
     }
 
     if (snapshot.resolverStream) {
-      return {
-        url: snapshot.resolverStream.url,
-        headers: snapshot.resolverStream.headers,
-        requestedQuality: quality,
-        effectiveQuality: snapshot.resolverStream.effectiveQuality || quality,
-        qualityApplied: true,
-      };
+      const resolverStream = snapshot.resolverStream;
+      const mediaCircuitOpen = this.isResolverMediaCircuitOpen(webRid, quality);
+      if (
+        !mediaCircuitOpen &&
+        (await this.validateStreamUrl(
+          resolverStream.url,
+          resolverStream.headers || {},
+          'flv'
+        ))
+      ) {
+        this.resetResolverMediaCircuit(webRid, quality);
+        this.resetRoomCircuit(webRid);
+        return {
+          url: resolverStream.url,
+          headers: resolverStream.headers,
+          requestedQuality: quality,
+          effectiveQuality: resolverStream.effectiveQuality || quality,
+          qualityApplied: true,
+        };
+      }
+
+      if (!mediaCircuitOpen) {
+        const retryAfterMs = this.openResolverMediaCircuit(webRid, quality);
+        this.logger?.warn(
+          'Douyin resolver returned an unreadable media stream; using fallback',
+          {
+            streamerId,
+            webRid,
+            quality,
+            url: sanitizeStreamUrl(resolverStream.url),
+            retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+          }
+        );
+      } else {
+        this.logger?.debug(
+          'Douyin resolver media validation is cooling down; using fallback',
+          { streamerId, webRid, quality }
+        );
+      }
+
+      snapshot = await this.fetchFallbackRoomSnapshot(webRid, streamerId);
+      room = snapshot.room;
+      webRid = snapshot.webRid;
+
+      if (!this.isLive(room)) {
+        throw new PlatformError(
+          'Live stream is offline',
+          'douyin',
+          'STREAM_OFFLINE'
+        );
+      }
+      if (!room.stream_url) {
+        throw new PlatformError(
+          'No Douyin stream info available',
+          'douyin',
+          'NO_STREAM_INFO'
+        );
+      }
     }
 
     this.mergeOriginStreams(room.stream_url);
@@ -232,7 +292,13 @@ export class DouyinAdapter implements PlatformAdapter {
       this.buildStreamHeaders(webRid, await this.buildDouyinCookie(webRid));
     const candidates = this.buildStreamCandidates(room.stream_url, quality);
     for (const candidate of candidates) {
-      if (await this.validateStreamUrl(candidate.url, streamHeaders)) {
+      if (
+        await this.validateStreamUrl(
+          candidate.url,
+          streamHeaders,
+          candidate.protocol
+        )
+      ) {
         this.logger?.debug('Using Douyin stream URL', {
           streamerId,
           webRid,
@@ -285,9 +351,21 @@ export class DouyinAdapter implements PlatformAdapter {
     this.pruneResolverCache();
     const resolverSnapshot = await this.fetchResolverRoom(webRid, quality);
     if (resolverSnapshot) {
-      this.resetRoomCircuit(webRid);
+      // Resolver metadata alone does not prove that a live media URL is usable.
+      // Keep fallback failures cooling down until media validation succeeds.
+      if (!this.isLive(resolverSnapshot.room)) {
+        this.resetRoomCircuit(webRid);
+      }
       return resolverSnapshot;
     }
+
+    return await this.fetchFallbackRoomSnapshot(webRid, streamerId);
+  }
+
+  private async fetchFallbackRoomSnapshot(
+    webRid: string,
+    streamerId: string = webRid
+  ): Promise<DouyinRoomSnapshot> {
     this.assertFallbackCircuitClosed(webRid);
 
     const pageUrl = `${this.liveBaseUrl}/${encodeURIComponent(webRid)}`;
@@ -975,7 +1053,8 @@ export class DouyinAdapter implements PlatformAdapter {
 
   private async validateStreamUrl(
     url: string,
-    streamHeaders: Record<string, string>
+    streamHeaders: Record<string, string>,
+    protocol: StreamCandidate['protocol'] = 'flv'
   ): Promise<boolean> {
     if (!/^https?:\/\//i.test(url) && !/^rtmp:\/\//i.test(url)) {
       return false;
@@ -986,19 +1065,52 @@ export class DouyinAdapter implements PlatformAdapter {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(
+      () => controller.abort(),
+      STREAM_VALIDATION_TIMEOUT_MS
+    );
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
     try {
       const response = await fetch(url, {
         method: 'GET',
-        headers: {
-          ...streamHeaders,
-          Range: 'bytes=0-0',
-        },
+        headers: streamHeaders,
+        redirect: 'manual',
         signal: controller.signal,
       });
-      await response.body?.cancel();
-      return response.status < 400;
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        return false;
+      }
+
+      reader = response.body.getReader();
+      const header = new Uint8Array(STREAM_VALIDATION_MAX_BYTES);
+      let length = 0;
+      while (length < STREAM_VALIDATION_MAX_BYTES) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          break;
+        }
+        if (!chunk.value?.byteLength) {
+          continue;
+        }
+        const remaining = STREAM_VALIDATION_MAX_BYTES - length;
+        const bytesToCopy = Math.min(chunk.value.byteLength, remaining);
+        header.set(chunk.value.subarray(0, bytesToCopy), length);
+        length += bytesToCopy;
+
+        const validation = this.validateMediaHeader(
+          header.subarray(0, length),
+          protocol
+        );
+        if (validation !== undefined) {
+          return validation;
+        }
+      }
+
+      return (
+        this.validateMediaHeader(header.subarray(0, length), protocol) === true
+      );
     } catch (error) {
       this.logger?.debug('Douyin stream URL validation failed', {
         url: sanitizeStreamUrl(url),
@@ -1008,8 +1120,83 @@ export class DouyinAdapter implements PlatformAdapter {
       });
       return false;
     } finally {
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The timeout can already have errored the response body.
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // Ignore readers whose lock was already released by the runtime.
+        }
+      }
       clearTimeout(timer);
     }
+  }
+
+  private validateMediaHeader(
+    bytes: Uint8Array,
+    protocol: StreamCandidate['protocol']
+  ): boolean | undefined {
+    if (protocol === 'hls') {
+      const text = new TextDecoder().decode(bytes).replace(/^\uFEFF/, '');
+      if (text.trimStart().startsWith('#EXTM3U')) {
+        return true;
+      }
+      return bytes.byteLength >= STREAM_VALIDATION_MAX_BYTES
+        ? false
+        : undefined;
+    }
+
+    if (protocol !== 'flv') {
+      return false;
+    }
+    if (bytes.byteLength < 3) {
+      return undefined;
+    }
+    if (bytes[0] !== 0x46 || bytes[1] !== 0x4c || bytes[2] !== 0x56) {
+      return false;
+    }
+    if (bytes.byteLength < 9) {
+      return undefined;
+    }
+
+    const dataOffset =
+      bytes[5] * 0x1000000 + bytes[6] * 0x10000 + bytes[7] * 0x100 + bytes[8];
+    if (
+      bytes[3] !== 1 ||
+      (bytes[4] & 0xfa) !== 0 ||
+      dataOffset < 9 ||
+      dataOffset > STREAM_VALIDATION_MAX_BYTES - 4
+    ) {
+      return false;
+    }
+    const firstTagOffset = dataOffset + 4;
+    if (bytes.byteLength < firstTagOffset + 12) {
+      return undefined;
+    }
+    if (
+      bytes[dataOffset] === 0 &&
+      bytes[dataOffset + 1] === 0 &&
+      bytes[dataOffset + 2] === 0 &&
+      bytes[dataOffset + 3] === 0
+    ) {
+      const tagType = bytes[firstTagOffset] & 0x1f;
+      const dataSize =
+        bytes[firstTagOffset + 1] * 0x10000 +
+        bytes[firstTagOffset + 2] * 0x100 +
+        bytes[firstTagOffset + 3];
+      return (
+        (tagType === 8 || tagType === 9 || tagType === 18) &&
+        dataSize > 0 &&
+        bytes[firstTagOffset + 8] === 0 &&
+        bytes[firstTagOffset + 9] === 0 &&
+        bytes[firstTagOffset + 10] === 0
+      );
+    }
+    return false;
   }
 
   private async resolveRoomInput(input: string): Promise<string> {
@@ -1343,6 +1530,62 @@ export class DouyinAdapter implements PlatformAdapter {
   private resetFallbackCircuit(webRid: string): void {
     DouyinAdapter.circuits.delete(GLOBAL_CIRCUIT_KEY);
     this.resetRoomCircuit(webRid);
+  }
+
+  private resolverMediaCircuitKey(
+    webRid: string,
+    quality: RecordingQuality
+  ): string {
+    return `${webRid}:${quality}`;
+  }
+
+  private isResolverMediaCircuitOpen(
+    webRid: string,
+    quality: RecordingQuality
+  ): boolean {
+    const circuit = DouyinAdapter.resolverMediaCircuits.get(
+      this.resolverMediaCircuitKey(webRid, quality)
+    );
+    return Boolean(circuit && circuit.retryAt > Date.now());
+  }
+
+  private openResolverMediaCircuit(
+    webRid: string,
+    quality: RecordingQuality
+  ): number {
+    const key = this.resolverMediaCircuitKey(webRid, quality);
+    const circuit = DouyinAdapter.resolverMediaCircuits.get(key) || {
+      failureCount: 0,
+      retryAt: 0,
+    };
+    circuit.failureCount += 1;
+    const delay = Math.min(
+      RESOLVER_MEDIA_CIRCUIT_BASE_DELAY_MS * 2 ** (circuit.failureCount - 1),
+      RESOLVER_MEDIA_CIRCUIT_MAX_DELAY_MS
+    );
+    circuit.retryAt = Date.now() + delay;
+
+    if (
+      !DouyinAdapter.resolverMediaCircuits.has(key) &&
+      DouyinAdapter.resolverMediaCircuits.size >=
+        RESOLVER_MEDIA_CIRCUIT_MAX_ENTRIES
+    ) {
+      const oldestKey = DouyinAdapter.resolverMediaCircuits.keys().next().value;
+      if (typeof oldestKey === 'string') {
+        DouyinAdapter.resolverMediaCircuits.delete(oldestKey);
+      }
+    }
+    DouyinAdapter.resolverMediaCircuits.set(key, circuit);
+    return delay;
+  }
+
+  private resetResolverMediaCircuit(
+    webRid: string,
+    quality: RecordingQuality
+  ): void {
+    DouyinAdapter.resolverMediaCircuits.delete(
+      this.resolverMediaCircuitKey(webRid, quality)
+    );
   }
 
   private isLive(room: DouyinRoom): boolean {
