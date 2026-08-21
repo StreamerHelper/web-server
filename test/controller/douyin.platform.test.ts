@@ -9,7 +9,7 @@ function flvResponse(): Response {
   return new Response(FLV_PREFIX, { status: 200 });
 }
 
-function buildDouyinHtml() {
+function buildDouyinHtml(status = 2) {
   const payload = JSON.stringify([
     {
       state: {
@@ -20,7 +20,7 @@ function buildDouyinHtml() {
             room: {
               id_str: '742000000000',
               title: '抖音直播标题',
-              status: 2,
+              status,
               owner: { nickname: '抖音主播' },
               room_view_stats: { display_value: 3456 },
               stream_url: {
@@ -65,6 +65,7 @@ describe('DouyinAdapter', () => {
     }
     (DouyinAdapter as any).guestCookieCache = undefined;
     (DouyinAdapter as any).resolverCache.clear();
+    (DouyinAdapter as any).offlineConfirmations.clear();
     (DouyinAdapter as any).resolverMediaCircuits.clear();
     (DouyinAdapter as any).circuits.clear();
   });
@@ -342,7 +343,60 @@ describe('DouyinAdapter', () => {
     ).toEqual(expect.objectContaining({ failureCount: 2 }));
   });
 
-  it('always tries the primary resolver before fallback circuit breakers', async () => {
+  it('requires fallback confirmation when the resolver reports offline', async () => {
+    process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('http://douyin-resolver:7100')) {
+          return new Response(
+            JSON.stringify({
+              state: 'offline',
+              roomId: '742000000000',
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        if (url.includes('/ttwid/union/register/')) {
+          return new Response('', {
+            status: 200,
+            headers: {
+              'set-cookie': 'ttwid=fallback-device; Path=/; HttpOnly',
+            },
+          });
+        }
+        if (url.startsWith('https://live.douyin.com/')) {
+          return new Response(buildDouyinHtml(), { status: 200 });
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+    const localLogger = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const adapter = new DouyinAdapter(localLogger);
+
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).resolves.toEqual(
+      expect.objectContaining({ isLive: true })
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(localLogger.warn).toHaveBeenCalledWith(
+      'Douyin resolver reported offline but fallback detected a live stream',
+      {
+        streamerId: 'douyin-web-rid',
+        webRid: 'douyin-web-rid',
+      }
+    );
+  });
+
+  it('does not silently accept offline when fallback verification is cooling down', async () => {
     process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
     const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(
       new Response(
@@ -357,16 +411,101 @@ describe('DouyinAdapter', () => {
       )
     );
     const adapter = new DouyinAdapter(logger) as any;
-    adapter.openCircuit('captcha', 'another-room');
     adapter.openCircuit('room-info', 'douyin-web-rid');
+
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).rejects.toEqual(
+      expect.objectContaining({ code: 'DOUYIN_BACKOFF' })
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((DouyinAdapter as any).circuits.has('douyin-web-rid')).toBe(true);
+  });
+
+  it('briefly caches an offline result confirmed by both sources', async () => {
+    process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
+    const now = 1_800_000_000_000;
+    jest.spyOn(Date, 'now').mockReturnValue(now);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('http://douyin-resolver:7100')) {
+          return new Response(
+            JSON.stringify({
+              state: 'offline',
+              roomId: '742000000000',
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        if (url.includes('/ttwid/union/register/')) {
+          return new Response('', {
+            status: 200,
+            headers: {
+              'set-cookie': 'ttwid=fallback-device; Path=/; HttpOnly',
+            },
+          });
+        }
+        if (url.startsWith('https://live.douyin.com/')) {
+          return new Response(buildDouyinHtml(4), { status: 200 });
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+    const adapter = new DouyinAdapter(logger);
 
     await expect(adapter.getStreamerStatus('douyin-web-rid')).resolves.toEqual(
       expect.objectContaining({ isLive: false })
     );
+    jest.spyOn(Date, 'now').mockReturnValue(now + 5_001);
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).resolves.toEqual(
+      expect.objectContaining({ isLive: false })
+    );
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect((DouyinAdapter as any).circuits.has('*')).toBe(true);
-    expect((DouyinAdapter as any).circuits.has('douyin-web-rid')).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).startsWith('https://live.douyin.com/')
+      )
+    ).toHaveLength(1);
+  });
+
+  it('lets a live resolver result override a cached offline confirmation', async () => {
+    process.env.DOUYIN_RESOLVER_URL = 'http://douyin-resolver:7100';
+    (DouyinAdapter as any).offlineConfirmations.set('douyin-web-rid', {
+      expiresAt: Date.now() + 30_000,
+      snapshot: {
+        webRid: 'douyin-web-rid',
+        room: { id_str: '742000000000', status: 4 },
+      },
+    });
+    jest.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          state: 'live',
+          roomId: '742000000000',
+          title: 'resolver title',
+          stream: {
+            url: 'https://pull.example/resolver.flv',
+            effectiveQuality: 'high',
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      )
+    );
+    const adapter = new DouyinAdapter(logger);
+
+    await expect(adapter.getStreamerStatus('douyin-web-rid')).resolves.toEqual(
+      expect.objectContaining({ isLive: true })
+    );
+    expect(
+      (DouyinAdapter as any).offlineConfirmations.has('douyin-web-rid')
+    ).toBe(false);
   });
 
   it('returns short backoff for a busy resolver without entering anti-bot fallback', async () => {
@@ -611,7 +750,11 @@ describe('DouyinAdapter', () => {
       )
     );
 
-    const adapter = new DouyinAdapter(logger);
+    const adapter = new DouyinAdapter(logger) as any;
+    jest.spyOn(adapter, 'fetchFallbackRoomSnapshot').mockResolvedValue({
+      webRid: 'douyin-web-rid',
+      room: { id_str: '742000000000', status: 4 },
+    });
     const status = await adapter.getStreamerStatus('douyin-web-rid');
 
     expect(status.isLive).toBe(false);

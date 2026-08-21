@@ -95,6 +95,7 @@ export const DOUYIN_BACKOFF_ERROR_CODE = 'DOUYIN_BACKOFF';
 const GUEST_COOKIE_TTL_MS = 24 * 60 * 60 * 1000;
 const RESOLVER_CACHE_TTL_MS = 5_000;
 const RESOLVER_CACHE_MAX_ENTRIES = 256;
+const OFFLINE_CONFIRMATION_TTL_MS = 30_000;
 const RESOLVER_MEDIA_CIRCUIT_BASE_DELAY_MS = 30_000;
 const RESOLVER_MEDIA_CIRCUIT_MAX_DELAY_MS = 5 * 60 * 1000;
 const RESOLVER_MEDIA_CIRCUIT_MAX_ENTRIES = 256;
@@ -165,6 +166,10 @@ export class DouyinAdapter implements PlatformAdapter {
     { failureCount: number; retryAt: number; reason: string }
   >();
   private static resolverCache = new Map<
+    string,
+    { expiresAt: number; snapshot: DouyinRoomSnapshot }
+  >();
+  private static offlineConfirmations = new Map<
     string,
     { expiresAt: number; snapshot: DouyinRoomSnapshot }
   >();
@@ -351,12 +356,46 @@ export class DouyinAdapter implements PlatformAdapter {
     this.pruneResolverCache();
     const resolverSnapshot = await this.fetchResolverRoom(webRid, quality);
     if (resolverSnapshot) {
-      // Resolver metadata alone does not prove that a live media URL is usable.
-      // Keep fallback failures cooling down until media validation succeeds.
-      if (!this.isLive(resolverSnapshot.room)) {
-        this.resetRoomCircuit(webRid);
+      if (this.isLive(resolverSnapshot.room)) {
+        DouyinAdapter.offlineConfirmations.delete(webRid);
+        return resolverSnapshot;
       }
-      return resolverSnapshot;
+
+      // Anonymous resolver responses can be room-specific false negatives.
+      // Only accept offline after the independent fallback agrees.
+      const confirmed = DouyinAdapter.offlineConfirmations.get(webRid);
+      if (confirmed && confirmed.expiresAt > Date.now()) {
+        return confirmed.snapshot;
+      }
+      DouyinAdapter.offlineConfirmations.delete(webRid);
+
+      const fallbackSnapshot = await this.fetchFallbackRoomSnapshot(
+        webRid,
+        streamerId
+      );
+      if (this.isLive(fallbackSnapshot.room)) {
+        this.logger?.warn(
+          'Douyin resolver reported offline but fallback detected a live stream',
+          { streamerId, webRid }
+        );
+        return fallbackSnapshot;
+      }
+
+      if (
+        DouyinAdapter.offlineConfirmations.size >= RESOLVER_CACHE_MAX_ENTRIES
+      ) {
+        const oldestKey = DouyinAdapter.offlineConfirmations
+          .keys()
+          .next().value;
+        if (typeof oldestKey === 'string') {
+          DouyinAdapter.offlineConfirmations.delete(oldestKey);
+        }
+      }
+      DouyinAdapter.offlineConfirmations.set(webRid, {
+        expiresAt: Date.now() + OFFLINE_CONFIRMATION_TTL_MS,
+        snapshot: fallbackSnapshot,
+      });
+      return fallbackSnapshot;
     }
 
     return await this.fetchFallbackRoomSnapshot(webRid, streamerId);
@@ -850,6 +889,11 @@ export class DouyinAdapter implements PlatformAdapter {
     for (const [key, entry] of DouyinAdapter.resolverCache) {
       if (entry.expiresAt <= now) {
         DouyinAdapter.resolverCache.delete(key);
+      }
+    }
+    for (const [key, entry] of DouyinAdapter.offlineConfirmations) {
+      if (entry.expiresAt <= now) {
+        DouyinAdapter.offlineConfirmations.delete(key);
       }
     }
   }
