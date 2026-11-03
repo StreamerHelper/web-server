@@ -10,6 +10,7 @@ function buildJob(overrides: Record<string, any> = {}) {
     jobId: 'job-public-id',
     streamerId: 'streamer-1',
     platform: 'bilibili',
+    status: 'completed',
     endTime: new Date('2026-05-18T11:50:00.000Z'),
     createdAt: new Date('2026-05-18T11:00:00.000Z'),
     updatedAt: new Date('2026-05-18T11:55:00.000Z'),
@@ -239,6 +240,7 @@ describe('StorageDeleteProcessor current streamer settings', () => {
           delayMinutes: 1,
         },
       },
+      uploadSettings: { autoUpload: false },
     });
 
     const result = await processor.execute({
@@ -253,6 +255,78 @@ describe('StorageDeleteProcessor current streamer settings', () => {
     });
     expect(processor.jobService.deleteJobStorage).toHaveBeenCalledWith(
       'job-db-id',
+      'scheduled'
+    );
+  });
+
+  it.each(['missing-tail', 'unfinished-part', 'bad-counters', 'recording'])(
+    'preserves source files when submission completeness fails: %s',
+    async failure => {
+      const { processor } = createProcessor();
+      const keys = ['raw/job/video/a.mkv', 'raw/job/video/b.mkv'];
+      const job = buildJob({
+        status: failure === 'recording' ? 'recording' : 'completed',
+        metadata: { uploadedSegments: keys },
+      });
+      processor.jobService.findById.mockResolvedValue(job);
+      processor.streamerService.findByStreamerId.mockResolvedValue({
+        platform: 'bilibili',
+        recordSettings: { autoDelete: { enabled: true, delayMinutes: 1 } },
+        uploadSettings: { autoUpload: true },
+      });
+      processor.submissionRepository.findByJobId.mockResolvedValue([
+        {
+          id: 'submission',
+          status: 'completed',
+          bvid: 'BV1',
+          avid: 1,
+          totalParts: 1,
+          completedParts: failure === 'bad-counters' ? 0 : 1,
+          parts: [
+            {
+              index: 1,
+              status: failure === 'unfinished-part' ? 'pending' : 'completed',
+              filename: 'uploaded',
+              cid: 1,
+              s3Keys: failure === 'missing-tail' ? keys.slice(0, 1) : keys,
+            },
+          ],
+        },
+      ]);
+      const result = await processor.execute({
+        id: job.id,
+        reason: 'scheduled',
+      });
+      expect(result.status).toBe('deferred');
+      expect(processor.jobService.deleteJobStorage).not.toHaveBeenCalled();
+    }
+  );
+
+  it('deletes only after completed parts cover all uploaded source segments', async () => {
+    const { processor } = createProcessor();
+    const keys = ['raw/job/video/a.mkv', 'raw/job/video/b.mkv'];
+    const job = buildJob({ metadata: { uploadedSegments: keys } });
+    processor.jobService.findById.mockResolvedValue(job);
+    processor.streamerService.findByStreamerId.mockResolvedValue({
+      platform: 'bilibili',
+      recordSettings: { autoDelete: { enabled: true, delayMinutes: 1 } },
+      uploadSettings: { autoUpload: true },
+    });
+    processor.submissionRepository.findByJobId.mockResolvedValue([
+      {
+        status: 'completed',
+        bvid: 'BV1',
+        avid: 1,
+        totalParts: 1,
+        completedParts: 1,
+        parts: [
+          { status: 'completed', filename: 'uploaded', cid: 1, s3Keys: keys },
+        ],
+      },
+    ]);
+    await processor.execute({ id: job.id, reason: 'scheduled' });
+    expect(processor.jobService.deleteJobStorage).toHaveBeenCalledWith(
+      job.id,
       'scheduled'
     );
   });

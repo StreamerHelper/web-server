@@ -85,9 +85,24 @@ describe('Recording lifecycle', () => {
     expect(recording.throttledUpdateHeartbeat).toHaveBeenCalledTimes(1);
   });
 
+  it('does not extend heartbeat for repeated non-zero but stalled progress', async () => {
+    const { recording } = createRecoveryRecording();
+    recording.resetHeartbeatTimer = jest.fn();
+    recording.throttledUpdateHeartbeat = jest.fn();
+    const stats = 'frame= 42 time=00:00:01.68';
+    await recording.handleFFmpegOutput(stats);
+    await recording.handleFFmpegOutput(stats + '\nHTTP error 404 Not Found');
+    await recording.handleFFmpegOutput('frame= 42 time=00:00:01.68');
+    expect(recording.resetHeartbeatTimer).toHaveBeenCalledTimes(1);
+    await recording.handleFFmpegOutput('frame= 43 time=00:00:01.72');
+    expect(recording.resetHeartbeatTimer).toHaveBeenCalledTimes(2);
+  });
+
   it('marks recovery only after a new video segment is accepted', async () => {
     const { recording, updateMetadata } = createRecoveryRecording();
-    const statSpy = jest.spyOn(fs, 'stat').mockResolvedValue({ size: 1024 } as any);
+    const statSpy = jest
+      .spyOn(fs, 'stat')
+      .mockResolvedValue({ size: 1024 } as any);
     recording.ffmpegRestartAttempts = 4;
     recording.isStreamRecoveryPendingOutput = true;
     recording.resetHeartbeatTimer = jest.fn();
@@ -175,8 +190,9 @@ describe('Recording lifecycle', () => {
       }) as any;
       recording.processListChanges = jest.fn().mockResolvedValue(undefined);
       recording.resolveEndReason = jest.fn();
-      recording.ffmpegRestartAttempts = (Recording as any)
-        .MAX_FFMPEG_RESTART_ATTEMPTS;
+      recording.ffmpegRestartAttempts = (
+        Recording as any
+      ).MAX_FFMPEG_RESTART_ATTEMPTS;
 
       recording.handleFFmpegExit({ code: 0, signal: null, isNatural: true });
       await jest.advanceTimersByTimeAsync(0);

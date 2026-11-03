@@ -14,7 +14,7 @@ import {
 } from '../entity/bilibili-submission.entity';
 import { Job } from '../entity/job.entity';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
-import { SubmissionRhythmSettings } from '../interface';
+import { JOB_STATUS, SubmissionRhythmSettings } from '../interface';
 import { BilibiliSubmissionService } from './bilibili-submission.service';
 import { JobService } from './job.service';
 import { StreamerService } from './streamer.service';
@@ -141,7 +141,14 @@ export class BilibiliSubmissionRhythmService {
     const chunks = this.buildReadyChunks(
       unplannedKeys,
       rhythm.intervalMinutes,
-      flushRemainder
+      // Recording may end while a previous batch is uploading. Every later
+      // callback must flush its tail too, not only the one-shot flushJob call.
+      flushRemainder ||
+        [
+          JOB_STATUS.COMPLETED,
+          JOB_STATUS.FAILED,
+          JOB_STATUS.CANCELLED,
+        ].includes(job.status as JOB_STATUS)
     );
     if (chunks.length === 0) {
       return;

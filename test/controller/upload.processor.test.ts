@@ -3,6 +3,7 @@ jest.mock('nanoid', () => ({
 }));
 
 import { UploadProcessor } from '../../src/processor/upload.processor';
+import * as fs from 'fs/promises';
 
 describe('UploadProcessor transcript scheduling', () => {
   const createProcessor = () => {
@@ -52,4 +53,40 @@ describe('UploadProcessor transcript scheduling', () => {
 
     expect(scheduleForVideoSegment).toHaveBeenCalled();
   });
+
+  it.each([0, 3])(
+    'does not upload an empty or changing video (%s bytes)',
+    async size => {
+      const { processor } = createProcessor();
+      processor.storageService = { upload: jest.fn() };
+      processor.jobService = {
+        addUploadedSegment: jest.fn(),
+        addFailedVideoSegment: jest.fn(),
+      };
+      processor.bullFramework = { getQueue: jest.fn() };
+      const stat = jest.spyOn(fs, 'stat').mockResolvedValue({ size: 5 } as any);
+      const read = jest
+        .spyOn(fs, 'readFile')
+        .mockResolvedValue(Buffer.alloc(size));
+      const data = {
+        id: 'job',
+        localPath: '/tmp/video.mkv',
+        s3Key: 'raw/job/video/a.mkv',
+      };
+      try {
+        await expect(
+          processor.execute(data, { opts: { attempts: 2 }, attemptsMade: 1 })
+        ).rejects.toThrow('Video segment is empty or changed while reading');
+        expect(processor.storageService.upload).not.toHaveBeenCalled();
+        expect(processor.jobService.addUploadedSegment).not.toHaveBeenCalled();
+        expect(processor.jobService.addFailedVideoSegment).toHaveBeenCalledWith(
+          'job',
+          data.s3Key
+        );
+      } finally {
+        stat.mockRestore();
+        read.mockRestore();
+      }
+    }
+  );
 });

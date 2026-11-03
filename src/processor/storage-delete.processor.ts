@@ -2,11 +2,13 @@ import { Framework, IProcessor, Processor } from '@midwayjs/bullmq';
 import { ILogger, Inject, Logger } from '@midwayjs/core';
 import {
   BilibiliSubmissionEntity,
+  PartStatus,
   SubmissionStatus,
 } from '../entity/bilibili-submission.entity';
 import { Job } from '../entity/job.entity';
 import {
   RecordingAutoDeleteSettings,
+  JOB_STATUS,
   StorageDeleteJobData,
 } from '../interface';
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
@@ -134,6 +136,22 @@ export class StorageDeleteProcessor implements IProcessor {
     job: Job,
     data: StorageDeleteJobData
   ) {
+    if (
+      [
+        JOB_STATUS.PENDING,
+        JOB_STATUS.RECORDING,
+        JOB_STATUS.STOPPING,
+        JOB_STATUS.PROCESSING,
+      ].includes(job.status as JOB_STATUS)
+    ) {
+      return this.deferDeleteForSubmission(
+        job,
+        data,
+        'recording_incomplete',
+        []
+      );
+    }
+
     const submissions = await this.submissionRepository.findByJobId(job.jobId);
     const blockingSubmissions = submissions.filter(submission =>
       this.isSubmissionBlockingDelete(submission)
@@ -155,12 +173,31 @@ export class StorageDeleteProcessor implements IProcessor {
       const streamer = await this.streamerService.findByStreamerId(
         job.streamerId
       );
-      if (streamer?.uploadSettings?.autoUpload) {
+      if (streamer && streamer.uploadSettings?.autoUpload !== false) {
         return this.deferDeleteForSubmission(
           job,
           data,
           'submission_missing',
           []
+        );
+      }
+    }
+
+    if (submissions.length > 0) {
+      const submittedKeys = new Set(
+        submissions.flatMap(submission =>
+          (submission.parts || []).flatMap(part => part.s3Keys || [])
+        )
+      );
+      const missingKeys = (job.metadata?.uploadedSegments || []).filter(
+        key => key.includes('/video/') && !submittedKeys.has(key)
+      );
+      if (missingKeys.length > 0 || job.metadata?.failedVideoSegments?.length) {
+        return this.deferDeleteForSubmission(
+          job,
+          data,
+          'submission_coverage_incomplete',
+          submissions
         );
       }
     }
@@ -182,7 +219,14 @@ export class StorageDeleteProcessor implements IProcessor {
     return (
       submission.status !== SubmissionStatus.COMPLETED ||
       !submission.bvid ||
-      !submission.avid
+      !submission.avid ||
+      !submission.parts?.length ||
+      submission.totalParts !== submission.parts.length ||
+      submission.completedParts !== submission.parts.length ||
+      submission.parts.some(
+        part =>
+          part.status !== PartStatus.COMPLETED || !part.filename || !part.cid
+      )
     );
   }
 

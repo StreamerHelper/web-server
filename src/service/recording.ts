@@ -248,6 +248,8 @@ export class Recording extends EventEmitter {
   private maxDurationTimer: NodeJS.Timeout | null = null;
   private ffmpegRestartTimer: NodeJS.Timeout | null = null;
   private lastFFmpegOutputTime = 0; // FFmpeg 最后输出时间
+  private lastFFmpegFrame = 0;
+  private lastFFmpegMediaTime = 0;
   private ffmpegRestartAttempts = 0;
   private streamRecoveryInFlight: Promise<void> | null = null;
   private streamRecoveryStateUpdate: Promise<void> = Promise.resolve();
@@ -757,6 +759,8 @@ export class Recording extends EventEmitter {
   }
 
   private async startFFmpegProcess(): Promise<void> {
+    this.lastFFmpegFrame = 0;
+    this.lastFFmpegMediaTime = 0;
     this.resetHeartbeatTimer();
     await this.ffmpeg.start({
       streamUrl: this.streamUrl,
@@ -1086,9 +1090,11 @@ export class Recording extends EventEmitter {
 
       this.segmentCount++;
       this.lastSegmentTime = timestamp;
-      this.lastFFmpegOutputTime = Date.now();
-      this.markStreamRecovered();
-      this.resetHeartbeatTimer();
+      if (stats.size > 0) {
+        this.lastFFmpegOutputTime = Date.now();
+        this.markStreamRecovered();
+        this.resetHeartbeatTimer();
+      }
 
       // 触发上传
       const uploadQueue = this.bullFramework.getQueue('upload');
@@ -1230,19 +1236,22 @@ export class Recording extends EventEmitter {
     }
 
     const frameMatch = message.match(/\bframe=\s*(\d+)/i);
-    if (frameMatch && Number(frameMatch[1]) > 0) {
-      return true;
-    }
-
     const timeMatch = message.match(
       /\btime=\s*(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)/i
     );
-    if (!timeMatch) {
-      return false;
-    }
-
-    const [, hours, minutes, seconds] = timeMatch;
-    return Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds) > 0;
+    const frame = Number(frameMatch?.[1] || 0);
+    const mediaTime = timeMatch
+      ? Number(timeMatch[1]) * 3600 +
+        Number(timeMatch[2]) * 60 +
+        Number(timeMatch[3])
+      : 0;
+    // Reconnection keeps printing the previous non-zero frame/time. Only
+    // advancing media counters are a heartbeat; repeated stats are not data.
+    const advanced =
+      frame > this.lastFFmpegFrame || mediaTime > this.lastFFmpegMediaTime;
+    this.lastFFmpegFrame = Math.max(this.lastFFmpegFrame, frame);
+    this.lastFFmpegMediaTime = Math.max(this.lastFFmpegMediaTime, mediaTime);
+    return advanced;
   }
 
   /**

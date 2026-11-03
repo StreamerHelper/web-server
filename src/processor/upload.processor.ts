@@ -39,6 +39,12 @@ export class UploadProcessor implements IProcessor {
 
       // 读取文件内容
       const fileContent = await fs.readFile(localPath);
+      if (
+        s3Key.includes('/video/') &&
+        (fileContent.length === 0 || fileContent.length !== stats.size)
+      ) {
+        throw new Error('Video segment is empty or changed while reading');
+      }
       this.logger.info('Read file for upload', {
         id,
         s3Key,

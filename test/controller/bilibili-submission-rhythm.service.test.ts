@@ -8,6 +8,7 @@ import {
   PartStatus,
   SubmissionStatus,
 } from '../../src/entity/bilibili-submission.entity';
+import { JOB_STATUS } from '../../src/interface';
 
 describe('BilibiliSubmissionRhythmService', () => {
   const originalTimeZone = process.env.TZ;
@@ -285,5 +286,76 @@ describe('BilibiliSubmissionRhythmService', () => {
         backoff: { type: 'exponential', delay: 60_000 },
       }
     );
+  });
+
+  it.each([JOB_STATUS.COMPLETED, JOB_STATUS.FAILED, JOB_STATUS.CANCELLED])(
+    'flushes a %s recording tail after the busy submission finishes, only once',
+    async status => {
+      const service = createService();
+      const keys = createSegmentKeys('job-busy-tail', 9);
+      const job = {
+        id: 'entity-busy-tail',
+        jobId: 'job-busy-tail',
+        streamerId: 'streamer-tail',
+        status,
+        metadata: { uploadedSegments: keys },
+      };
+      const submission = {
+        id: 'submission-busy-tail',
+        jobId: job.jobId,
+        status: SubmissionStatus.UPLOADING,
+        parts: [
+          service.submissionService.buildSubmissionPart(
+            keys.slice(0, 6),
+            1,
+            PartStatus.COMPLETED,
+            1,
+            { filename: 'uploaded-file', cid: 1 }
+          ),
+        ],
+      };
+      service.jobService.findById.mockResolvedValue(job);
+      service.jobService.findByJobId.mockResolvedValue(job);
+      service.submissionRepository.findById.mockResolvedValue(submission);
+      service.submissionRepository.findByJobId.mockResolvedValue([submission]);
+      service.streamerService.findByStreamerId.mockResolvedValue({
+        uploadSettings: {
+          autoUpload: true,
+          rhythm: { mode: 'segmented', intervalMinutes: 1 },
+        },
+      });
+
+      await service.flushJob(job.id);
+      expect(service.queue.addJobToQueue).not.toHaveBeenCalled();
+
+      submission.status = SubmissionStatus.COMPLETED;
+      await service.queueNextForSubmission(submission.id);
+      expect(submission.parts[1].s3Keys).toEqual(keys.slice(6));
+      expect(service.queue.addJobToQueue).toHaveBeenCalledTimes(1);
+
+      submission.status = SubmissionStatus.COMPLETED;
+      await service.queueNextForSubmission(submission.id);
+      expect(service.queue.addJobToQueue).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('does not flush a partial interval while recording is still active', async () => {
+    const service = createService();
+    service.jobService.findById.mockResolvedValue({
+      id: 'active',
+      jobId: 'active',
+      streamerId: 'streamer',
+      status: JOB_STATUS.RECORDING,
+      metadata: { uploadedSegments: createSegmentKeys('active', 3) },
+    });
+    service.submissionRepository.findByJobId.mockResolvedValue([]);
+    service.streamerService.findByStreamerId.mockResolvedValue({
+      uploadSettings: {
+        autoUpload: true,
+        rhythm: { mode: 'segmented', intervalMinutes: 1 },
+      },
+    });
+    await service.handleUploadedVideoSegment('active');
+    expect(service.submissionService.createSubmission).not.toHaveBeenCalled();
   });
 });

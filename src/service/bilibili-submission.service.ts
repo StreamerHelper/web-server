@@ -1276,6 +1276,9 @@ export class BilibiliSubmissionService {
       this.logger.debug('Downloading segment', { s3Key, localPath });
 
       const buffer = await this.storageService.download(s3Key);
+      if (buffer.length === 0) {
+        throw new Error(`Cannot merge empty video segment: ${s3Key}`);
+      }
       await fs.writeFile(localPath, buffer);
       segmentFiles.push(localPath);
     }
@@ -1317,6 +1320,9 @@ export class BilibiliSubmissionService {
 
     return new Promise((resolve, reject) => {
       const ffmpeg = spawn('ffmpeg', [
+        // FFmpeg can otherwise exit 0 after a broken concat input, leaving a
+        // playable but truncated file that must never be treated as complete.
+        '-xerror',
         '-f',
         'concat',
         '-safe',
@@ -1340,10 +1346,18 @@ export class BilibiliSubmissionService {
         await fs.unlink(listFile).catch(() => {});
 
         if (code === 0) {
-          const stats = await fs.stat(outputPath);
-          // 获取视频时长
-          const duration = await this.getVideoDuration(outputPath);
-          resolve({ duration, fileSize: stats.size });
+          try {
+            const stats = await fs.stat(outputPath);
+            const duration = await this.getVideoDuration(outputPath);
+            if (!stats.size || !Number.isFinite(duration) || duration <= 0) {
+              throw new Error(
+                'FFmpeg merge produced an empty or invalid video'
+              );
+            }
+            resolve({ duration, fileSize: stats.size });
+          } catch (error) {
+            reject(error);
+          }
         } else {
           reject(new Error(`FFmpeg merge failed with code ${code}: ${stderr}`));
         }
