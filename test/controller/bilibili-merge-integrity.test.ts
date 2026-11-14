@@ -7,15 +7,19 @@ import * as path from 'path';
 import { BilibiliSubmissionService } from '../../src/service/bilibili-submission.service';
 
 describe('Bilibili merge input validation', () => {
-  it('rejects empty stored segments before they can truncate a concat', async () => {
+  it('skips empty stored segments and only fails when nothing usable is left', async () => {
     const service = new BilibiliSubmissionService() as any;
-    service.logger = { debug: jest.fn() };
+    service.logger = { debug: jest.fn(), warn: jest.fn() };
     service.storageService = {
       download: jest.fn().mockResolvedValue(Buffer.alloc(0)),
     };
     await expect(
       service.downloadAndMergeSegments(['raw/job/video/empty.mkv'], '/tmp', 1)
-    ).rejects.toThrow('Cannot merge empty video segment');
+    ).rejects.toThrow('No non-empty video segments');
+    expect(service.logger.warn).toHaveBeenCalledWith(
+      'Skipping empty video segment',
+      { s3Key: 'raw/job/video/empty.mkv' }
+    );
   });
 });
 
@@ -28,7 +32,7 @@ const hasFFmpeg = spawnSync('ffmpeg', ['-version']).status === 0;
     beforeEach(async () => {
       dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bilibili-merge-test-'));
       service = new BilibiliSubmissionService() as any;
-      service.logger = { debug: jest.fn() };
+      service.logger = { debug: jest.fn(), warn: jest.fn() };
       execFileSync('ffmpeg', [
         '-v',
         'error',
@@ -55,7 +59,8 @@ const hasFFmpeg = spawnSync('ffmpeg', ['-version']).status === 0;
         path.join(dir, 'merged.mkv')
       );
       expect(result.duration).toBeGreaterThanOrEqual(1000);
-      expect(result.duration).toBeLessThan(1100);
+      // -avoid_negative_ts make_zero 会把第二个分片的 0.022s 偏移补齐，多出约 0.2s
+      expect(result.duration).toBeLessThan(1300);
     });
 
     it('rejects a broken middle input instead of accepting a truncated successful exit', async () => {

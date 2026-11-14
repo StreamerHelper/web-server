@@ -30,6 +30,21 @@ export class BilibiliSubmissionRecoveryService {
       return 0;
     }
 
+    // 已完成但 parts 元数据有缺口的行只记录，不再重新合并/上传：
+    // 原片在录制结束 6 小时后已被清理，重跑只会把线上正常的稿件改成 failed。
+    const drifted =
+      await this.submissionRepository.findCompletedWithIncompleteParts();
+    if (drifted.length > 0) {
+      this.logger.warn(
+        'Completed bilibili submissions have incomplete part metadata; leaving them untouched',
+        {
+          count: drifted.length,
+          submissionIds: drifted.map(submission => submission.id),
+          jobIds: drifted.map(submission => submission.jobId),
+        }
+      );
+    }
+
     const submissions =
       await this.submissionRepository.findRecoverableSubmissions();
     if (submissions.length === 0) {

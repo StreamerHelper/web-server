@@ -57,6 +57,19 @@ export interface BilibiliUploadedPart {
   omitCid?: boolean;
 }
 
+/**
+ * B站稿件在线上可观测到的状态。
+ * videos 是当前公开（或审核中可见）的分P 数量，用来和本地 parts 对账。
+ */
+export interface BilibiliArchiveInfo {
+  bvid: string;
+  avid: number;
+  videos: number;
+  /** 0 = 正常公开；-30 = 审核中；其他负数表示不可见 */
+  state: number;
+  durationMs: number;
+}
+
 // 上传线路配置
 const UPLOAD_LINES = [
   { name: 'bldsa', query: 'zone=cs&upcdn=bldsa&probe_version=20221109' },
@@ -138,6 +151,88 @@ export class BilibiliUploadService {
     const maybeStream = body as unknown as { destroy?: (error: Error) => void };
     if (maybeStream?.destroy) {
       maybeStream.destroy(new Error('Bilibili upload request timed out'));
+    }
+  }
+
+  /**
+   * 查询稿件在 B 站的实际状态（公开 view 接口，不需要登录态）。
+   *
+   * 本地 status 只是 worker 的簿记，B 站才是稿件是否存在的唯一事实来源。
+   * 任何准备把投稿标成 failed 的路径都应该先调用它做一次对账。
+   */
+  async getArchiveInfo(query: {
+    bvid?: string;
+    avid?: number;
+  }): Promise<BilibiliArchiveInfo | null> {
+    const bvid = (query.bvid || '').trim();
+    const avid = Number(query.avid || 0);
+    if (!bvid && !(Number.isFinite(avid) && avid > 0)) {
+      return null;
+    }
+
+    const params = new URLSearchParams();
+    if (bvid) {
+      params.set('bvid', bvid);
+    } else {
+      params.set('aid', String(avid));
+    }
+    const url = `https://api.bilibili.com/x/web-interface/view?${params.toString()}`;
+
+    try {
+      const response = await this.fetchWithTimeout(
+        url,
+        {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            Referer: 'https://www.bilibili.com/',
+          },
+        },
+        15000,
+        'archive-view'
+      );
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const payload = (await response.json()) as {
+        code?: number;
+        data?: {
+          bvid?: string;
+          aid?: number;
+          videos?: number;
+          state?: number;
+          pages?: Array<{ duration?: number }>;
+        };
+      };
+
+      if (payload?.code !== 0 || !payload.data) {
+        return null;
+      }
+
+      const pages = Array.isArray(payload.data.pages)
+        ? payload.data.pages
+        : [];
+      const durationMs = Math.round(
+        pages.reduce((total, page) => total + Number(page.duration || 0), 0) *
+          1000
+      );
+
+      return {
+        bvid: String(payload.data.bvid || bvid),
+        avid: Number(payload.data.aid || avid || 0),
+        videos: Number(payload.data.videos ?? pages.length ?? 0),
+        state: Number(payload.data.state ?? 0),
+        durationMs,
+      };
+    } catch (error) {
+      this.logger.warn('Failed to query bilibili archive info', {
+        bvid,
+        avid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
     }
   }
 

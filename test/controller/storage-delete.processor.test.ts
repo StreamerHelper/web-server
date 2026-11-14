@@ -43,6 +43,9 @@ function createProcessor() {
   processor.submissionRepository = {
     findByJobId: jest.fn().mockResolvedValue([]),
   };
+  processor.uploadService = {
+    getArchiveInfo: jest.fn().mockResolvedValue(null),
+  };
   processor.bullFramework = {
     getQueue: jest.fn().mockReturnValue(queue),
   };

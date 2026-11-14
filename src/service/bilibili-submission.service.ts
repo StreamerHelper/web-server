@@ -604,25 +604,119 @@ export class BilibiliSubmissionService {
         avid: result.avid,
       });
     } catch (error) {
-      const errorMessage =
+      const rawErrorMessage =
         error instanceof Error ? error.message : String(error);
+      const errorMessage = this.truncateErrorMessage(rawErrorMessage);
       this.logger.error('Submission failed', {
         submissionId,
         error: errorMessage,
       });
 
-      // 直接标记为失败
-      await this.submissionRepository.updateStatus(
+      // 本地失败不等于 B 站没有稿件：稿件可能已经创建/编辑成功，只是后续
+      // 步骤（合并、清理、写库）失败了。落库前先和 B 站对一次账。
+      const reconciled = await this.reconcileArchiveAfterFailure(
         submissionId,
-        SubmissionStatus.FAILED,
         errorMessage
       );
+
+      if (!reconciled) {
+        // 直接标记为失败：即使状态写入失败，也必须清理临时目录，避免磁盘泄漏
+        try {
+          await this.submissionRepository.updateStatus(
+            submissionId,
+            SubmissionStatus.FAILED,
+            errorMessage
+          );
+        } catch (statusError) {
+          this.logger.error('Failed to persist submission failure', {
+            submissionId,
+            error:
+              statusError instanceof Error
+                ? statusError.message
+                : String(statusError),
+          });
+        }
+      }
+
       if (tempDir) {
         await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
       }
 
       throw error;
     }
+  }
+
+  /**
+   * 失败后对账：以 B 站稿件为准修正本地状态。
+   *
+   * - 稿件分P 数 >= 本地计划数：说明投稿其实成功了，标记 completed；
+   * - 稿件存在但分P 不足：保持 failed，但把错误信息换成“线上 N/M 个分P”，
+   *   避免后续恢复任务把它当成“没投过”而重复合并、重复上传；
+   * - 稿件不存在：交回调用方按原错误标记失败。
+   */
+  private async reconcileArchiveAfterFailure(
+    submissionId: string,
+    errorMessage: string
+  ): Promise<boolean> {
+    const current = await this.submissionRepository.findById(submissionId);
+    if (!current) {
+      return false;
+    }
+    const avid = Number(current.avid || 0);
+    if (!current.bvid && (!Number.isFinite(avid) || avid <= 0)) {
+      return false;
+    }
+
+    const archive = await this.uploadService.getArchiveInfo({
+      bvid: current.bvid || undefined,
+      avid: Number.isFinite(avid) && avid > 0 ? avid : undefined,
+    });
+    if (!archive) {
+      return false;
+    }
+
+    const expectedParts = Math.max(
+      Number(current.totalParts || 0),
+      (current.parts || []).length
+    );
+
+    if (expectedParts > 0 && archive.videos >= expectedParts) {
+      await this.submissionRepository.completeSubmission(submissionId);
+      this.logger.warn(
+        'Submission failed locally but bilibili archive is complete; keeping it completed',
+        {
+          submissionId,
+          bvid: archive.bvid,
+          localParts: expectedParts,
+          remoteParts: archive.videos,
+          error: errorMessage,
+        }
+      );
+      return true;
+    }
+
+    const message = this.truncateErrorMessage(
+      `B站稿件 ${archive.bvid} 已存在，线上 ${archive.videos}/${expectedParts || '?'} 个分P；本次失败：${errorMessage}`
+    );
+    await this.submissionRepository.updateStatus(
+      submissionId,
+      SubmissionStatus.FAILED,
+      message
+    );
+    this.logger.warn(
+      'Submission failed locally and bilibili archive has fewer parts',
+      {
+        submissionId,
+        bvid: archive.bvid,
+        localParts: expectedParts,
+        remoteParts: archive.videos,
+      }
+    );
+    return true;
+  }
+
+  private truncateErrorMessage(message: string): string {
+    return message.length > 1990 ? `${message.slice(0, 1990)}…` : message;
   }
 
   private async burnInSubtitlesToMergedPart(
@@ -1277,10 +1371,17 @@ export class BilibiliSubmissionService {
 
       const buffer = await this.storageService.download(s3Key);
       if (buffer.length === 0) {
-        throw new Error(`Cannot merge empty video segment: ${s3Key}`);
+        // 单个空分片（约 10 秒）不应该让整段录制作废，跳过后继续合并；
+        // 只有整段都拿不到数据时才视为失败。
+        this.logger.warn('Skipping empty video segment', { s3Key });
+        continue;
       }
       await fs.writeFile(localPath, buffer);
       segmentFiles.push(localPath);
+    }
+
+    if (segmentFiles.length === 0) {
+      throw new Error(`No non-empty video segments for part ${partIndex}`);
     }
 
     // 合并分片
@@ -1306,6 +1407,10 @@ export class BilibiliSubmissionService {
 
   /**
    * 合并视频分片（使用 FFmpeg）
+   *
+   * 直播分片在断流、重连后经常出现 DTS 回退，`-xerror` 会在这种情况下中止。
+   * 先严格合并，只有在时间戳 / muxing 类错误时才回退到宽容模式重试一次，
+   * 否则一个 10 秒分片的时间戳抖动会让整段 1 小时的录制永远投不出去。
    */
   private async mergeSegments(
     segments: string[],
@@ -1318,55 +1423,96 @@ export class BilibiliSubmissionService {
     const listContent = segments.map(s => `file '${s}'`).join('\n');
     await fs.writeFile(listFile, listContent);
 
-    return new Promise((resolve, reject) => {
-      const ffmpeg = spawn('ffmpeg', [
-        // FFmpeg can otherwise exit 0 after a broken concat input, leaving a
-        // playable but truncated file that must never be treated as complete.
-        '-xerror',
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        listFile,
-        '-c',
-        'copy',
-        '-y',
-        outputPath,
-      ]);
+    const run = (strict: boolean) =>
+      new Promise<{ duration: number; fileSize: number }>((resolve, reject) => {
+        const args: string[] = [];
+        if (strict) {
+          // FFmpeg can otherwise exit 0 after a broken concat input, leaving a
+          // playable but truncated file that must never be treated as complete.
+          args.push('-xerror');
+        }
+        args.push(
+          '-fflags',
+          strict ? '+genpts' : '+genpts+igndts',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
+          '-i',
+          listFile,
+          '-c',
+          'copy',
+          '-avoid_negative_ts',
+          'make_zero',
+          '-y',
+          outputPath
+        );
 
-      let stderr = '';
-      ffmpeg.stderr?.on('data', data => {
-        stderr += data.toString();
-        this.logger.debug('FFmpeg merge output', { message: data.toString() });
-      });
+        const ffmpeg = spawn('ffmpeg', args);
 
-      ffmpeg.on('close', async code => {
-        // 清理列表文件
-        await fs.unlink(listFile).catch(() => {});
+        let stderr = '';
+        ffmpeg.stderr?.on('data', data => {
+          stderr += data.toString();
+          this.logger.debug('FFmpeg merge output', {
+            message: data.toString(),
+          });
+        });
 
-        if (code === 0) {
-          try {
-            const stats = await fs.stat(outputPath);
-            const duration = await this.getVideoDuration(outputPath);
-            if (!stats.size || !Number.isFinite(duration) || duration <= 0) {
-              throw new Error(
-                'FFmpeg merge produced an empty or invalid video'
-              );
+        ffmpeg.on('close', async code => {
+          if (code === 0) {
+            try {
+              const stats = await fs.stat(outputPath);
+              const duration = await this.getVideoDuration(outputPath);
+              if (!stats.size || !Number.isFinite(duration) || duration <= 0) {
+                throw new Error(
+                  'FFmpeg merge produced an empty or invalid video'
+                );
+              }
+              resolve({ duration, fileSize: stats.size });
+            } catch (error) {
+              reject(error);
             }
-            resolve({ duration, fileSize: stats.size });
-          } catch (error) {
+          } else {
+            const error = new Error(
+              `FFmpeg merge failed with code ${code}: ${stderr}`
+            ) as Error & { stderr?: string };
+            error.stderr = stderr;
             reject(error);
           }
-        } else {
-          reject(new Error(`FFmpeg merge failed with code ${code}: ${stderr}`));
-        }
+        });
+
+        ffmpeg.on('error', err => {
+          reject(err);
+        });
       });
 
-      ffmpeg.on('error', err => {
-        reject(err);
-      });
-    });
+    try {
+      try {
+        return await run(true);
+      } catch (strictError) {
+        const stderr =
+          (strictError as Error & { stderr?: string })?.stderr || '';
+        const retryable = /Non-monotonic DTS|out of order|Error muxing a packet/i.test(
+          stderr
+        );
+        if (!retryable) {
+          throw strictError;
+        }
+        this.logger.warn(
+          'Strict merge failed on timestamp errors, retrying in tolerant mode',
+          { outputPath }
+        );
+        await fs.rm(outputPath, { force: true }).catch(() => {});
+        const result = await run(false);
+        this.logger.warn('Tolerant merge succeeded', {
+          outputPath,
+          duration: result.duration,
+        });
+        return result;
+      }
+    } finally {
+      await fs.unlink(listFile).catch(() => {});
+    }
   }
 
   /**

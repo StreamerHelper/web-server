@@ -14,6 +14,7 @@ import {
 import { BilibiliSubmissionRepository } from '../repository/bilibili-submission.repository';
 import { JobService } from '../service/job.service';
 import { StreamerService } from '../service/streamer.service';
+import { BilibiliUploadService } from '../service/bilibili-upload.service';
 import { normalizeAutoDeleteSettings } from '../utils/record-settings';
 
 const IN_PROGRESS_SUBMISSION_STATUSES = new Set<SubmissionStatus>([
@@ -34,6 +35,9 @@ export class StorageDeleteProcessor implements IProcessor {
 
   @Inject()
   private submissionRepository: BilibiliSubmissionRepository;
+
+  @Inject()
+  private uploadService: BilibiliUploadService;
 
   @Inject()
   private bullFramework: Framework;
@@ -198,6 +202,75 @@ export class StorageDeleteProcessor implements IProcessor {
           data,
           'submission_coverage_incomplete',
           submissions
+        );
+      }
+
+      const reviewCheck = await this.checkArchiveReviewGuard(
+        job,
+        data,
+        submissions
+      );
+      if (reviewCheck) {
+        return reviewCheck;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 稿件已经投出去但仍然在 B 站审核中时不删原片。
+   *
+   * 审核可能驳回，而原片是唯一还能重投的素材；之前的实现是“本地 completed
+   * 就立刻删”，HWcx 那次稿件 00:31 完成、00:35 原片就没了，审核期间无法回滚。
+   * 最多延期 24 次（约 6 小时），避免审核长期不通过时无限占用磁盘。
+   */
+  private async checkArchiveReviewGuard(
+    job: Job,
+    data: StorageDeleteJobData,
+    submissions: BilibiliSubmissionEntity[]
+  ) {
+    const published = submissions.filter(
+      submission =>
+        submission.status === SubmissionStatus.COMPLETED &&
+        Boolean(submission.bvid)
+    );
+    if (published.length === 0) {
+      return null;
+    }
+
+    const deferredCount = Number(
+      job.metadata?.storageDeleteReviewDeferCount || 0
+    );
+    if (deferredCount >= 24) {
+      return null;
+    }
+
+    for (const submission of published) {
+      const info = await this.uploadService.getArchiveInfo({
+        bvid: submission.bvid || undefined,
+        avid: Number(submission.avid || 0) || undefined,
+      });
+      if (info && info.state !== 0) {
+        await this.jobService.updateMetadata(job.id, {
+          storageDeleteReviewDeferCount: deferredCount + 1,
+        });
+        this.logger.info(
+          'Storage delete deferred because bilibili archive is still under review',
+          {
+            id: job.id,
+            jobId: job.jobId,
+            submissionId: submission.id,
+            bvid: info.bvid,
+            state: info.state,
+            deferredCount: deferredCount + 1,
+          }
+        );
+        return this.deferDeleteForSubmission(
+          job,
+          data,
+          'archive_in_review',
+          [submission]
         );
       }
     }

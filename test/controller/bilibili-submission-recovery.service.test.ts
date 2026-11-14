@@ -18,6 +18,7 @@ describe('BilibiliSubmissionRecoveryService', () => {
     };
     service.submissionRepository = {
       findRecoverableSubmissions: jest.fn(),
+      findCompletedWithIncompleteParts: jest.fn().mockResolvedValue([]),
     };
     return service;
   };

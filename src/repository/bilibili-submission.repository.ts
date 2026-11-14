@@ -61,30 +61,48 @@ export class BilibiliSubmissionRepository {
     });
   }
 
+  /**
+   * 需要恢复（重新入队）的投稿。
+   *
+   * 只包含真正“没走完”的行：pending / uploading / submitting。
+   * 已完成的行即使 parts 元数据有缺口，也不在这里重跑——那样会让一个
+   * 已经在 B 站上线的稿件因为原片被自动清理而重新合并、失败、再被标成
+   * failed。元数据缺口只做只读 observation，由运维对账处理。
+   */
   async findRecoverableSubmissions(): Promise<BilibiliSubmissionEntity[]> {
-    const unfinishedPartCondition = `EXISTS (
-      SELECT 1
-      FROM jsonb_array_elements(submission.parts) AS part
-      WHERE part->>'status' <> :completedPartStatus
-        OR COALESCE(part->>'filename', '') = ''
-        OR COALESCE(part->>'cid', '') IN ('', '0')
-    )`;
-
-    return this.repo
-      .createQueryBuilder('submission')
-      .where('submission.status IN (:...activeStatuses)', {
-        activeStatuses: [
+    return this.repo.find({
+      where: {
+        status: In([
           SubmissionStatus.PENDING,
           SubmissionStatus.UPLOADING,
           SubmissionStatus.SUBMITTING,
-        ],
+        ]),
+      },
+      order: { createdAt: 'ASC' },
+    });
+  }
+
+  /**
+   * 已完成但 parts 元数据不完整的行（cid / filename 缺失）。
+   * 仅用于启动时告警，不会再触发合并或上传。
+   */
+  async findCompletedWithIncompleteParts(): Promise<
+    BilibiliSubmissionEntity[]
+  > {
+    return this.repo
+      .createQueryBuilder('submission')
+      .where('submission.status = :completedStatus', {
+        completedStatus: SubmissionStatus.COMPLETED,
       })
-      .orWhere(
-        `(submission.status = :completedStatus AND ${unfinishedPartCondition})`,
-        {
-          completedStatus: SubmissionStatus.COMPLETED,
-          completedPartStatus: PartStatus.COMPLETED,
-        }
+      .andWhere(
+        `EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(submission.parts) AS part
+          WHERE part->>'status' <> :completedPartStatus
+            OR COALESCE(part->>'filename', '') = ''
+            OR COALESCE(part->>'cid', '') IN ('', '0')
+        )`,
+        { completedPartStatus: PartStatus.COMPLETED }
       )
       .orderBy('submission.createdAt', 'ASC')
       .getMany();

@@ -100,6 +100,7 @@ export interface JobMetadata {
   storageDeletedAt?: string;
   storageDeletedKeys?: string[];
   storageDeleteReason?: string;
+  storageDeleteReviewDeferCount?: number;
   ffmpegRequestedQuality?: RecordingQuality;
   resolution?: string;
   bitrate?: number;
