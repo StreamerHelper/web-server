@@ -149,3 +149,73 @@ describe('BilibiliUploadService streaming uploads', () => {
     }
   });
 });
+
+describe('BilibiliUploadService archive reconciliation', () => {
+  const createService = () => {
+    const service = new BilibiliUploadService() as any;
+    service.logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    };
+    return service;
+  };
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('reads part count and state from the public view API', async () => {
+    const service = createService();
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        data: {
+          bvid: 'BV1xx411c7mD',
+          aid: 42,
+          videos: 3,
+          state: 0,
+          pages: [{ duration: 60 }, { duration: 61 }, { duration: 62 }],
+        },
+      }),
+    });
+    (global as any).fetch = fetchMock;
+
+    const info = await service.getArchiveInfo({ bvid: 'BV1xx411c7mD' });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      'bvid=BV1xx411c7mD'
+    );
+    expect(info).toEqual({
+      bvid: 'BV1xx411c7mD',
+      avid: 42,
+      videos: 3,
+      state: 0,
+      durationMs: 183000,
+    });
+  });
+
+  it('returns null when bilibili reports the archive does not exist', async () => {
+    const service = createService();
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ code: -404, message: '啥都木有' }),
+    });
+
+    await expect(
+      service.getArchiveInfo({ bvid: 'BV1deleted001' })
+    ).resolves.toBeNull();
+  });
+
+  it('returns null when no bvid or avid is supplied', async () => {
+    const service = createService();
+    const fetchMock = jest.fn();
+    (global as any).fetch = fetchMock;
+
+    await expect(service.getArchiveInfo({})).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
